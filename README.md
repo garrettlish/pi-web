@@ -106,11 +106,19 @@ pi-web --cwd ~/code/my-project
 - Sessions are addressable: the URL hash (`#ws=…&session=…`) survives a reload and can be
   bookmarked or shared between your own tabs.
 - Idle processes with no attached tab are reaped after 30 minutes.
+- The sidebar filter matches a session's title only. The search button beside the workspace button
+  (or `Cmd/Ctrl`+`K`) opens a dialog that searches **every prompt, response, tool request and tool
+  result in every workspace**: all typed terms must match (case-insensitive), newest occurrences
+  first, and each hit shows its role, workspace, session and a snippet around the match. Clicking
+  a hit switches to that session and jumps to the occurrence — scrolling to the message, or
+  opening the tool call's request/response popup. The system prompt and thinking blocks are left
+  out of the index: identical in every session, they would bury every query under false hits.
 
 **Controls**
 
 - Switch model and thinking level from the header. The model list honors `enabledModels` from
-  `~/.pi/agent/settings.json`.
+  `~/.pi/agent/settings.json`. Both are in-app menus anchored below their button, with the height
+  clamped to the space left under it, so they scroll instead of spilling off the window.
 - Context-window usage (used / max / percent), session cost and token totals in the header —
   updated as each assistant message completes, not only when a run ends — with a session-details
   popover for the full path, session id, cwd and token breakdown.
@@ -126,6 +134,10 @@ pi-web --cwd ~/code/my-project
   remembered across reloads, and a button at the left edge of the header brings it back.
 - Extension UI requests (`select`, `confirm`, `input`, `editor`) surface as real dialogs; `notify`
   becomes a toast.
+- Clicking a tool call opens its request/response popup. A result that read a picture is shown as
+  the image itself (click to enlarge into a full-window viewer layered over the popup, so the
+  request/response stays readable underneath), not just as `{"content": "", "fileSize": …}` —
+  whether pi returned the bytes inline or only reported the file size and path.
 - Light and dark themes, a resizable sidebar, keyboard focus styling.
 
 ## Architecture
@@ -166,7 +178,9 @@ localhost-only by default.
 | `POST /api/open` | `{client, sessionFile?, cwd?}` — attach this client to a session; a fresh spawn is awaited until pi answers RPC |
 | `POST /api/cmd` | `{client, type, …}` — forward a pi RPC command, await its response |
 | `POST /api/ui-response` | Answer an extension UI request |
+| `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
 | `GET /api/sessions` | List sessions with live active/streaming flags |
+| `GET /api/search?q=<terms>&limit=<n>` | Full-text search across every session's prompts, responses, tool requests and tool results; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
 
 ## Configuration
@@ -212,7 +226,14 @@ Either way, put authentication in front of the port before it is reachable by an
 
 - Paths from the browser are resolved and checked against the public asset directory before being
   served; the workspace picker only lists existing directories.
+- `GET /api/image` is the one route that reads an arbitrary absolute path, because a tool result can
+  reference a picture anywhere on disk. It is restricted to image bytes: the content must sniff as
+  PNG, JPEG, GIF or WebP, the size is capped at 16 MB, and it is served with `no-store`. Anything
+  else — text, JSON, SVG — is refused with 415, so the endpoint cannot be used as a general file
+  reader.
 - Session listing walks only the configured session directory.
+- Cross-session search reads only the same session directory, returns snippets and never writes.
+  Parsed indexes live in a byte-capped in-memory cache and are keyed by each file's mtime and size.
 - No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
   `textContent`, and the Markdown subset escapes before formatting.
 - Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
@@ -228,10 +249,11 @@ npm test           # end-to-end smoke test (starts a throwaway server)
 ```
 
 `npm test` boots the server on a random port and verifies what has actually broken before: the page
-and assets are served, the HTTP API answers, foreign `Host`/`Origin` requests are rejected, path
-traversal cannot escape `public/`, and malformed commands return a clean 4xx. It needs no agent
-credentials — when `pi` happens to be installed it also checks the agent round-trip, otherwise it
-skips that check.
+and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
+skips the system prompt and thinking blocks, foreign `Host`/`Origin` requests are rejected, path
+traversal cannot escape `public/`, and malformed commands return a clean 4xx. It runs against a
+throwaway session directory, needs no agent credentials, and — when `pi` happens to be installed —
+also checks the agent round-trip, otherwise it skips that check.
 
 Frontend changes apply on reload (static files are served with `Cache-Control: no-cache`). Server
 changes need a restart. Session files are plain JSONL and readable with any text editor, which is
@@ -246,6 +268,10 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - The RPC `bash` command is intentionally unused — send prompts instead.
 - No authentication. See [Remote access](#remote-access).
 - No multi-user support: one person, one machine, many tabs.
+- Cross-session search indexes the text of every message in every session file, not only the active
+  branch. History from before a compaction is reachable (and rendered), but a message on a branch
+  that was branched away from has no transcript row: clicking such a hit reports that it is not on
+  the active branch instead of jumping.
 
 ## License
 

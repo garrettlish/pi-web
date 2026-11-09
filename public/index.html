@@ -33,6 +33,10 @@
           <span class="logo-text">pi<span class="logo-dim">web</span></span>
         </span>
         <span class="sidebar-actions">
+          <button id="btn-search" class="icon-btn" title="Search all sessions (Ctrl/Cmd+K)" aria-label="Search all sessions"
+                  aria-haspopup="dialog" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          </button>
           <button id="btn-workspaces" class="icon-btn" title="Switch workspace" aria-label="Switch workspace">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           </button>
@@ -75,8 +79,16 @@
           <div id="session-info-pop" class="popover hidden" role="dialog" aria-label="Session details"></div>
         </div>
         <div class="topbar-right">
-          <select id="model-select" class="hidden" title="Model"></select>
-          <select id="thinking-select" class="hidden" title="Thinking level"></select>
+          <div class="picker">
+            <button id="model-picker-btn" class="picker-btn hidden" title="Model"
+                    aria-haspopup="listbox" aria-expanded="false"><span class="picker-label">model</span></button>
+            <div id="model-menu" class="picker-menu hidden" role="listbox" aria-label="Model"></div>
+          </div>
+          <div class="picker">
+            <button id="thinking-picker-btn" class="picker-btn hidden" title="Thinking level"
+                    aria-haspopup="listbox" aria-expanded="false"><span class="picker-label">think</span></button>
+            <div id="thinking-menu" class="picker-menu hidden" role="listbox" aria-label="Thinking level"></div>
+          </div>
           <span id="context-usage" class="badge" title="Context window usage">—</span>
           <span id="session-cost" class="badge" title="Session cost / tokens">—</span>
           <button id="btn-prompt-list" class="ghost icon-btn" title="User prompts in this session" aria-label="User prompts"
@@ -125,6 +137,10 @@
     </div>
   </div>
 
+  <div id="image-overlay" class="hidden" role="dialog" aria-modal="true" aria-label="Enlarged image">
+    <img id="image-overlay-img" alt="" />
+  </div>
+
   <div id="dialog-overlay" class="hidden">
     <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <div id="dialog-title"></div>
@@ -156,8 +172,30 @@
     </div>
   </div>
 
-  <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+  <div id="search-overlay" class="hidden">
+    <div id="search-dialog" role="dialog" aria-modal="true" aria-labelledby="search-title">
+      <div class="search-head">
+        <span id="search-title">Search all sessions</span>
+        <span class="spacer"></span>
+        <span class="dim" id="search-count"></span>
+        <button id="search-close" class="ghost" title="Close (Esc)">✕</button>
+      </div>
+      <div class="search-input-row">
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="search-input" type="search" placeholder="Search prompts, responses and tool output in every workspace…"
+               autocomplete="off" spellcheck="false" aria-label="Search all sessions"
+               role="combobox" aria-expanded="true" aria-controls="search-results" aria-autocomplete="list">
+      </div>
+      <div id="search-results" class="search-results" role="listbox" aria-label="Search results"></div>
+      <div class="search-foot">
+        <span class="dim">All terms must match · newest first</span>
+        <span class="spacer"></span>
+        <span class="dim search-keys"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
 
+  <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
   <noscript>pi-web needs JavaScript enabled to talk to the local agent process.</noscript>
 
   <script src="/app.js"></script>

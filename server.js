@@ -15,10 +15,11 @@
  */
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { readFileSync, openSync, readSync, closeSync } from "node:fs";
+import { readFileSync, openSync, readSync, closeSync, createReadStream } from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -431,7 +432,10 @@ function userText(content) {
   return "";
 }
 
-async function listSessions(limit = 400) {
+/** Session files under the configured directory, newest first, with their stat.
+ *  Shared by the sidebar listing and the search index so both see one corpus
+ *  (and one directory walk) instead of drifting apart. */
+async function sessionFilesWithStats(limit = 400) {
   const files = [];
   async function walk(dir, depth) {
     let dirents;
@@ -458,7 +462,11 @@ async function listSessions(limit = 400) {
     })
   );
 
-  const usable = stats.filter(Boolean).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs).slice(0, limit);
+  return stats.filter(Boolean).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs).slice(0, limit);
+}
+
+async function listSessions(limit = 400) {
+  const usable = await sessionFilesWithStats(limit);
 
   const sessions = await Promise.all(
     usable.map(async ({ f, st }) => {
@@ -540,6 +548,238 @@ async function sessionsWithStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-session search
+// ---------------------------------------------------------------------------
+// The sidebar filter only sees each session's title (its first user prompt).
+// This index keeps the searchable text of every message — user prompts, model
+// responses, tool requests and tool results — so one query can reach any
+// occurrence in any workspace. Session files are append-mostly JSONL, so a
+// file is re-parsed only when its mtime or size changed; parsed text is kept
+// in a byte-capped LRU because a single tool result can be several megabytes.
+
+const SEARCH_MAX_HITS = 200;
+/** Text kept per record. Matches the popup's own display cap (MAX_TOOL_TEXT in
+ *  app.js), so search reaches exactly what the popup can show — a record is
+ *  never unfindable in the part a user would actually read. */
+const SEARCH_RECORD_MAX_CHARS = 200000;
+/** Parsed-text budget for the index cache, counted in text characters. Heap use
+ *  is a few times this, so it is kept well below the corpus a normal install
+ *  holds (a few hundred sessions, a few megabytes of text) to bound a machine
+ *  with enormous tool output; eviction is LRU, one file at a time. */
+const SEARCH_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+
+/** abs file -> { key, records, bytes }; Map order doubles as LRU order */
+const searchCache = new Map();
+let searchCacheBytes = 0;
+
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Searchable records of one session entry. The system prompt is skipped on
+ *  purpose: it is identical in every session and would bury every query under
+ *  false hits. Thinking blocks are skipped too — they are model scratch space,
+ *  not something the user asked for or the agent reported. */
+function searchRecordsOf(entry) {
+  if (!entry || entry.type !== "message") return [];
+  const m = entry.message;
+  if (!m || m.role === "system") return [];
+  const blocks = Array.isArray(m.content) ? m.content : [];
+  const out = [];
+  const textBlocks = () => blocks.filter((b) => b.type === "text").map((b) => b.text || "").join("\n");
+
+  if (m.role === "user") {
+    const text = typeof m.content === "string" ? m.content : textBlocks();
+    if (text.trim()) out.push({ role: "user", text });
+  } else if (m.role === "assistant") {
+    for (const b of blocks) {
+      if (b.type === "text" && b.text) {
+        out.push({ role: "assistant", text: b.text });
+      } else if (b.type === "toolCall") {
+        let args = "";
+        try {
+          args = JSON.stringify(b.arguments || {});
+        } catch {
+          args = String(b.arguments || "");
+        }
+        // the tool name is part of the text so "grep <pattern>" style queries hit
+        out.push({ role: "tool", toolName: b.name || "", toolCallId: b.id || null, text: `${b.name || ""} ${args}` });
+      }
+    }
+  } else if (m.role === "toolResult") {
+    const text = blocks.map((b) => (b.type === "text" ? b.text || "" : b.type === "image" ? "[image]" : "[block]")).join("\n");
+    if (text.trim()) out.push({ role: "toolResult", toolName: m.toolName || "", toolCallId: m.toolCallId || null, text });
+  } else if (m.role === "bashExecution") {
+    out.push({ role: "bash", text: `$ ${m.command || ""}\n${m.output || ""}` });
+  }
+
+  return out
+    .filter((r) => r.text)
+    .map((r) => ({
+      entryId: entry.id,
+      ts: entry.timestamp || null,
+      role: r.role,
+      toolName: r.toolName || null,
+      toolCallId: r.toolCallId || null,
+      text: r.text.length > SEARCH_RECORD_MAX_CHARS ? r.text.slice(0, SEARCH_RECORD_MAX_CHARS) : r.text,
+    }));
+}
+
+function touchSearchCache(file, entry) {
+  searchCache.delete(file);
+  searchCache.set(file, entry);
+}
+
+function evictSearchCache() {
+  while (searchCacheBytes > SEARCH_CACHE_MAX_BYTES && searchCache.size > 1) {
+    const [oldestFile, oldest] = searchCache.entries().next().value;
+    searchCache.delete(oldestFile);
+    searchCacheBytes -= oldest.bytes;
+  }
+}
+
+/** Read one session file line by line and build its search records. Streamed
+ *  rather than read whole: a session JSONL can be tens of megabytes, and
+ *  holding the raw text alongside the parsed records doubles the cost of
+ *  indexing the corpus. */
+async function readSearchIndex(file) {
+  const records = [];
+  let header = null;
+  let bytes = 0;
+  const stream = createReadStream(file, { encoding: "utf8" });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (!line) continue;
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue; // a partially written trailing line is normal for a live session
+      }
+      if (e.type === "session") {
+        header = e;
+        continue;
+      }
+      for (const r of searchRecordsOf(e)) {
+        bytes += Buffer.byteLength(r.text, "utf8");
+        records.push(r);
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return { records, header, bytes };
+}
+
+/** Parsed search records for one session file, from cache when unchanged. */
+async function indexSessionFile(file, st) {
+  const key = `${st.mtimeMs}:${st.size}`;
+  const cached = searchCache.get(file);
+  if (cached && cached.key === key) {
+    touchSearchCache(file, cached);
+    return cached;
+  }
+
+  const { records, header, bytes } = await readSearchIndex(file);
+
+  if (cached) searchCacheBytes -= cached.bytes;
+  const entry = {
+    key,
+    bytes,
+    records,
+    sessionId: header?.id || null,
+    cwd: header?.cwd || null,
+  };
+  searchCacheBytes += bytes;
+  touchSearchCache(file, entry);
+  evictSearchCache();
+  return entry;
+}
+
+/** Collapse whitespace so a snippet stays a single logical line, and mark it as
+ *  clipped when it does not start/end at the record's own boundary. */
+function snippetParts(text, index, matchLength) {
+  const before = 40; // enough context to recognise the sentence the match sits in
+  const after = 140;
+  const start = Math.max(0, index - before);
+  const end = Math.min(text.length, index + matchLength + after);
+  const collapse = (s) => s.replace(/\s+/g, " ");
+  return {
+    before: (start > 0 ? "…" : "") + collapse(text.slice(start, index)),
+    match: collapse(text.slice(index, index + matchLength)),
+    after: collapse(text.slice(index + matchLength, end)) + (end < text.length ? "…" : ""),
+  };
+}
+
+/** Search every session for all whitespace-separated terms (case-insensitive
+ *  substring, AND semantics). Files are walked newest-first and each file's
+ *  records newest-first, so the most recent occurrences surface first. Scanning
+ *  stops at `limit` hits and reports `truncated` rather than an invented count. */
+async function searchSessions(query, limit = SEARCH_MAX_HITS) {
+  const terms = String(query || "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8)
+    // a pathological term would make the regex scan every record for nothing
+    .map((t) => t.slice(0, 200));
+  if (!terms.length) return { hits: [], truncated: false, sessionsScanned: 0 };
+
+  const patterns = terms.map((t) => new RegExp(escapeRegExp(t), "i"));
+  const hits = [];
+  let truncated = false;
+  let sessionsScanned = 0;
+
+  const files = await sessionFilesWithStats();
+  for (const { f, st } of files) {
+    if (truncated) break;
+    let index;
+    try {
+      index = await indexSessionFile(f, st);
+    } catch {
+      continue;
+    }
+    sessionsScanned++;
+    // newest occurrence first: appended entries are chronologically last
+    for (let i = index.records.length - 1; i >= 0; i--) {
+      const r = index.records[i];
+      let firstIndex = -1;
+      let firstLength = 0;
+      let ok = true;
+      for (const re of patterns) {
+        const m = re.exec(r.text);
+        if (!m) {
+          ok = false;
+          break;
+        }
+        if (firstIndex < 0 || m.index < firstIndex) {
+          firstIndex = m.index;
+          firstLength = m[0].length;
+        }
+      }
+      if (!ok) continue;
+      if (hits.length >= limit) {
+        truncated = true;
+        break;
+      }
+      hits.push({
+        sessionFile: f,
+        sessionId: index.sessionId,
+        cwd: index.cwd,
+        entryId: r.entryId,
+        role: r.role,
+        toolName: r.toolName,
+        toolCallId: r.toolCallId,
+        ts: r.ts,
+        ...snippetParts(r.text, firstIndex, firstLength),
+      });
+    }
+  }
+
+  return { hits, truncated, sessionsScanned };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -550,6 +790,17 @@ const MIME = {
   ".svg": "image/svg+xml",
   ".png": "image/png",
 };
+
+/** Image types the read tool may return, and the sniffed magic bytes that must
+ *  match. Only these are served: an arbitrary file must never be readable
+ *  through the image endpoint just because a tool call named it. */
+const IMAGE_TYPES = new Map([
+  ["image/png", (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))],
+  ["image/jpeg", (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff],
+  ["image/gif", (b) => b.length > 6 && b.subarray(0, 4).toString("latin1") === "GIF8"],
+  ["image/webp", (b) => b.length > 12 && b.subarray(0, 4).toString("latin1") === "RIFF" && b.subarray(8, 12).toString("latin1") === "WEBP"],
+]);
+const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
 
 function sendJson(res, code, body) {
   const payload = JSON.stringify(body);
@@ -692,6 +943,17 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Cross-session full-text search: prompts, responses, tool requests and
+    // tool results across every workspace. Read-only over the session
+    // directory — the same corpus /api/sessions lists.
+    if (pathname === "/api/search" && req.method === "GET") {
+      const q = url.searchParams.get("q") || "";
+      const limitParam = Number(url.searchParams.get("limit"));
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : SEARCH_MAX_HITS;
+      sendJson(res, 200, await searchSessions(q, limit));
+      return;
+    }
+
     // Directory listing for the workspace picker (local folders only, no dotfiles)
     if (pathname === "/api/browse" && req.method === "GET") {
       const params = new URL(req.url, "http://localhost").searchParams;
@@ -714,6 +976,50 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/health" && req.method === "GET") {
       sendJson(res, 200, { ok: true, procs: procs.size });
+      return;
+    }
+
+    // Image bytes for a tool result that reports an image path but carries no
+    // image block (e.g. a `read` that returns only {content:"", fileSize}).
+    // Deliberately narrow: images only, verified by magic bytes, size-capped,
+    // and behind the same loopback/Host/Origin guards as every other route.
+    if (pathname === "/api/image" && req.method === "GET") {
+      const target = url.searchParams.get("path") || "";
+      if (!target || !path.isAbsolute(target)) {
+        sendJson(res, 400, { error: "absolute path required" });
+        return;
+      }
+      let real;
+      try {
+        real = await fsp.realpath(target);
+        const st = await fsp.stat(real);
+        if (!st.isFile()) throw new Error("not a regular file");
+        if (st.size > MAX_IMAGE_BYTES) {
+          sendJson(res, 413, { error: "image too large" });
+          return;
+        }
+      } catch (err) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      let data;
+      try {
+        data = await fsp.readFile(real);
+      } catch (err) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      const type = [...IMAGE_TYPES].find(([, matches]) => matches(data))?.[0];
+      if (!type) {
+        sendJson(res, 415, { error: "not a supported image" });
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": type,
+        "Content-Length": data.length,
+        "Cache-Control": "no-store",
+      });
+      res.end(data);
       return;
     }
 

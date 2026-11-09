@@ -394,12 +394,12 @@ function buildItemsFromEntries(entries) {
             ts,
           };
         } else {
-          items.push({ kind: "toolResultOrphan", message: m, ts });
+          items.push({ kind: "toolResultOrphan", message: m, ts, entry });
         }
         break;
       }
       case "bashExecution": {
-        items.push({ kind: "bash", message: m, ts });
+        items.push({ kind: "bash", message: m, ts, entry });
         break;
       }
       case "custom": {
@@ -591,12 +591,84 @@ function capText(t) {
   return s.length > MAX_TOOL_TEXT ? `${s.slice(0, MAX_TOOL_TEXT)}\n… truncated (${s.length} chars total)` : s;
 }
 
+/** True when a tool response carries no image block but the result payload is
+ *  only image metadata — the shape a file-reading tool returns for a picture
+ *  it cannot inline ({content: "", totalLines: 0, fileSize: N}). In that case
+ *  the popup can still show the picture by asking the server for the bytes at
+ *  the path the call names. */
+function imageMetadataPath(call, result) {
+  if (!result || result.isError) return null;
+  const content = result.content || [];
+  if (content.some((b) => b && b.type === "image")) return null;
+  const target = call.arguments?.path ?? call.arguments?.file_path ?? call.arguments?.file;
+  if (typeof target !== "string" || !target.startsWith("/")) return null;
+  const text = content.map((b) => (b && b.type === "text" ? b.text : "")).join("").trim();
+  if (!text) return null;
+  let meta;
+  try {
+    meta = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  // Only the empty-content metadata shape: a text result that happens to sit
+  // next to a path must never turn into an unrequested file fetch.
+  if (!meta || typeof meta !== "object") return null;
+  if (typeof meta.fileSize !== "number" || meta.content !== "") return null;
+  if (!/\.(png|jpe?g|gif|webp)$/i.test(target)) return null;
+  return target;
+}
+
+/** Full-window image viewer. Clicking a picture inside a tool popup must not
+ *  replace that popup: openPopup() swaps the modal's whole body, which is why
+ *  the request/response disappeared. And the modal is only 860px wide, so a
+ *  "zoomed" image there renders no bigger than the thumbnail. This overlay
+ *  sits above the modal and sizes the picture against the window instead. */
+function openImageViewer(src, alt = "tool result image") {
+  const img = $("#image-overlay-img");
+  img.src = src;
+  img.alt = alt;
+  $("#image-overlay").classList.remove("hidden");
+}
+function closeImageViewer() {
+  const overlay = $("#image-overlay");
+  if (overlay.classList.contains("hidden")) return;
+  overlay.classList.add("hidden");
+  $("#image-overlay-img").removeAttribute("src");
+}
+// click anywhere (the image included) dismisses it — the cursor says zoom-out
+$("#image-overlay").addEventListener("click", closeImageViewer);
+
+/** clickable image that enlarges into the viewer above. A failed fetch (the
+ *  file is gone, or the server refuses it) is reported in place: a broken-image
+ *  icon in the middle of a tool popup says nothing about why. */
+function imageEl(src) {
+  const img = el("img", { src, alt: "tool result image", title: "Click to enlarge", onclick: () => openImageViewer(src) });
+  img.addEventListener("error", () => {
+    img.replaceWith(el("div", { class: "tc-text dim", text: `image could not be loaded: ${src.startsWith("data:") ? "inline image data is invalid" : decodeURIComponent(src)}` }));
+  });
+  return el("div", { class: "tc-image-wrap" }, img);
+}
+
+/** image section for a tool result, from an inline block or a served path */
+function imageResultSection(title, blocks) {
+  const sec = el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: title }));
+  for (const src of blocks) sec.append(imageEl(src));
+  return sec;
+}
+
 /** rich body for one tool call: arguments, live execution updates, response.
  *  Rendered inside the popup — never inline, so it cannot shove the rest of
  *  the transcript off screen. */
 function buildToolcallBody(call, exec, result) {
   const body = el("div", { class: "tc-body" });
   const diff = typeof result?.details?.diff === "string" ? result.details.diff : null;
+
+  // A tool that read a picture and could only report its size is the common
+  // case worth leading with: show the image itself, above the JSON.
+  const imagePath = imageMetadataPath(call, result);
+  if (imagePath) {
+    body.append(imageResultSection("image", [`/api/image?path=${encodeURIComponent(imagePath)}`]));
+  }
 
   // edit calls lead with the colored diff — seeing what changed is the point
   // of the popup; the raw request/response follow below
@@ -632,7 +704,7 @@ function buildToolcallBody(call, exec, result) {
         const txt = capText(b.text || "");
         sec.append(looksLikeDiff(txt) ? diffBlock(txt) : el("div", { class: "tc-text", text: txt }));
       } else if (b.type === "image") {
-        sec.append(el("img", { src: `data:${b.mimeType};base64,${b.data}` }));
+        sec.append(imageEl(`data:${b.mimeType};base64,${b.data}`));
       }
     }
     if (result.details != null && !(call.name === "edit" && diff)) {
@@ -924,36 +996,196 @@ function renderHeader() {
   // on open, so header re-renders stay cheap
   if (!$("#session-info-pop").classList.contains("hidden")) renderSessionInfo();
 
-  const modelSel = $("#model-select");
-  if (state.models.length) {
-    modelSel.classList.remove("hidden");
-    modelSel.innerHTML = "";
-    const byProvider = new Map();
-    for (const m of state.models) {
-      if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
-      byProvider.get(m.provider).push(m);
-    }
-    for (const [provider, models] of [...byProvider.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const group = el("optgroup", { label: provider });
-      for (const m of models) {
-        const opt = el("option", { value: `${m.provider}/${m.id}`, text: m.name || m.id });
-        opt.selected = state.model && state.model.provider === m.provider && state.model.id === m.id;
-        group.append(opt);
-      }
-      modelSel.append(group);
+  renderModelPicker();
+  renderThinkingPicker();
+}
+
+/** Header label of a picker button: the current value, or a placeholder when
+ *  nothing is selected yet. */
+function pickerLabel(text) {
+  return `<span class="picker-label">${esc(text)}</span>`;
+}
+
+function renderModelPicker() {
+  const btn = $("#model-picker-btn");
+  const menu = $("#model-menu");
+  if (!state.models.length) {
+    btn.classList.add("hidden");
+    setPickerOpen(menu, false);
+    return;
+  }
+  btn.classList.remove("hidden");
+  const current = state.model
+    ? state.models.find((m) => m.provider === state.model.provider && m.id === state.model.id)
+    : null;
+  btn.replaceChildren(...htmlFragment(pickerLabel(current ? current.name || current.id : "select model")));
+
+  // Rebuild only when the option set or the selection changed: renderHeader
+  // runs on nearly every event, and rebuilding the open menu would drop focus.
+  const sig = `${state.models.map((m) => `${m.provider}/${m.id}`).join("|")}#${current ? `${current.provider}/${current.id}` : ""}`;
+  if (menu.dataset.sig === sig) return;
+  menu.dataset.sig = sig;
+  menu.innerHTML = "";
+
+  const byProvider = new Map();
+  for (const m of state.models) {
+    if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+    byProvider.get(m.provider).push(m);
+  }
+  for (const [provider, models] of [...byProvider.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    menu.append(el("div", { class: "picker-group", text: provider }));
+    for (const m of models) {
+      const isCurrent = current && current.provider === m.provider && current.id === m.id;
+      menu.append(
+        el(
+          "button",
+          {
+            class: `picker-item${isCurrent ? " selected" : ""}`,
+            role: "option",
+            "aria-selected": String(!!isCurrent),
+            title: `${m.provider}/${m.id}`,
+            onclick: () => pickModel(m.provider, m.id),
+          },
+          el("span", { class: "picker-check", text: isCurrent ? "✓" : "" }),
+          el("span", { class: "picker-text", text: m.name || m.id })
+        )
+      );
     }
   }
-  const thinkSel = $("#thinking-select");
-  thinkSel.innerHTML = "";
-  if (state.thinkingLevels.length) {
-    thinkSel.classList.remove("hidden");
-    for (const lv of state.thinkingLevels) {
-      const opt = el("option", { value: lv, text: `think: ${lv}` });
-      opt.selected = lv === state.thinkingLevel;
-      thinkSel.append(opt);
-    }
+}
+
+function renderThinkingPicker() {
+  const btn = $("#thinking-picker-btn");
+  const menu = $("#thinking-menu");
+  if (!state.thinkingLevels.length) {
+    btn.classList.add("hidden");
+    setPickerOpen(menu, false);
+    return;
+  }
+  btn.classList.remove("hidden");
+  btn.replaceChildren(...htmlFragment(pickerLabel(`think: ${state.thinkingLevel || "—"}`)));
+
+  const sig = `${state.thinkingLevels.join("|")}#${state.thinkingLevel || ""}`;
+  if (menu.dataset.sig === sig) return;
+  menu.dataset.sig = sig;
+  menu.innerHTML = "";
+  for (const lv of state.thinkingLevels) {
+    const isCurrent = lv === state.thinkingLevel;
+    menu.append(
+      el(
+        "button",
+        {
+          class: `picker-item${isCurrent ? " selected" : ""}`,
+          role: "option",
+          "aria-selected": String(isCurrent),
+          onclick: () => pickThinkingLevel(lv),
+        },
+        el("span", { class: "picker-check", text: isCurrent ? "✓" : "" }),
+        el("span", { class: "picker-text", text: lv })
+      )
+    );
+  }
+}
+
+/** Open/close a header picker menu. When opening, the menu is anchored to the
+ *  BOTTOM of its button and its height is clamped to the space left below it:
+ *  opening downward is what the user expects, and a menu that never exceeds
+ *  the viewport cannot push its first rows off screen. */
+function setPickerOpen(menu, open) {
+  // Unhide first: the horizontal fit below reads the menu's real width, which
+  // is 0 while it is display:none.
+  menu.classList.toggle("hidden", !open);
+  if (open) positionPickerMenu(menu);
+  const btn = menu.previousElementSibling;
+  if (btn) btn.setAttribute("aria-expanded", String(open));
+}
+
+/** Clamp an open menu under its button: height limited to the room below (so
+ *  it scrolls instead of running past the viewport edge) and horizontal
+ *  placement kept inside the window for narrow layouts. */
+function positionPickerMenu(menu) {
+  const btn = menu.previousElementSibling;
+  if (!btn) return;
+  menu.style.maxHeight = "";
+  menu.style.left = "";
+  menu.style.right = "";
+  const b = btn.getBoundingClientRect();
+  const gap = 6;
+  const margin = 8;
+  const below = window.innerHeight - b.bottom - gap - margin;
+  // Keep it below at all times: on a very short window the list simply gets
+  // shorter and scrolls rather than flipping above the button and clipping.
+  menu.style.maxHeight = `${Math.max(120, Math.min(420, below))}px`;
+  // Right-aligned by default (matches the right-hand header cluster); switch
+  // to left alignment only when that would push the menu off the left edge.
+  const width = Math.max(menu.offsetWidth, 180);
+  if (b.right - width < margin) {
+    menu.style.right = "auto";
+    menu.style.left = "0";
   } else {
-    thinkSel.classList.add("hidden");
+    menu.style.right = "0";
+    menu.style.left = "auto";
+  }
+}
+
+function closePickers() {
+  setPickerOpen($("#model-menu"), false);
+  setPickerOpen($("#thinking-menu"), false);
+}
+
+/** Bind a header picker button to its menu. Opening one closes the other, and
+ *  inner clicks must not reach the click-away handler on document. */
+function wirePicker(btnSel, menuSel) {
+  const btn = $(btnSel);
+  const menu = $(menuSel);
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = menu.classList.contains("hidden");
+    closePickers();
+    setPickerOpen(menu, open);
+  });
+  menu.addEventListener("click", (e) => e.stopPropagation());
+}
+wirePicker("#model-picker-btn", "#model-menu");
+wirePicker("#thinking-picker-btn", "#thinking-menu");
+document.addEventListener("click", closePickers);
+// A resize changes the room below the button, so an open menu must re-clamp:
+// without this it keeps the old max-height and can run past the new edge.
+window.addEventListener("resize", () => {
+  for (const menu of [$("#model-menu"), $("#thinking-menu")]) {
+    if (!menu.classList.contains("hidden")) positionPickerMenu(menu);
+  }
+});
+
+async function pickModel(provider, modelId) {
+  closePickers();
+  // record intent BEFORE the RPC round-trip: a refresh() get_state issued
+  // earlier but resolving later carries the pre-pick model and must not
+  // overwrite this selection
+  state.modelPickedAt = Date.now();
+  try {
+    await cmd("set_model", { provider, modelId });
+    const st = await cmd("get_state");
+    state.model = st.data?.model;
+    state.thinkingLevel = st.data?.thinkingLevel;
+    const lv = await cmd("get_available_thinking_levels");
+    state.thinkingLevels = lv.data?.levels || [];
+    renderHeader();
+    toast(`model → ${provider}/${modelId}`);
+  } catch (err) {
+    toast(`set model failed: ${err.message}`, "error");
+    loadModels();
+  }
+}
+
+async function pickThinkingLevel(level) {
+  closePickers();
+  try {
+    await cmd("set_thinking_level", { level });
+    state.thinkingLevel = level;
+    renderHeader();
+  } catch (err) {
+    toast(`set thinking failed: ${err.message}`, "error");
   }
 }
 
@@ -1053,6 +1285,11 @@ function scrollToUserPrompt(item) {
   const node = item.node;
   if (!node || !node.isConnected) return;
   node.scrollIntoView({ block: "start", behavior: "smooth" });
+  flashNode(node);
+}
+
+/** brief highlight drawing the eye to a node that was just jumped to */
+function flashNode(node) {
   node.classList.remove("prompt-flash");
   void node.offsetWidth; // restart the animation if it is already flashing
   node.classList.add("prompt-flash");
@@ -1395,6 +1632,254 @@ async function loadSessions() {
     console.error(err);
   }
 }
+
+// ---------------------------------------------------------------------------
+// cross-session search
+// ---------------------------------------------------------------------------
+// The sidebar filter only matches a session's title (its first prompt). This
+// dialog queries the server's index, which covers every prompt, response, tool
+// request and tool result in every workspace, and jumps to the occurrence.
+const searchOverlay = $("#search-overlay");
+const searchInput = $("#search-input");
+const searchResultsEl = $("#search-results");
+const searchCountEl = $("#search-count");
+const SEARCH_LIMIT = 200;
+let searchHits = [];
+let searchIndex = 0;
+let searchTimer = null;
+let searchGen = 0; // guards against a slow earlier query overwriting a newer one
+let searchReturnFocus = null;
+
+function searchRoleLabel(hit) {
+  if (hit.role === "user") return "you";
+  if (hit.role === "assistant") return "pi";
+  if (hit.role === "toolResult") return hit.toolName ? `result: ${hit.toolName}` : "result";
+  if (hit.role === "tool") return hit.toolName ? `call: ${hit.toolName}` : "call";
+  return hit.role;
+}
+
+function setSearchOpen(open) {
+  searchOverlay.classList.toggle("hidden", !open);
+  $("#btn-search").setAttribute("aria-expanded", String(open));
+  if (open) {
+    searchReturnFocus = document.activeElement;
+    searchInput.focus();
+    searchInput.select();
+    // the dialog reopens with its previous query and hits still rendered; the
+    // selection is re-applied because the rows were rebuilt while it was hidden
+    if (searchHits.length) selectSearchIndex(searchIndex, { scroll: true });
+  } else if (searchReturnFocus && searchReturnFocus.isConnected) {
+    searchReturnFocus.focus({ preventScroll: true });
+  }
+}
+
+/** Move the selection without rebuilding the list (mouse hover and arrows). */
+function selectSearchIndex(i, { scroll = false } = {}) {
+  const rows = searchResultsEl.querySelectorAll(".sr-item");
+  if (!rows.length || i < 0 || i >= rows.length) return;
+  searchIndex = i;
+  rows.forEach((row, k) => {
+    row.classList.toggle("selected", k === i);
+    row.setAttribute("aria-selected", String(k === i));
+  });
+  // the combobox points at the active row so screen readers announce it
+  searchInput.setAttribute("aria-activedescendant", rows[i].id);
+  if (scroll) rows[i].scrollIntoView({ block: "nearest" });
+}
+
+/** render the result rows, or a single explanatory line when there are none */
+function renderSearchResults(emptyMessage) {
+  searchResultsEl.innerHTML = "";
+  searchInput.setAttribute("aria-expanded", String(searchHits.length > 0));
+  if (!searchHits.length) {
+    searchInput.removeAttribute("aria-activedescendant");
+    searchResultsEl.append(el("div", { class: "sr-empty", text: emptyMessage || "No matches in any session" }));
+    return;
+  }
+  const byFile = new Map(state.sessions.map((s) => [s.file, s]));
+  searchHits.forEach((hit, i) => {
+    const meta = byFile.get(hit.sessionFile);
+    const label = meta?.name || meta?.title || hit.sessionFile.split("/").pop().replace(/\.jsonl$/, "");
+    searchResultsEl.append(
+      el(
+        "div",
+        {
+          class: `sr-item${i === searchIndex ? " selected" : ""}`,
+          id: `sr-${i}`,
+          role: "option",
+          "aria-selected": String(i === searchIndex),
+          onclick: () => openSearchHit(hit),
+          onmouseenter: () => selectSearchIndex(i),
+        },
+        el(
+          "div",
+          { class: "sr-top" },
+          el("span", { class: `sr-role ${hit.role}`, text: searchRoleLabel(hit) }),
+          el("span", { class: "sr-ws", text: wsLabel(hit.cwd) || "(unknown)", title: hit.cwd || "" }),
+          el("span", { class: "sr-session", text: label, title: hit.sessionFile }),
+          el("span", { class: "sr-time", text: hit.ts ? fmtDate(Date.parse(hit.ts)) : "" })
+        ),
+        el(
+          "div",
+          { class: "sr-text" },
+          document.createTextNode(hit.before || ""),
+          el("mark", { text: hit.match || "" }),
+          document.createTextNode(hit.after || "")
+        )
+      )
+    );
+  });
+}
+
+async function runSearch(query) {
+  const q = query.trim();
+  const gen = ++searchGen;
+  if (!q) {
+    searchHits = [];
+    searchIndex = 0;
+    searchCountEl.textContent = "";
+    renderSearchResults("Type to search every prompt, response and tool output");
+    return;
+  }
+  searchCountEl.textContent = "searching…";
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${SEARCH_LIMIT}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+    if (gen !== searchGen) return; // a newer query already took over
+    searchHits = Array.isArray(data.hits) ? data.hits : [];
+    searchIndex = 0;
+    renderSearchResults();
+    searchResultsEl.scrollTop = 0;
+    const n = searchHits.length;
+    searchCountEl.textContent = data.truncated ? `first ${n} matches` : n ? `${n} match${n === 1 ? "" : "es"}` : "";
+  } catch (err) {
+    if (gen !== searchGen) return;
+    searchCountEl.textContent = "";
+    renderSearchResults(`search failed: ${err.message}`);
+  }
+}
+
+function queueSearch(delay = 180) {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    searchTimer = null;
+    runSearch(searchInput.value);
+  }, delay);
+}
+
+/** scroll to the entry a hit points at and flash it; tool hits open their popup
+ *  because the transcript row is one line and the match lives in the body */
+function findOccurrence(hit) {
+  // tool calls and their results both live inside the assistant item that made
+  // the call, so they are located by call id before the entry id is tried
+  if (hit.toolCallId) {
+    for (const item of state.items) {
+      if (item.kind !== "assistant") continue;
+      const block = item.blocks.find((b) => b.type === "toolcall" && b.call.id === hit.toolCallId);
+      if (block) return { item, block };
+    }
+  }
+  for (const item of state.items) {
+    if (item.entry && item.entry.id === hit.entryId) return { item, block: null };
+  }
+  // a result whose call is gone still renders as its own orphan row
+  if (hit.toolCallId) {
+    for (const item of state.items) {
+      if (item.kind === "toolResultOrphan" && item.message?.toolCallId === hit.toolCallId) return { item, block: null };
+    }
+    for (const item of state.items) {
+      if (item.kind === "toolResultOrphan" && item.message?.timestamp === hit.ts) return { item, block: null };
+    }
+  }
+  return null;
+}
+
+async function revealOccurrence(hit) {
+  let found = findOccurrence(hit);
+  if (!found && !state.isStreaming) {
+    // the cached view may predate the entry (or a compaction moved the branch).
+    // Skipped while streaming: refresh() rebuilds from persisted entries and a
+    // run in flight would lose the item it is still writing to.
+    await refresh({ sessions: false });
+    found = findOccurrence(hit);
+  }
+  if (!found) {
+    toast("that message is not on this session's active branch", "warning", 7000);
+    return;
+  }
+  const { item, block } = found;
+  if (item.dirty || !item.node) {
+    // renderTranscript() reconciles cached nodes 1:1; rendering an item without
+    // it would leave a detached node that scrollIntoView cannot reach
+    item.dirty = true;
+    renderTranscript({ follow: false });
+  }
+  const node = item.node;
+  const host = block
+    ? node?.querySelector(`.toolcall[data-call-id="${CSS.escape(block.call.id)}"]`) || node
+    : node;
+  if (!host || !host.isConnected) {
+    toast("could not locate that message in the transcript", "warning", 7000);
+    return;
+  }
+  host.scrollIntoView({ block: scrollBlockFor(host), behavior: "smooth" });
+  flashNode(host);
+  if (block) openToolcall(block.call, block);
+}
+
+/** Center a short target, but align a target taller than the transcript
+ *  viewport to its top — centering one would push its first lines (where a
+ *  prompt starts) above the fold with no way to tell it was scrolled to. */
+function scrollBlockFor(node) {
+  const viewport = transcriptEl.clientHeight;
+  return node.getBoundingClientRect().height > viewport * 0.8 ? "start" : "center";
+}
+
+async function openSearchHit(hit) {
+  setSearchOpen(false);
+  if (hit.sessionFile !== state.sessionFile) {
+    const meta = state.sessions.find((s) => s.file === hit.sessionFile);
+    await switchSession(hit.sessionFile, hit.cwd || meta?.cwd || undefined);
+    if (hit.sessionFile !== state.sessionFile) return; // switch failed; it toasted
+  }
+  await revealOccurrence(hit);
+}
+
+searchInput.addEventListener("input", () => {
+  searchIndex = 0;
+  queueSearch();
+});
+searchInput.addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return; // IME candidate selection
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    selectSearchIndex(Math.min(searchIndex + 1, searchHits.length - 1), { scroll: true });
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    selectSearchIndex(Math.max(searchIndex - 1, 0), { scroll: true });
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    const hit = searchHits[searchIndex];
+    if (hit) openSearchHit(hit);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation(); // do not fall through to the global Esc actions
+    setSearchOpen(false);
+  }
+});
+$("#btn-search").addEventListener("click", () => setSearchOpen(searchOverlay.classList.contains("hidden")));
+$("#search-close").addEventListener("click", () => setSearchOpen(false));
+searchOverlay.addEventListener("click", (e) => {
+  if (e.target === searchOverlay) setSearchOpen(false);
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    setSearchOpen(searchOverlay.classList.contains("hidden"));
+  }
+});
+renderSearchResults("Type to search every prompt, response and tool output");
 
 // ---------------------------------------------------------------------------
 // actions
@@ -2679,47 +3164,23 @@ $("#btn-theme").addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
 });
 
-$("#model-select").addEventListener("change", async (e) => {
-  const [provider, ...rest] = e.target.value.split("/");
-  const modelId = rest.join("/");
-  // record intent BEFORE the RPC round-trip: a refresh() get_state issued
-  // earlier but resolving later carries the pre-pick model and must not
-  // overwrite this selection
-  state.modelPickedAt = Date.now();
-  try {
-    await cmd("set_model", { provider, modelId });
-    const st = await cmd("get_state");
-    state.model = st.data?.model;
-    state.thinkingLevel = st.data?.thinkingLevel;
-    const lv = await cmd("get_available_thinking_levels");
-    state.thinkingLevels = lv.data?.levels || [];
-    renderHeader();
-    toast(`model → ${provider}/${modelId}`);
-  } catch (err) {
-    toast(`set model failed: ${err.message}`, "error");
-    loadModels();
-  }
-});
-
-$("#thinking-select").addEventListener("change", async (e) => {
-  try {
-    await cmd("set_thinking_level", { level: e.target.value });
-    state.thinkingLevel = e.target.value;
-  } catch (err) {
-    toast(`set thinking failed: ${err.message}`, "error");
-  }
-});
-
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (!$("#session-info-pop").classList.contains("hidden")) {
+    if (!$("#model-menu").classList.contains("hidden") || !$("#thinking-menu").classList.contains("hidden")) {
+      closePickers();
+    } else if (!$("#session-info-pop").classList.contains("hidden")) {
       setSessionInfoOpen(false);
     } else if (!$("#prompt-list-pop").classList.contains("hidden")) {
       setPromptListOpen(false);
+    } else if (!searchOverlay.classList.contains("hidden")) {
+      setSearchOpen(false);
     } else if (!$("#ws-overlay").classList.contains("hidden")) {
       closeWsPicker();
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
       $("#dialog-cancel").click();
+    } else if (!$("#image-overlay").classList.contains("hidden")) {
+      // the viewer sits above the tool popup, so it closes first
+      closeImageViewer();
     } else if (!$("#modal-overlay").classList.contains("hidden")) {
       closeModal();
     } else if (state.isStreaming && document.activeElement !== inputEl) {

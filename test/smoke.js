@@ -15,12 +15,23 @@
  */
 import { spawn } from "node:child_process";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PORT = Number(process.env.SMOKE_PORT || 3300 + Math.floor(Math.random() * 400));
 const BASE = `http://127.0.0.1:${PORT}`;
+
+// A throwaway session directory keeps /api/sessions and /api/search
+// deterministic and independent of whatever real sessions this machine has.
+const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-smoke-"));
+function writeFixture(dirName, file, lines) {
+  const dir = path.join(FIXTURE_DIR, dirName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, file), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+}
 
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -60,10 +71,75 @@ function rawRequestStatus(pathname, headers = {}) {
   });
 }
 
-const server = spawn(process.execPath, [path.join(ROOT, "server.js"), "--port", String(PORT)], {
-  cwd: ROOT,
-  stdio: ["ignore", "pipe", "pipe"],
-});
+// Two workspaces, each with one session. The fixture exercises every searchable
+// channel and two of the exclusion rules (system prompt, thinking blocks).
+writeFixture("--tmp-ws-alpha--", "2026-01-01T00-00-00-000Z_aaaa.jsonl", [
+  { type: "session", version: 3, id: "aaaa", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp/ws-alpha" },
+  {
+    type: "message",
+    id: "u1",
+    parentId: null,
+    timestamp: "2026-01-01T00:00:01.000Z",
+    message: { role: "user", content: [{ type: "text", text: "please inspect the flibbertigibbet module" }] },
+  },
+  {
+    type: "message",
+    id: "a1",
+    parentId: "u1",
+    timestamp: "2026-01-01T00:00:02.000Z",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "SEARCHTHINKINGONLY private reasoning" },
+        { type: "text", text: "the flibbertigibbet module exports nothing useful" },
+        { type: "toolCall", id: "call-1", name: "grep", arguments: { pattern: "SEARCHTOOLARG flibbertigibbet" } },
+      ],
+    },
+  },
+  {
+    type: "message",
+    id: "r1",
+    parentId: "a1",
+    timestamp: "2026-01-01T00:00:03.000Z",
+    message: { role: "toolResult", toolCallId: "call-1", toolName: "grep", content: [{ type: "text", text: "SEARCHTOOLOUT flibbertigibbet.js:1" }] },
+  },
+]);
+writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
+  { type: "session", version: 3, id: "bbbb", timestamp: "2026-02-02T00:00:00.000Z", cwd: "/tmp/ws-beta" },
+  {
+    type: "message",
+    id: "u2",
+    parentId: null,
+    timestamp: "2026-02-02T00:00:01.000Z",
+    message: { role: "user", content: [{ type: "text", text: "unrelated request about widgets" }] },
+  },
+  {
+    type: "message",
+    id: "s1",
+    parentId: null,
+    timestamp: "2026-02-02T00:00:02.000Z",
+    message: { role: "system", content: "SEARCHSYSTEMONLY system preamble" },
+  },
+  {
+    type: "message",
+    id: "a2",
+    parentId: "u2",
+    timestamp: "2026-02-02T00:00:03.000Z",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "the widgets are fine, and so is flibbertigibbet" }],
+    },
+  },
+]);
+
+const server = spawn(
+  process.execPath,
+  [path.join(ROOT, "server.js"), "--port", String(PORT), "--session-dir", FIXTURE_DIR],
+  {
+    cwd: ROOT,
+    stdio: ["ignore", "pipe", "pipe"],
+  }
+);
 let serverLog = "";
 server.stdout.on("data", (d) => (serverLog += d));
 server.stderr.on("data", (d) => (serverLog += d));
@@ -99,6 +175,47 @@ try {
   const sessions = await (await fetch(`${BASE}/api/sessions`)).json();
   check("/api/sessions returns a list", Array.isArray(sessions.sessions));
 
+  // Cross-session search: every channel (prompt, response, tool request, tool
+  // result) is reachable, the system prompt and thinking blocks are not, and
+  // the route sits behind the same localhost guards as everything else.
+  const search = async (q) => (await fetch(`${BASE}/api/search?q=${encodeURIComponent(q)}`)).json();
+  const both = await search("flibbertigibbet");
+  check("/api/search returns a hits list", Array.isArray(both.hits));
+  check("/api/search reports truncation state", typeof both.truncated === "boolean");
+  check(
+    "/api/search reaches every workspace",
+    new Set(both.hits.map((h) => h.cwd)).size === 2,
+    JSON.stringify(both.hits.map((h) => h.cwd))
+  );
+  const channels = new Set(both.hits.map((h) => h.role));
+  for (const role of ["user", "assistant", "tool", "toolResult"]) {
+    check(`/api/search matches ${role} content`, channels.has(role), [...channels].join(","));
+  }
+  check("/api/search scopes hits to the matching entry", both.hits.every((h) => h.match.toLowerCase() === "flibbertigibbet"));
+  check("/api/search returns a snippet around the match", both.hits.every((h) => h.before != null && h.after != null && h.entryId));
+
+  const toolArg = await search("SEARCHTOOLARG");
+  check("/api/search matches tool-call arguments", toolArg.hits.length > 0 && toolArg.hits.every((h) => h.role === "tool"));
+  const toolOut = await search("SEARCHTOOLOUT");
+  check("/api/search matches tool results", toolOut.hits.length > 0 && toolOut.hits.every((h) => h.role === "toolResult"));
+  check(
+    "/api/search ignores the system prompt",
+    (await search("SEARCHSYSTEMONLY")).hits.length === 0
+  );
+  check("/api/search ignores thinking blocks", (await search("SEARCHTHINKINGONLY")).hits.length === 0);
+  check(
+    "/api/search requires all terms",
+    (await search("flibbertigibbet widgets")).hits.length === 1,
+    JSON.stringify((await search("flibbertigibbet widgets")).hits.map((h) => h.role))
+  );
+  check("/api/search is case-insensitive", (await search("FLIBBERTIGIBBET")).hits.length === both.hits.length);
+  const emptySearch = await search("");
+  check("/api/search ignores an empty query", Array.isArray(emptySearch.hits) && emptySearch.hits.length === 0);
+  const searchCrossOrigin = await fetch(`${BASE}/api/search?q=flibbertigibbet`, {
+    headers: { Origin: "https://evil.example.com" },
+  });
+  check("cross-origin search is rejected", searchCrossOrigin.status === 403, `got ${searchCrossOrigin.status}`);
+
   const browse = await (await fetch(`${BASE}/api/browse?path=${encodeURIComponent(ROOT)}`)).json();
   check("/api/browse lists directories", Array.isArray(browse.dirs) && browse.dirs.includes("public"));
 
@@ -130,6 +247,17 @@ try {
   check("command without a type is rejected", badCmd.status === 400, `got ${badCmd.status}`);
   check("no stack trace leaks in the error body", !(await badCmd.text()).includes("at Object."));
 
+  // /api/image must serve images only: a traversal-ish path, a relative path,
+  // a non-image file and a missing file are all refused.
+  const img = (q) => fetch(`${BASE}/api/image?${q}`);
+  check("/api/image rejects a relative path", (await img("path=package.json")).status === 400);
+  check("/api/image rejects an empty path", (await img("path=")).status === 400);
+  check("/api/image 404s a missing file", (await img(`path=${encodeURIComponent("/tmp/pi-web-nope.png")}`)).status === 404);
+  const notImage = await img(`path=${encodeURIComponent(path.join(ROOT, "server.js"))}`);
+  check("/api/image refuses a non-image file", notImage.status === 415, `got ${notImage.status}`);
+  const realPng = path.join(ROOT, "public", "favicon.svg");
+  check("/api/image refuses SVG (no script-bearing types)", (await img(`path=${encodeURIComponent(realPng)}`)).status === 415);
+
   // Only run the agent-backed check when pi is actually installed: /api/open
   // succeeds either way, so ask the agent for its state and treat a 503 as
   // "no agent here" rather than a pass.
@@ -155,6 +283,7 @@ try {
   check("server still alive after the request matrix", (await fetch(`${BASE}/api/health`)).ok);
 } finally {
   stopServer();
+  fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });
 }
 
 if (failures) {
