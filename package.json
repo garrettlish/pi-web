@@ -1,0 +1,34 @@
+{
+  "name": "pi-web",
+  "version": "0.1.0",
+  "description": "A local web UI for the pi coding agent: streamed transcripts, chat-history browsing, and a full inspector for every LLM and tool call.",
+  "type": "module",
+  "bin": {
+    "pi-web": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js",
+    "check": "node --check server.js && node --check public/app.js && node --check test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "web-ui",
+    "rpc",
+    "llm",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/garrettlish/pi-web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/garrettlish/pi-web/issues"
+  },
+  "homepage": "https://github.com/garrettlish/pi-web#readme"
+}

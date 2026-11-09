@@ -46,6 +46,18 @@ function fmtTokens(n) {
   if (n == null) return "—";
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
+/** exact token counts for the header/context popover: 60000 -> "60,000" */
+function fmtNum(n) {
+  if (n == null || isNaN(n)) return "—";
+  return Math.round(n).toLocaleString("en-US");
+}
+/** compact k-unit counts for the ctx pill: 60000 -> "60k", 1000000 -> "1,000k" */
+function fmtK(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1000) return Math.round(n).toLocaleString("en-US");
+  const k = n / 1000;
+  return `${Number.isInteger(k) ? k.toLocaleString("en-US") : k.toFixed(1)}k`;
+}
 
 function toast(message, type = "info", ms = 5000) {
   const t = el("div", { class: `toast ${type}`, text: message });
@@ -77,7 +89,11 @@ const state = {
   sessionFile: null,
   sessionId: null,
   sessionName: null,
+  leafId: null, // active-branch leaf from get_entries
+  model: null,
   models: [],
+  commands: [], // discoverable slash commands (extension commands, prompt templates, skills)
+  thinkingLevel: null,
   thinkingLevels: [],
   stats: null,
   queued: { steering: [], followUp: [] },
@@ -368,6 +384,44 @@ function jsonBlock(obj, cls = "tc-json") {
   return el("pre", { class: cls, text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) });
 }
 
+/** true when a tool response contains a unified diff body (hunk headers) */
+function looksLikeDiff(text) {
+  let hunks = 0, changes = 0;
+  for (const line of text.split("\n")) {
+    if (/^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/.test(line)) hunks++;
+    else if (line.startsWith("+") || line.startsWith("-")) changes++;
+    if (hunks > 0 && changes > 0) return true;
+  }
+  return false;
+}
+
+/** colored unified-diff view: red deletions, green additions, blue hunk
+ *  headers — plain rendering for any non-diff preamble (title, stat line) */
+function diffBlock(text) {
+  const wrap = el("div", { class: "tc-text tc-diff" });
+  let inDiff = false;
+  for (const line of text.split("\n")) {
+    if (!inDiff && /^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/.test(line)) inDiff = true;
+    let cls = "";
+    if (inDiff) {
+      if (/^@@/.test(line)) cls = "dhunk";
+      else if (/^(---|\+\+\+) /.test(line)) cls = "dfile";
+      else if (line.startsWith("+")) cls = "dadd";
+      else if (line.startsWith("-")) cls = "ddel";
+      else if (/^\\ No newline/.test(line)) cls = "dmeta";
+    }
+    const row = el("div", { class: `dline${cls ? ` ${cls}` : ""}` });
+    if (cls === "dadd" || cls === "ddel") {
+      // keep the body text at default color; tint the +/- sign for emphasis
+      row.append(el("span", { class: "dsign", text: line[0] }), line.slice(1) || " ");
+    } else {
+      row.textContent = line || " ";
+    }
+    wrap.append(row);
+  }
+  return wrap;
+}
+
 /** one tool call card */
 function renderToolcall(item, block) {
   const call = block.call;
@@ -428,7 +482,7 @@ function renderToolcall(item, block) {
     for (const b of result.content || []) {
       if (b.type === "text") {
         const txt = b.text || "";
-        const pre = el("div", { class: "tc-text", text: txt });
+        const pre = looksLikeDiff(txt) ? diffBlock(txt) : el("div", { class: "tc-text", text: txt });
         if (txt.length > 2000) {
           pre.classList.add("clipped");
           const more = el("span", { class: "tc-expand", text: `show all (${txt.length} chars)`, onclick: () => { pre.classList.toggle("clipped"); more.textContent = pre.classList.contains("clipped") ? `show all (${txt.length} chars)` : "collapse"; } });
@@ -522,20 +576,31 @@ function renderItem(item) {
     }
     case "toolResultOrphan": {
       const m = item.message;
-      return el(
+      // orphaned results can carry a huge payload (e.g. every replayed read);
+      // keep them collapsed by default like normal tool cards — the head
+      // toggles the body, double-click opens the raw JSON inspector
+      const key = `orphan-${m.toolCallId || m.timestamp || ""}`;
+      const isOpen = state.openToolcalls.has(key);
+      const card = el("div", { class: `toolcall ${isOpen ? "open" : ""}`, "data-call-id": key });
+      const head = el(
         "div",
-        { class: "item" },
-        el(
-          "div",
-          { class: "toolcall" },
-          el("div", { class: "tc-head", onclick: () => openModal(`tool result: ${m.toolName}`, m) },
-            el("span", { class: "tc-name", text: m.toolName }),
-            el("span", { class: "tc-summary", text: "(orphaned tool result)" }),
-            el("span", { class: `tc-status ${m.isError ? "error" : "ok"}`, text: m.isError ? "error" : "done" })
-          ),
-          el("div", { class: "tc-body", style: "display:block" }, el("div", { class: "tc-text", text: resultText(m.content).slice(0, 4000) }))
-        )
+        {
+          class: "tc-head",
+          role: "button",
+          tabindex: "0",
+          "aria-expanded": String(isOpen),
+          title: "Click to expand · double-click for raw JSON",
+          onclick: () => toggleToolcall(item, key, head),
+          onkeydown: onActivate(() => toggleToolcall(item, key, head)),
+        },
+        el("span", { class: "tc-chevron", text: "▸" }),
+        el("span", { class: "tc-name", text: m.toolName }),
+        el("span", { class: "tc-summary", text: "(orphaned tool result)" }),
+        el("span", { class: `tc-status ${m.isError ? "error" : "ok"}`, text: m.isError ? "error" : "done" })
       );
+      head.addEventListener("dblclick", () => openModal(`tool result: ${m.toolName}`, m));
+      card.append(head, el("div", { class: "tc-body" }, el("div", { class: "tc-text", text: resultText(m.content).slice(0, 4000) })));
+      return el("div", { class: "item" }, card);
     }
     case "bash": {
       const m = item.message;
@@ -650,13 +715,26 @@ $("#btn-jump").addEventListener("click", scrollBottom);
 // ---------------------------------------------------------------------------
 function renderHeader() {
   $("#session-name").textContent = state.sessionName || (state.sessionFile ? state.sessionFile.split("/").pop().replace(/\.jsonl$/, "") : "—");
-  $("#session-file").textContent = state.sessionFile || "";
-  $("#session-file").title = state.sessionFile || "";
   const cu = state.stats?.contextUsage;
-  const pct = cu && cu.percent != null ? Number(cu.percent) : NaN;
-  $("#context-usage").textContent = isNaN(pct) ? "ctx —" : `ctx ${pct.toFixed(2)}%`;
+  // `tokens`/`percent` are null right after compaction until a fresh response;
+  // contextWindow comes from the active model, so fall back to it for the max.
+  const cuTokens = cu?.tokens != null ? Number(cu.tokens) : NaN;
+  const cuMax = cu?.contextWindow != null ? Number(cu.contextWindow) : Number(state.model?.contextWindow);
+  const pct = cu?.percent != null ? Number(cu.percent) : NaN;
+  const ctxEl = $("#context-usage");
+  ctxEl.textContent = isNaN(cuTokens)
+    ? isNaN(pct) ? "ctx —" : `ctx — / ${fmtK(cuMax)} · ${pct.toFixed(2)}%`
+    : `ctx ${fmtK(cuTokens)} / ${fmtK(cuMax)}${isNaN(pct) ? "" : ` · ${pct.toFixed(2)}%`}`;
   const st = state.stats;
-  $("#session-cost").textContent = st ? `${fmtCost(st.cost)} · ${fmtTokens(st.tokens?.total)} tok` : "—";
+  ctxEl.title = st
+    ? `Context window usage\nused: ${isNaN(cuTokens) ? "—" : fmtNum(cuTokens)} tokens\nmax: ${fmtNum(cuMax)} tokens\npercent: ${isNaN(pct) ? "—" : `${pct.toFixed(2)}%`}`
+    : "Context window usage";
+  if (st) {
+    $("#session-cost").textContent = `${fmtCost(st.cost)} · ${fmtTokens(st.tokens?.total)} tok`;
+  } else $("#session-cost").textContent = "—";
+  // only rebuild the popover when it is on screen; a hidden one is refreshed
+  // on open, so header re-renders stay cheap
+  if (!$("#session-info-pop").classList.contains("hidden")) renderSessionInfo();
 
   const modelSel = $("#model-select");
   if (state.models.length) {
@@ -690,6 +768,58 @@ function renderHeader() {
     thinkSel.classList.add("hidden");
   }
 }
+
+/**
+ * Session-details popover: the full session file path plus the session/model
+ * facts that no longer fit on the single-line header.
+ */
+function renderSessionInfo() {
+  const pop = $("#session-info-pop");
+  pop.innerHTML = "";
+  const st = state.stats;
+  const cu = st?.contextUsage;
+  const cuMax = cu?.contextWindow != null ? Number(cu.contextWindow) : Number(state.model?.contextWindow);
+  const rows = [
+    ["session", state.sessionName || "—"],
+    ["file", state.sessionFile || "—"],
+    ["id", state.sessionId || "—"],
+    ["cwd", state.cwd || "—"],
+    ["model", state.model ? `${state.model.provider}/${state.model.id}` : "—"],
+    ["thinking", state.thinkingLevel || "—"],
+    ["messages", st ? `${st.userMessages} user · ${st.assistantMessages} assistant · ${st.toolCalls} tools` : "—"],
+    ["cost", st ? fmtCost(st.cost) : "—"],
+    ["tokens", st ? `${fmtNum(st.tokens?.total)} total (in ${fmtNum(st.tokens?.input)}, out ${fmtNum(st.tokens?.output)}, cache r/w ${fmtNum(st.tokens?.cacheRead)}/${fmtNum(st.tokens?.cacheWrite)})` : "—"],
+    ["context", cu ? `${fmtNum(cu.tokens)} / ${fmtNum(cuMax)} tokens · ${cu.percent != null ? `${Number(cu.percent).toFixed(2)}%` : "—"}` : "—"],
+  ];
+  for (const [k, v] of rows) {
+    pop.append(
+      el("div", { class: "info-row" }, el("span", { class: "info-key", text: k }), el("span", { class: "info-val", text: v, title: v }))
+    );
+  }
+  if (state.sessionFile) {
+    pop.append(
+      el("button", {
+        class: "ghost info-copy",
+        text: "Copy path",
+        onclick: () => navigator.clipboard.writeText(state.sessionFile).then(() => toast("path copied"), () => toast("copy failed", "error")),
+      })
+    );
+  }
+}
+
+const sessionInfoBtn = $("#btn-session-info");
+function setSessionInfoOpen(open) {
+  $("#session-info-pop").classList.toggle("hidden", !open);
+  sessionInfoBtn.setAttribute("aria-expanded", String(open));
+}
+sessionInfoBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  renderSessionInfo();
+  setSessionInfoOpen($("#session-info-pop").classList.contains("hidden"));
+});
+// Click-away and Esc close it; clicks inside the popover must not bubble out.
+$("#session-info-pop").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", () => setSessionInfoOpen(false));
 
 function renderStatus() {
   const bar = $("#status-bar");
@@ -781,12 +911,7 @@ function truncate(s, n) {
 const WS_KEY = "piweb-workspace";
 const WS_PINNED_KEY = "piweb-pinned-workspaces";
 
-function basename(p) {
-  const parts = String(p || "").replace(/\/+$/, "").split("/");
-  return parts.pop() || p;
-}
-
-/** two-level display name, e.g. /Users/xiancli/work/pi-web -> "xiancli/pi-web" */
+/** two-level display name, e.g. /home/me/work/pi-web -> "work/pi-web" */
 function wsLabel(p) {
   if (!p || p === "(unknown)") return p || "";
   const segs = String(p).replace(/\/+$/, "").split("/").filter(Boolean);
@@ -1067,6 +1192,9 @@ async function refresh({ sessions = false, stats = true } = {}) {
         const lv = await cmd("get_available_thinking_levels");
         state.thinkingLevels = lv.data?.levels || [];
       } catch {}
+      // refresh the slash-command list too: skills/templates/extensions can
+      // change between sessions (different cwd) or after a pi /reload
+      loadCommands();
     }
     renderHeader();
     renderStatus();
@@ -1085,6 +1213,17 @@ async function loadModels() {
   renderHeader();
 }
 
+/** pi's get_commands lists every discoverable command (extension commands,
+ *  prompt templates, skills); sending "/name" through `prompt` runs it. */
+async function loadCommands() {
+  try {
+    const res = await cmd("get_commands");
+    state.commands = (res.data?.commands || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    state.commands = []; // older pi without get_commands: autocomplete off, prompts still work
+  }
+}
+
 async function sendPrompt() {
   const input = $("#input");
   const text = input.value.trim();
@@ -1096,6 +1235,7 @@ async function sendPrompt() {
   }
   input.value = "";
   autosize(input);
+  closeCmdMenu();
   const images = attachments.splice(0, attachments.length);
   renderAttachments();
   const extra = state.isStreaming ? { streamingBehavior: "steer" } : {};
@@ -1227,7 +1367,6 @@ async function waitPiReady(expectedFile) {
 // live event handling
 // ---------------------------------------------------------------------------
 let currentAssistant = null; // streaming assistant item
-let pendingRefresh = null;
 
 function findStreamingAssistant() {
   if (currentAssistant && state.items.includes(currentAssistant)) return currentAssistant;
@@ -1386,7 +1525,7 @@ function handleEvent(record) {
       const ex = state.executions.get(record.toolCallId) || { updates: [] };
       ex.status = "running";
       state.executions.set(record.toolCallId, ex);
-      markToolcallDirty(record.toolCallId, { open: true });
+      markToolcallDirty(record.toolCallId);
       break;
     }
     case "tool_execution_update": {
@@ -1394,7 +1533,7 @@ function handleEvent(record) {
       ex.status = ex.status === "pending" ? "running" : ex.status;
       if (record.partialResult != null) ex.updates.push(record.partialResult);
       state.executions.set(record.toolCallId, ex);
-      markToolcallDirty(record.toolCallId, { open: true });
+      markToolcallDirty(record.toolCallId);
       break;
     }
     case "tool_execution_end": {
@@ -1404,7 +1543,7 @@ function handleEvent(record) {
       ex.isError = !!record.isError;
       ex.durationMs = record.durationMs;
       state.executions.set(record.toolCallId, ex);
-      markToolcallDirty(record.toolCallId, { open: !!record.isError });
+      markToolcallDirty(record.toolCallId);
       break;
     }
     case "turn_end":
@@ -1465,14 +1604,11 @@ function roleKind(role) {
   return { user: "user", system: "system", bashExecution: "bash" }[role] || "notice";
 }
 
-function markToolcallDirty(toolCallId, { open = false } = {}) {
+function markToolcallDirty(toolCallId) {
   for (const item of state.items) {
     if (item.kind !== "assistant") continue;
     for (const b of item.blocks) {
       if (b.type === "toolcall" && b.call.id === toolCallId) {
-        if (open && !state.openToolcalls.has(toolCallId) && state.executions.get(toolCallId)?.status === "running") {
-          state.openToolcalls.add(toolCallId);
-        }
         item.dirty = true;
       }
     }
@@ -1595,9 +1731,140 @@ function autosize(ta) {
   ta.style.height = "auto";
   ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
 }
+// ---------------------------------------------------------------------------
+// slash-command autocomplete: typing "/" at the start of the composer lists
+// the session's discoverable commands (skills, prompt templates, extensions)
+// ---------------------------------------------------------------------------
+const cmdMenuEl = el("div", { class: "cmd-menu hidden", role: "listbox", "aria-label": "Slash commands" });
+$("#composer").append(cmdMenuEl);
+let cmdMatches = [];
+let cmdIndex = 0;
+
+/** the word being typed after a leading "/", or null when not composing a command */
+function cmdToken() {
+  const v = inputEl.value;
+  const pos = inputEl.selectionStart;
+  if (!v.startsWith("/") || pos == null || inputEl.selectionEnd !== pos) return null;
+  const typed = v.slice(1, pos);
+  return /\s/.test(typed) ? null : typed;
+}
+
+function closeCmdMenu() {
+  cmdMenuEl.classList.add("hidden");
+  cmdMenuEl.innerHTML = "";
+  cmdMatches = [];
+  cmdIndex = 0;
+}
+
+function updateCmdMenu() {
+  const token = cmdToken();
+  // token === "" is valid: a bare "/" lists every command
+  if (token == null || !state.commands.length) {
+    closeCmdMenu();
+    return;
+  }
+  const q = token.toLowerCase();
+  cmdMatches = state.commands
+    .filter((c) => c.name.toLowerCase().includes(q))
+    .sort(
+      (a, b) =>
+        Number(!a.name.toLowerCase().startsWith(q)) - Number(!b.name.toLowerCase().startsWith(q)) ||
+        a.name.localeCompare(b.name)
+    )
+    .slice(0, 200);
+  cmdIndex = 0;
+  renderCmdMenu();
+}
+
+function renderCmdMenu() {
+  if (!cmdMatches.length) {
+    closeCmdMenu();
+    return;
+  }
+  cmdMenuEl.innerHTML = "";
+  cmdMenuEl.classList.remove("hidden");
+  cmdMatches.forEach((c, i) => {
+    const selected = i === cmdIndex;
+    cmdMenuEl.append(
+      el(
+        "div",
+        {
+          class: `cmd-item${selected ? " selected" : ""}`,
+          role: "option",
+          "aria-selected": String(selected),
+          // mousedown (not click) so the composer never loses focus
+          onmousedown: (e) => {
+            e.preventDefault();
+            applyCmdIndex(i);
+          },
+        },
+        el("span", { class: `cmd-source ${c.source || ""}`, text: c.source || "cmd" }),
+        el("span", { class: "cmd-name", text: `/${c.name}` }),
+        c.description ? el("span", { class: "cmd-desc", text: c.description }) : null
+      )
+    );
+  });
+}
+
+function moveCmdIndex(delta) {
+  if (!cmdMatches.length) return;
+  cmdIndex = (cmdIndex + delta + cmdMatches.length) % cmdMatches.length;
+  renderCmdMenu();
+  cmdMenuEl.querySelector(".cmd-item.selected")?.scrollIntoView({ block: "nearest" });
+}
+
+/** replace the typed "/word" with "/name", keep any args typed after it */
+function applyCmdIndex(i) {
+  const c = cmdMatches[i];
+  if (!c) return;
+  const v = inputEl.value;
+  const sp = v.search(/\s/);
+  const tail = sp === -1 ? "" : v.slice(sp); // args already typed after the first word
+  inputEl.value = tail ? `/${c.name}${tail}` : `/${c.name} `;
+  const caret = c.name.length + (tail ? 1 : 2);
+  inputEl.setSelectionRange(caret, caret);
+  autosize(inputEl);
+  closeCmdMenu();
+  inputEl.focus();
+}
+
 const inputEl = $("#input");
-inputEl.addEventListener("input", () => autosize(inputEl));
+inputEl.addEventListener("input", () => {
+  autosize(inputEl);
+  updateCmdMenu();
+});
+inputEl.addEventListener("blur", closeCmdMenu);
 inputEl.addEventListener("keydown", (e) => {
+  if (!cmdMenuEl.classList.contains("hidden")) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveCmdIndex(1);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveCmdIndex(-1);
+      return;
+    }
+    if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      // Tab always completes; Enter completes unless the typed word already
+      // is an exact command name — then it falls through and sends.
+      const typed = inputEl.value.slice(1, inputEl.selectionStart);
+      const exact = state.commands.some((c) => c.name === typed);
+      if (e.key === "Tab" || !exact) {
+        e.preventDefault();
+        applyCmdIndex(cmdIndex);
+        return;
+      }
+    }
+    if (e.key === "Escape") {
+      // close the menu without triggering the global Esc actions (abort)
+      e.preventDefault();
+      e.stopPropagation();
+      closeCmdMenu();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     sendPrompt();
@@ -1853,7 +2120,9 @@ $("#thinking-select").addEventListener("change", async (e) => {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (!$("#ws-overlay").classList.contains("hidden")) {
+    if (!$("#session-info-pop").classList.contains("hidden")) {
+      setSessionInfoOpen(false);
+    } else if (!$("#ws-overlay").classList.contains("hidden")) {
       closeWsPicker();
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
       $("#dialog-cancel").click();

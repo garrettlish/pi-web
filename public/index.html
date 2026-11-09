@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>pi web</title>
+  <title>pi-web</title>
+  <meta name="description" content="A local web UI for the pi coding agent: streamed transcripts, session history, and a full inspector for every LLM and tool call.">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0d1117">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script>
     // apply saved theme before first paint to avoid a flash
@@ -57,16 +61,20 @@
     <main id="main">
       <header id="topbar">
         <div class="topbar-left">
+          <button id="btn-session-info" class="ghost icon-btn" title="Session details" aria-label="Session details"
+                  aria-haspopup="dialog" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5"/><path d="M12 8h.01"/></svg>
+          </button>
           <span id="session-name">—</span>
-          <span id="session-file" class="dim" title=""></span>
+          <div id="session-info-pop" class="popover hidden" role="dialog" aria-label="Session details"></div>
         </div>
         <div class="topbar-right">
-          <button id="btn-theme" class="ghost icon-btn" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
-          <select id="model-select" title="Model"></select>
-          <select id="thinking-select" title="Thinking level"></select>
+          <select id="model-select" class="hidden" title="Model"></select>
+          <select id="thinking-select" class="hidden" title="Thinking level"></select>
           <span id="context-usage" class="badge" title="Context window usage">—</span>
           <span id="session-cost" class="badge" title="Session cost / tokens">—</span>
           <button id="btn-abort" class="danger hidden" title="Abort (Esc)">Stop</button>
+          <button id="btn-theme" class="ghost icon-btn" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
         </div>
       </header>
 
@@ -78,7 +86,7 @@
 
       <div id="composer">
         <div id="attachments" class="attachments hidden"></div>
-        <textarea id="input" rows="1" placeholder="Message pi…  (drop images to attach, Enter to send, Shift+Enter for newline)"></textarea>
+        <textarea id="input" rows="1" placeholder="Message pi…  (type / for commands & skills, drop images to attach, Enter to send, Shift+Enter for newline)"></textarea>
         <div class="composer-row">
           <span class="hint dim" id="composer-hint"></span>
           <span class="spacer"></span>
@@ -89,7 +97,7 @@
   </div>
 
   <div id="modal-overlay" class="hidden">
-    <div id="modal" role="dialog">
+    <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <div class="modal-head">
         <span id="modal-title">Details</span>
         <span class="spacer"></span>
@@ -101,7 +109,7 @@
   </div>
 
   <div id="dialog-overlay" class="hidden">
-    <div id="dialog" role="dialog">
+    <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <div id="dialog-title"></div>
       <div id="dialog-body"></div>
       <div class="dialog-actions">
@@ -113,7 +121,7 @@
   </div>
 
   <div id="ws-overlay" class="hidden">
-    <div id="ws-dialog" role="dialog" aria-label="Choose workspace directory">
+    <div id="ws-dialog" role="dialog" aria-modal="true" aria-label="Choose workspace directory">
       <div class="ws-dialog-head">Choose a workspace directory</div>
       <div class="ws-path-row">
         <button id="ws-up" class="icon-btn" title="Up one level" aria-label="Up one level">
@@ -131,7 +139,9 @@
     </div>
   </div>
 
-  <div id="toasts"></div>
+  <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+
+  <noscript>pi-web needs JavaScript enabled to talk to the local agent process.</noscript>
 
   <script src="/app.js"></script>
 </body>

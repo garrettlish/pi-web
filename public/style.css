@@ -3,7 +3,7 @@
   --surface-base: #0d1117;      /* app background */
   --surface: #10161f;           /* panels: sidebar, topbar, composer, cards */
   --surface-elev: #161d29;      /* elevated: controls, hover fills */
-  --surface-code: var(--surface-code);      /* code blocks, JSON viewers */
+  --surface-code: #0a0e14;      /* code blocks, JSON viewers */
   --border: #242c3a;
   /* text */
   --text: #e5e7eb;
@@ -146,15 +146,35 @@ body.resizing iframe, body.resizing .tc-json, body.resizing .tc-text { pointer-e
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
 #topbar {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 8px; position: relative;
   padding: 8px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
-.topbar-left { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-#session-name { font-family: var(--font-ui); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw; }
-#session-file { font-family: var(--font-ui); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 28vw; }
-.topbar-right { display: flex; align-items: center; gap: 8px; }
+/* one line only: the full session path lives in the info popover, so the
+   header keeps just an icon button + the (truncating) session name */
+.topbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; position: relative; }
+#btn-session-info { flex: none; }
+#session-name { font-family: var(--font-ui); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 40vw; }
+
+/* session details popover, anchored under the topbar info button */
+#session-info-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+  width: min(560px, 88vw); padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-family: var(--font-ui); font-size: 12px;
+}
+#session-info-pop .info-row { display: flex; gap: 12px; padding: 3px 0; }
+#session-info-pop .info-key {
+  flex: none; width: 72px; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; padding-top: 2px;
+}
+#session-info-pop .info-val {
+  flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#session-info-pop .info-copy { margin-top: 8px; padding: 2px 8px; font-size: 12px; }
+.topbar-right { display: flex; align-items: center; gap: 8px; flex: none; }
 #topbar select {
   background: var(--surface-elev); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -322,8 +342,20 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
 .tc-expand { font-size: 12px; color: var(--primary); cursor: pointer; margin-top: 3px; display: inline-block; font-family: var(--font-ui); }
 .tc-result.is-error .tc-text { border-color: var(--danger); }
 
+/* colored unified-diff view inside tool responses */
+.tc-diff { white-space: pre; overflow-x: auto; padding: 4px 0; }
+.tc-diff .dline { padding: 0 12px; min-height: 1.45em; }
+.tc-diff .dline.dadd { background: var(--success-soft); }
+.tc-diff .dline.dadd .dsign { color: var(--success); font-weight: 700; }
+.tc-diff .dline.ddel { background: var(--danger-soft); }
+.tc-diff .dline.ddel .dsign { color: var(--danger); font-weight: 700; }
+.tc-diff .dline.dhunk { color: var(--primary); }
+.tc-diff .dline.dfile { font-weight: 700; }
+.tc-diff .dline.dmeta { color: var(--text-secondary); font-style: italic; }
+
 /* ---------------- composer ---------------- */
 #composer {
+  position: relative;
   border-top: 1px solid var(--border);
   background: var(--surface);
   padding: 12px 16px;
@@ -336,6 +368,31 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
   outline: none; display: block;
 }
 #input:focus { border-color: var(--primary); }
+
+/* slash-command autocomplete (skills, prompt templates, extension commands) */
+.cmd-menu {
+  position: absolute; bottom: calc(100% + 8px); left: 16px; z-index: 20;
+  width: min(560px, calc(100% - 32px));
+  max-height: 280px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.cmd-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; cursor: pointer;
+  font-family: var(--font-ui); font-size: 13px;
+}
+.cmd-item:hover, .cmd-item.selected { background: var(--primary-soft-bg); }
+.cmd-source {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--text-secondary); background: var(--surface-elev);
+  border: 1px solid var(--border); border-radius: 10px; padding: 0 8px;
+}
+.cmd-source.skill { color: var(--primary); border-color: var(--primary-soft-border); background: var(--primary-soft); }
+.cmd-source.prompt { color: var(--success); border-color: var(--success-soft); background: var(--success-soft); }
+.cmd-source.extension { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
+.cmd-name { flex: none; font-family: var(--mono); font-weight: 700; }
+.cmd-desc { color: var(--text-secondary); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* image attachments (drop image files anywhere on the page) */
 body.dropping #input { border-color: var(--primary); border-style: dashed; }
@@ -538,4 +595,27 @@ select:focus-visible,
 #dialog-body textarea:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+/* respect reduced-motion preferences (WCAG 2.3.3) */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* narrow windows: the header is a single row, so drop the least critical
+   text (session name, cost) before anything can overlap or overflow */
+@media (max-width: 900px) {
+  #session-name { max-width: 24vw; }
+  #session-cost { display: none; }
+  #topbar select { max-width: 150px; }
+}
+@media (max-width: 640px) {
+  #topbar { padding: 6px 8px; gap: 6px; }
+  #session-name { display: none; }
+  #transcript { padding: 12px 12px 24px; }
 }

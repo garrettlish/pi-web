@@ -3,7 +3,13 @@
  * pi-web: a web UI bridge for the pi coding agent, running `pi --mode rpc`.
  *
  * Usage:
- *   node server.js [--port 3210] [--cwd <project-dir>] [--session-dir <dir>] [--pi <pi-bin>]
+ *   node server.js [--port 3210] [--host 127.0.0.1] [--cwd <project-dir>]
+ *                  [--session-dir <dir>] [--pi <pi-bin>] [--allow-remote]
+ *
+ * Security model: this process can start the agent, which can run shell
+ * commands as you. It binds to loopback and rejects requests whose Host or
+ * Origin is not local, so other web pages cannot drive it (DNS rebinding /
+ * CSRF). Binding elsewhere, or --allow-remote, turns those guards off.
  *
  * No npm dependencies. Node >= 18.
  */
@@ -24,12 +30,61 @@ function argValue(name, fallback) {
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
+const HELP = `pi-web — a local web UI for the pi coding agent
+
+Usage:
+  pi-web [options]
+  node server.js [options]
+
+Options:
+  --port <n>          Port to listen on (default: 3210, env PI_WEB_PORT)
+  --host <addr>       Address to bind (default: 127.0.0.1, env PI_WEB_HOST).
+                      Binding a non-loopback address enables remote access.
+  --cwd <dir>         Directory the agent works in (default: current directory)
+  --session-dir <dir> Where pi stores session files
+                      (default: ~/.pi/agent/sessions, env PI_CODING_AGENT_SESSION_DIR)
+  --pi <path>         pi executable to spawn (default: "pi" on PATH, env PI_BIN)
+  --allow-remote      Disable the localhost-only request guards while still
+                      binding to 127.0.0.1 (for reverse proxies; see README)
+  -h, --help          Show this help
+  -v, --version       Show the version
+
+Environment:
+  PI_WEB_PORT, PI_WEB_HOST, PI_WEB_CWD, PI_BIN,
+  PI_CODING_AGENT_SESSION_DIR, PI_WEB_ALLOW_REMOTE
+`;
+
+if (process.argv.includes("-h") || process.argv.includes("--help")) {
+  process.stdout.write(HELP);
+  process.exit(0);
+}
+if (process.argv.includes("-v") || process.argv.includes("--version")) {
+  const pkg = JSON.parse(readFileSync(path.join(__dirname, "package.json"), "utf8"));
+  process.stdout.write(`${pkg.version}\n`);
+  process.exit(0);
+}
+
 const PORT = Number(argValue("--port", process.env.PI_WEB_PORT || 3210));
+const HOST = argValue("--host", process.env.PI_WEB_HOST || "127.0.0.1");
 const CWD = path.resolve(argValue("--cwd", process.env.PI_WEB_CWD || process.cwd()));
 const SESSION_DIR = path.resolve(
   argValue("--session-dir", process.env.PI_CODING_AGENT_SESSION_DIR || path.join(os.homedir(), ".pi", "agent", "sessions"))
 );
 const PI_BIN = argValue("--pi", process.env.PI_BIN || "pi");
+
+/** localhost names/IPs — anything else means the operator opted into remote serving */
+function isLoopbackHost(hostHeader) {
+  if (!hostHeader) return false;
+  const host = hostHeader.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127\./.test(host);
+}
+
+// Binding to a non-loopback address is itself the opt-in to remote serving, so
+// it does not need a second flag. Requests are guarded while we are loopback-only.
+const ALLOW_REMOTE =
+  process.argv.includes("--allow-remote") ||
+  process.env.PI_WEB_ALLOW_REMOTE === "1" ||
+  !isLoopbackHost(HOST);
 
 // ---------------------------------------------------------------------------
 // pi RPC subprocess pool
@@ -500,7 +555,33 @@ function readBody(req) {
   });
 }
 
+/**
+ * Reject requests that did not originate from this machine. Binding to
+ * loopback already stops inbound connections, but a malicious page in another
+ * tab can still open a cross-origin `fetch`/`EventSource` to localhost — the
+ * Host and Origin checks below close that (DNS rebinding and CSRF).
+ */
+function isAllowedRequest(req) {
+  if (!isLoopbackHost(req.headers.host)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true; // same-origin GETs, curl, and EventSource omit it
+  try {
+    return isLoopbackHost(new URL(origin).host);
+  } catch {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
+  if (!ALLOW_REMOTE && !isAllowedRequest(req)) {
+    sendJson(res, 403, { error: "pi-web only accepts requests from localhost — see README: Remote access" });
+    return;
+  }
+  // Defense in depth for every response: no MIME sniffing, no referrer leaks to
+  // outside sites, and no framing (the UI must never be clickjacked).
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
 
@@ -619,7 +700,8 @@ const server = http.createServer(async (req, res) => {
     // Static files
     let rel = pathname === "/" ? "/index.html" : pathname;
     const file = path.normalize(path.join(PUBLIC_DIR, rel));
-    if (!file.startsWith(PUBLIC_DIR)) {
+    // the trailing separator stops a sibling like /public-evil from matching
+    if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) {
       res.writeHead(403);
       res.end("forbidden");
       return;
@@ -668,7 +750,11 @@ server.on("error", (err) => {
   }
   throw err;
 });
-server.listen(PORT, () => {
-  console.log(`[pi-web] http://localhost:${PORT}  (pi cwd: ${CWD})`);
+server.listen(PORT, HOST, () => {
+  console.log(`[pi-web] http://${HOST === "127.0.0.1" ? "localhost" : HOST}:${PORT}  (pi cwd: ${CWD})`);
   console.log(`[pi-web] session dir: ${SESSION_DIR}`);
+  if (ALLOW_REMOTE) {
+    console.warn(`[pi-web] WARNING: remote access is enabled (${HOST === "127.0.0.1" ? "--allow-remote" : `--host ${HOST}`}).`);
+    console.warn(`[pi-web] Anyone who can reach this port can drive the agent, and it runs shell commands as you.`);
+  }
 });
