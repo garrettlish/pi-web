@@ -9,13 +9,20 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/** parse a trusted static markup string into DOM nodes. DOMParser documents
+ *  are inert — scripts never run — and every current caller passes either
+ *  pre-escaped content (renderMarkdown) or hardcoded SVG markup (DIR_ICON). */
+function htmlFragment(markup) {
+  return [...new DOMParser().parseFromString(markup, "text/html").body.childNodes];
+}
+
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (v == null) continue;
     if (k === "class") node.className = v;
     else if (k === "text") node.textContent = v;
-    else if (k === "html") node.innerHTML = v;
+    else if (k === "html") node.replaceChildren(...htmlFragment(v));
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
     else node.setAttribute(k, v);
   }
@@ -79,6 +86,9 @@ function onActivate(fn) {
 // state
 // ---------------------------------------------------------------------------
 const TAB_KEY = "piweb-sidebar-tab";
+const SIDEBAR_COLLAPSED_KEY = "piweb-sidebar-collapsed";
+const PROMPT_HISTORY_KEY = "piweb-prompt-history";
+const PROMPT_HISTORY_MAX = 200;
 
 const state = {
   items: [], // transcript items (ordered, active branch + live)
@@ -90,6 +100,9 @@ const state = {
   sessionName: null,
   leafId: null, // active-branch leaf from get_entries
   model: null,
+  /** Date.now() of the last user-initiated model pick; guards against stale
+   *  get_state snapshots (issued before the pick) resetting the selection */
+  modelPickedAt: 0,
   models: [],
   commands: [], // discoverable slash commands (extension commands, prompt templates, skills)
   thinkingLevel: null,
@@ -103,6 +116,29 @@ const state = {
   /** sidebar view: "recent" = flat list across all workspaces, "workspaces" = two-level */
   sidebarTab: localStorage.getItem(TAB_KEY) === "workspaces" ? "workspaces" : "recent",
 };
+
+// ---------------------------------------------------------------------------
+// sidebar collapse / expand
+// ---------------------------------------------------------------------------
+function sidebarCollapsed() {
+  return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+}
+
+function applySidebarCollapsed(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  document.getElementById("btn-sidebar-expand").classList.toggle("hidden", !collapsed);
+}
+
+function toggleSidebar() {
+  const collapsed = !sidebarCollapsed();
+  if (collapsed) localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "1");
+  else localStorage.removeItem(SIDEBAR_COLLAPSED_KEY);
+  applySidebarCollapsed(collapsed);
+}
+
+document.getElementById("btn-sidebar-collapse").addEventListener("click", toggleSidebar);
+document.getElementById("btn-sidebar-expand").addEventListener("click", toggleSidebar);
+applySidebarCollapsed(sidebarCollapsed());
 
 // ---------------------------------------------------------------------------
 // server bridge
@@ -195,7 +231,10 @@ function renderMarkdown(text) {
     }
     if (/^\s*>\s?/.test(line)) {
       const buf = [];
-      while (i < lines.length && /^\s*>\s?/.test(lines[i])) buf.push(inlineMd(lines[i].replace(/^\s*>\s?/, ""))), i++;
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        buf.push(inlineMd(lines[i].replace(/^\s*>\s?/, "")));
+        i++;
+      }
       out.push(`<blockquote>${buf.join("<br>")}</blockquote>`);
       continue;
     }
@@ -440,31 +479,95 @@ function looksLikeDiff(text) {
   return false;
 }
 
-/** colored unified-diff view: red deletions, green additions, blue hunk
- *  headers — plain rendering for any non-diff preamble (title, stat line) */
+/** one diff row: sign gutter, old/new line-number gutters, then the body */
+function diffRow({ sign = "", oldNum = "", newNum = "", text = "", cls = "" }) {
+  const row = el("div", { class: `dline${cls ? ` ${cls}` : ""}` });
+  row.append(
+    el("span", { class: "dsign", text: sign || " " }),
+    el("span", { class: "dnum", text: String(oldNum) }),
+    el("span", { class: "dnum", text: String(newNum) }),
+    el("span", { class: "dbody", text: text || " " })
+  );
+  return row;
+}
+
+/** colored side-by-side-numbered diff view, GitHub style: green additions,
+ *  red deletions, blue hunk/file headers, gray skipped-context markers.
+ *  Accepts two shapes:
+ *  - pi edit diffs: rows like "+12 body" / "-  5 body" (sign, space-padded
+ *    line number, body), " 12 body" for context and "     ..." skip markers —
+ *    these never carry @@ hunk headers
+ *  - unified diffs: @@ hunk headers, ---/+++ file headers, +/-/space rows —
+ *    any preamble before the first hunk stays plain */
 function diffBlock(text) {
   const wrap = el("div", { class: "tc-text tc-diff" });
-  let inDiff = false;
-  for (const line of text.split("\n")) {
-    if (!inDiff && /^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/.test(line)) inDiff = true;
-    let cls = "";
-    if (inDiff) {
-      if (/^@@/.test(line)) cls = "dhunk";
-      else if (/^(---|\+\+\+) /.test(line)) cls = "dfile";
-      else if (line.startsWith("+")) cls = "dadd";
-      else if (line.startsWith("-")) cls = "ddel";
-      else if (/^\\ No newline/.test(line)) cls = "dmeta";
+  const lines = String(text ?? "").split("\n");
+  // @@ hunk headers only appear in unified diffs; without one, rows are
+  // pi-edit rows, so a stat line like "+9 -6" is never colored
+  const isUnified = lines.some((l) => /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(l));
+  let inUnified = false;
+  let oldNum = 0, newNum = 0;
+  for (const line of lines) {
+    if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line)) {
+      // unified hunk header: seed the counters so +/-/context rows track both
+      // sides from here on
+      const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      oldNum = m ? parseInt(m[1], 10) : 0;
+      newNum = m ? parseInt(m[2], 10) : 0;
+      inUnified = true;
+      wrap.append(diffRow({ cls: "dhunk", text: line }));
+      continue;
     }
-    const row = el("div", { class: `dline${cls ? ` ${cls}` : ""}` });
-    if (cls === "dadd" || cls === "ddel") {
-      // keep the body text at default color; tint the +/- sign for emphasis
-      row.append(el("span", { class: "dsign", text: line[0] }), line.slice(1) || " ");
-    } else {
-      row.textContent = line || " ";
+    if (inUnified) {
+      if (/^(---|\+\+\+) /.test(line)) {
+        wrap.append(diffRow({ cls: "dfile", text: line }));
+      } else if (/^\\ No newline/.test(line)) {
+        wrap.append(diffRow({ cls: "dmeta", text: line }));
+      } else if (line.startsWith("+")) {
+        wrap.append(diffRow({ cls: "dadd", sign: "+", newNum: newNum++, text: line.slice(1) }));
+      } else if (line.startsWith("-")) {
+        wrap.append(diffRow({ cls: "ddel", sign: "-", oldNum: oldNum++, text: line.slice(1) }));
+      } else {
+        wrap.append(diffRow({ oldNum: oldNum++, newNum: newNum++, text: line.slice(1) }));
+      }
+      continue;
     }
-    wrap.append(row);
+    if (!isUnified) {
+      // pi edit diff row: sign, space-padded line number, body
+      if (/^ *\.{3}$/.test(line)) {
+        wrap.append(diffRow({ cls: "dskip", text: line.trim() }));
+      } else {
+        const m = line.match(/^([+-]?)\s*(\d+)\s(.*)$/);
+        if (m) {
+          const num = parseInt(m[2], 10);
+          if (m[1] === "+") {
+            wrap.append(diffRow({ cls: "dadd", sign: "+", newNum: num, text: m[3] }));
+          } else if (m[1] === "-") {
+            wrap.append(diffRow({ cls: "ddel", sign: "-", oldNum: num, text: m[3] }));
+          } else {
+            wrap.append(diffRow({ oldNum: num, newNum: num, text: m[3] }));
+          }
+        } else {
+          // headers or plain preamble — no coloring
+          wrap.append(diffRow({ text: line }));
+        }
+      }
+      continue;
+    }
+    wrap.append(diffRow({ text: line }));
   }
   return wrap;
+}
+
+/** added/deleted line counts for a pi edit diff (lines look like "+12 text"
+ *  / "-  5 text" — sign, space-padded line number, then the line body) */
+function editDiffStats(diffText) {
+  let added = 0, deleted = 0;
+  for (const line of String(diffText ?? "").split("\n")) {
+    if (/^\+\s*\d+\s/.test(line)) added++;
+    else if (/^-\s*\d+\s/.test(line)) deleted++;
+  }
+  return { added, deleted };
 }
 
 /** derive the live view state for one tool call block (shared by the row and
@@ -493,6 +596,15 @@ function capText(t) {
  *  the transcript off screen. */
 function buildToolcallBody(call, exec, result) {
   const body = el("div", { class: "tc-body" });
+  const diff = typeof result?.details?.diff === "string" ? result.details.diff : null;
+
+  // edit calls lead with the colored diff — seeing what changed is the point
+  // of the popup; the raw request/response follow below
+  if (call.name === "edit" && diff) {
+    body.append(
+      el("div", { class: "tc-section tc-diff-section" }, el("div", { class: "tc-label", text: "diff" }), diffBlock(diff))
+    );
+  }
 
   // request
   const reqPre = el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: "request · arguments" }));
@@ -523,8 +635,13 @@ function buildToolcallBody(call, exec, result) {
         sec.append(el("img", { src: `data:${b.mimeType};base64,${b.data}` }));
       }
     }
-    if (result.details != null) {
-      sec.append(el("div", { class: "tc-label", text: "details" }), jsonBlock(result.details));
+    if (result.details != null && !(call.name === "edit" && diff)) {
+      // edit results carry a computed diff — already shown above for edit
+      if (typeof result.details.diff === "string") {
+        sec.append(el("div", { class: "tc-label", text: "diff" }), diffBlock(result.details.diff));
+      } else {
+        sec.append(el("div", { class: "tc-label", text: "details" }), jsonBlock(result.details));
+      }
     }
     body.append(sec);
   }
@@ -534,7 +651,7 @@ function buildToolcallBody(call, exec, result) {
 /** one tool call row: a single line in the transcript. Clicking it opens the
  *  full request/response in the popup — expanding in place pushed everything
  *  after the card (notably the assistant's summary) below the fold. */
-function renderToolcall(item, block) {
+function renderToolcall(_item, block) {
   const { call, result, exec, statusText } = toolcallState(block);
 
   const card = el("div", {
@@ -542,19 +659,42 @@ function renderToolcall(item, block) {
     "data-call-id": call.id,
   });
 
-  const summary = argsSummary(call) || JSON.stringify(call.arguments || {}).slice(0, 80);
   const open = () => openToolcall(call, block);
+  const headOpts = {
+    class: "tc-head",
+    role: "button",
+    tabindex: "0",
+    title: "Open request / response",
+    "aria-haspopup": "dialog",
+    onclick: open,
+    onkeydown: onActivate(open),
+  };
+
+  // edit calls get the compact pi-style header: pencil, file name, +/- counts.
+  // Clicking still opens the full request/response popup shared by all tools.
+  if (call.name === "edit") {
+    const filePath = String(call.arguments?.path || call.arguments?.file_path || "");
+    const base = filePath.split(/[\\/]/).pop() || filePath;
+    const stats = result?.details?.diff != null ? editDiffStats(result.details.diff) : null;
+    card.append(
+      el(
+        "div",
+        headOpts,
+        el("span", { class: "tc-open-icon", text: "✎" }),
+        el("span", { class: "tc-name", text: "edit" }),
+        el("span", { class: "tc-summary", text: base }),
+        stats ? el("span", { class: "tc-stat add", text: `+${stats.added}` }) : null,
+        stats ? el("span", { class: "tc-stat del", text: `−${stats.deleted}` }) : null,
+        statusText !== "done" ? el("span", { class: `tc-status ${statusText}`, text: statusText }) : null
+      )
+    );
+    return card;
+  }
+
+  const summary = argsSummary(call) || JSON.stringify(call.arguments || {}).slice(0, 80);
   const head = el(
     "div",
-    {
-      class: "tc-head",
-      role: "button",
-      tabindex: "0",
-      title: "Open request / response",
-      "aria-haspopup": "dialog",
-      onclick: open,
-      onkeydown: onActivate(open),
-    },
+    headOpts,
     el("span", { class: "tc-open-icon", text: "↗" }),
     el("span", { class: "tc-name", text: call.name }),
     el("span", { class: "tc-summary", text: summary }),
@@ -604,7 +744,9 @@ function renderItem(item) {
       for (const b of item.blocks) {
         if (b.type === "text") {
           const d = el("div", { class: "assistant-text" });
-          d.innerHTML = renderMarkdown(b.text || "");
+          // renderMarkdown escapes the source text up front, so the markup it
+          // emits is safe to parse; htmlFragment keeps it off innerHTML
+          d.replaceChildren(...htmlFragment(renderMarkdown(b.text || "")));
           blocks.append(d);
         } else if (b.type === "thinking") {
           if (b.redacted && !b.thinking) {
@@ -1285,6 +1427,8 @@ async function refresh({ sessions = false, stats = true } = {}) {
         state.stats = s.data;
       } catch {}
       try {
+        // captured before the query: a pick made while it is in flight wins
+        const askedAt = Date.now();
         const st = await cmd("get_state");
         // `|| null` (not `|| state.sessionFile`): a fresh/new session reports
         // sessionFile=null and must CLEAR the old one — keeping it would leave
@@ -1292,7 +1436,15 @@ async function refresh({ sessions = false, stats = true } = {}) {
         state.sessionFile = st.data?.sessionFile || null;
         state.sessionId = st.data?.sessionId;
         state.sessionName = st.data?.sessionName || null;
-        state.model = st.data?.model || state.model;
+        // A model the user picked after this query was issued must win over
+        // the snapshot pi returned: an in-flight get_state still carries the
+        // pre-pick model (typically the first available one) and would
+        // silently reset the dropdown even though the picked model is still
+        // listed. pi itself keeps the pick (set_model wrote a model_change
+        // entry), so dropping the stale snapshot is always safe.
+        const m = st.data?.model;
+        const stalesPick = state.modelPickedAt > askedAt && m && !sameModel(m, state.model);
+        if (m && !stalesPick) state.model = m;
         state.thinkingLevel = st.data?.thinkingLevel ?? state.thinkingLevel;
         state.isStreaming = !!st.data?.isStreaming;
       } catch {}
@@ -1313,12 +1465,46 @@ async function refresh({ sessions = false, stats = true } = {}) {
   }
 }
 
-async function loadModels() {
-  try {
-    const res = await cmd("get_available_models");
-    state.models = res.data?.models || [];
-  } catch {}
-  renderHeader();
+// Extensions register asynchronously after the pi process spawns (e.g.
+// pi-provider-workbuddy resolves credentials and fetches its model catalog
+// over the network before calling registerProvider), so a model query sent
+// right after /api/open can come back missing them. With retry:true, keep
+// polling until the model set has been identical across three consecutive
+// polls (or the cap), re-rendering as the list grows. Two identical polls do
+// NOT prove stability: workbuddy-style extensions may register seconds after
+// spawn, so a late registration can land between two early identical polls —
+// a third poll after an unchanged gap must also see no change. A token guards
+// against overlapping loops if loadModels is called again mid-retry.
+let loadModelsToken = 0;
+function modelInList(m) {
+  return !!m && state.models.some((x) => x.provider === m.provider && x.id === m.id);
+}
+function sameModel(a, b) {
+  return !!a && !!b && a.provider === b.provider && a.id === b.id;
+}
+async function loadModels({ retry = false } = {}) {
+  const token = ++loadModelsToken;
+  let prevSig = null;
+  let stableStreak = 0; // consecutive polls that returned the same model set
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await cmd("get_available_models");
+      state.models = res.data?.models || [];
+    } catch {}
+    renderHeader();
+    const sig = state.models.map((m) => `${m.provider}/${m.id}`).sort().join("|");
+    if (retry && sig && sig === prevSig) stableStreak++;
+    else stableStreak = 0;
+    prevSig = sig;
+    const stable = stableStreak >= 2; // three identical polls in a row
+    const done =
+      !retry ||
+      token !== loadModelsToken ||
+      (state.models.length && (modelInList(state.model) || stable)) ||
+      attempt >= 12;
+    if (done) break;
+    await new Promise((r) => setTimeout(r, 2500));
+  }
 }
 
 /** pi's get_commands lists every discoverable command (extension commands,
@@ -1344,6 +1530,7 @@ async function sendPrompt() {
   input.value = "";
   autosize(input);
   closeCmdMenu();
+  rememberPrompt(text);
   const images = attachments.splice(0, attachments.length);
   renderAttachments();
   const extra = state.isStreaming ? { streamingBehavior: "steer" } : {};
@@ -1404,6 +1591,10 @@ async function switchSession(file, cwd) {
     await waitPiReady(file);
     state.sessionFile = file;
     state.executions.clear();
+    // queue chips belong to the previous session's process — leaving them set
+    // would keep showing the old session's queued messages after a switch
+    // (pi has no get_queue RPC, so this is the only source of truth)
+    state.queued = { steering: [], followUp: [] };
     state.isStreaming = false;
     state.isCompacting = false;
     currentAssistant = null;
@@ -1437,6 +1628,7 @@ async function newSession() {
     await waitPiReady(null);
     state.sessionFile = null;
     state.executions.clear();
+    state.queued = { steering: [], followUp: [] };
     state.isStreaming = false;
     state.isCompacting = false;
     currentAssistant = null;
@@ -1510,6 +1702,9 @@ function handleEvent(record) {
     case "agent_start":
       state.isStreaming = true;
       renderStatus();
+      // a late extension registration can add models after boot's retry loop
+      // gave up; top up the picker before the run picks its model
+      if (!state.models.length || (state.model && !modelInList(state.model))) loadModels();
       break;
     case "turn_start":
       break;
@@ -1577,6 +1772,7 @@ function handleEvent(record) {
     case "message_end": {
       const m = record.message;
       if (m.role === "assistant") {
+        scheduleStatsRefresh();
         const item = findStreamingAssistant();
         const built = { kind: "assistant", blocks: blocksOf(m), meta: assistantMeta(m), streaming: false, ts: m.timestamp, _rawMessage: m };
         if (item) {
@@ -1735,6 +1931,21 @@ function scheduleSettledRefresh() {
   }, 250);
 }
 
+// The ctx/cost badges in the header update per assistant message, not only at
+// agent_settled — a multi-turn run otherwise shows stale totals until it ends.
+let statsTimer = null;
+function scheduleStatsRefresh() {
+  if (statsTimer) return;
+  statsTimer = setTimeout(async () => {
+    statsTimer = null;
+    try {
+      const s = await cmd("get_session_stats");
+      state.stats = s.data;
+      renderHeader();
+    } catch {}
+  }, 300);
+}
+
 async function restartPi() {
   try {
     // reopen this tab's session in a fresh process (the old one exited);
@@ -1753,6 +1964,7 @@ async function restartPi() {
     $("#pi-status").textContent = "pi running";
     $("#pi-status").className = "pi-status ok";
     $("#pi-status").onclick = null;
+    state.queued = { steering: [], followUp: [] }; // queue died with the process
     await refresh({ sessions: false });
     syncHash();
   } catch (err) {
@@ -1863,7 +2075,12 @@ function repaintModal() {
 
 /** open one tool call: arguments, execution updates and response in a popup */
 function openToolcall(call, block) {
-  openPopup(`tool: ${call.name}`, {
+  // edit popups carry the target file name in the title
+  const title =
+    call.name === "edit" && call.arguments?.path
+      ? `edit: ${String(call.arguments.path).split(/[\\/]/).pop()}`
+      : `tool: ${call.name}`;
+  openPopup(title, {
     paint: () => {
       // re-read live state so a running call stays current between repaints
       const st = toolcallState(block);
@@ -1930,6 +2147,17 @@ function closeCmdMenu() {
   cmdMenuEl.innerHTML = "";
   cmdMatches = [];
   cmdIndex = 0;
+}
+
+/** true when the caret sits on the first (ArrowUp) / last (ArrowDown) visual
+ *  line of the textarea — arrows must keep their native caret movement while
+ *  the user is navigating inside a multi-line draft */
+function cursorOnOuterLine(ta) {
+  const pos = ta.selectionStart;
+  if (pos == null || ta.selectionEnd !== pos) return false;
+  if (ta.value.slice(0, pos).includes("\n")) return false; // ArrowUp: not on the first line
+  if (ta.value.slice(pos).includes("\n")) return false; // ArrowDown: not on the last line
+  return true;
 }
 
 function updateCmdMenu() {
@@ -2005,9 +2233,73 @@ function applyCmdIndex(i) {
 }
 
 const inputEl = $("#input");
+
+// ---------------------------------------------------------------------------
+// prompt history: ArrowUp/ArrowDown (terminal-style) recalls previously sent
+// prompts; ArrowDown past the newest restores the in-progress draft.
+// ---------------------------------------------------------------------------
+function promptHistory() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || "[]");
+    return Array.isArray(arr) ? arr.filter((s) => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberPrompt(text) {
+  const hist = promptHistory().filter((s) => s !== text);
+  hist.push(text); // most recent last
+  if (hist.length > PROMPT_HISTORY_MAX) hist.splice(0, hist.length - PROMPT_HISTORY_MAX);
+  localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(hist));
+}
+
+// -1 = not browsing; otherwise an offset back from the newest entry:
+// 0 = newest prompt, 1 = the one before it, …
+let historyIndex = -1;
+let historyDraft = "";
+
+function resetHistoryBrowse() {
+  historyIndex = -1;
+}
+
+function showHistoryEntry() {
+  const hist = promptHistory();
+  const pos = hist.length - 1 - historyIndex;
+  if (pos < 0 || pos >= hist.length) return;
+  inputEl.value = hist[pos];
+  autosize(inputEl);
+  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+}
+
+function historyMove(delta) {
+  const hist = promptHistory();
+  if (!hist.length) return;
+  if (historyIndex === -1) {
+    // not browsing yet: ArrowDown is a no-op, ArrowUp enters history at the
+    // newest prompt and parks the current draft
+    if (delta < 0) return;
+    historyDraft = inputEl.value;
+    historyIndex = 0;
+  } else {
+    const next = historyIndex + delta; // ArrowUp = older, ArrowDown = newer
+    if (next >= hist.length) return; // already at the oldest entry
+    if (next < 0) {
+      // walked forward past the newest entry: restore the parked draft
+      historyIndex = -1;
+      inputEl.value = historyDraft;
+      autosize(inputEl);
+      inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+      return;
+    }
+    historyIndex = next;
+  }
+  showHistoryEntry();
+}
 inputEl.addEventListener("input", () => {
   autosize(inputEl);
   updateCmdMenu();
+  resetHistoryBrowse();
 });
 inputEl.addEventListener("blur", closeCmdMenu);
 inputEl.addEventListener("keydown", (e) => {
@@ -2044,6 +2336,16 @@ inputEl.addEventListener("keydown", (e) => {
       return;
     }
   }
+  if (e.key === "ArrowUp" && !e.altKey && !e.ctrlKey && !e.metaKey && cursorOnOuterLine(inputEl)) {
+    e.preventDefault();
+    historyMove(1);
+    return;
+  }
+  if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey && cursorOnOuterLine(inputEl)) {
+    e.preventDefault();
+    historyMove(-1);
+    return;
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     sendPrompt();
@@ -2062,11 +2364,13 @@ function renderAttachments() {
   attachmentsEl.innerHTML = "";
   attachmentsEl.classList.toggle("hidden", !attachments.length);
   attachments.forEach((a, i) => {
+    // clicking a thumbnail opens the full image in the popup for detail review
+    const zoom = () => openPopup("attachment", { paint: () => el("div", { class: "attachment-zoom" }, el("img", { src: a.url, alt: "attachment" })) });
     attachmentsEl.append(
       el(
         "div",
         { class: "attachment" },
-        el("img", { src: a.url, alt: "attachment preview" }),
+        el("img", { src: a.url, alt: "attachment preview", title: "Click to enlarge", onclick: zoom }),
         el("button", {
           class: "attachment-remove",
           title: "Remove attachment",
@@ -2261,10 +2565,14 @@ applySidebarWidth(Number(localStorage.getItem(SIDEBAR_WIDTH_KEY)) || 280);
 // ---------------------------------------------------------------------------
 const ICON_SUN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`;
 const ICON_MOON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+/** parse a static SVG string into a live element (no untrusted input) */
+function svgIcon(markup) {
+  return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
+}
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("piweb-theme", theme);
-  $("#btn-theme").innerHTML = theme === "light" ? ICON_MOON : ICON_SUN;
+  $("#btn-theme").replaceChildren(svgIcon(theme === "light" ? ICON_MOON : ICON_SUN));
 }
 $("#btn-theme").addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
@@ -2273,6 +2581,10 @@ $("#btn-theme").addEventListener("click", () => {
 $("#model-select").addEventListener("change", async (e) => {
   const [provider, ...rest] = e.target.value.split("/");
   const modelId = rest.join("/");
+  // record intent BEFORE the RPC round-trip: a refresh() get_state issued
+  // earlier but resolving later carries the pre-pick model and must not
+  // overwrite this selection
+  state.modelPickedAt = Date.now();
   try {
     await cmd("set_model", { provider, modelId });
     const st = await cmd("get_state");
@@ -2351,7 +2663,9 @@ function connectEvents() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ client: CLIENT_ID }),
   }).catch(() => {});
-  await loadModels();
+  // Not awaited: the retry loop re-renders the picker as providers land, and
+  // boot must not stall on a slow extension registration.
+  loadModels({ retry: true });
   await refresh({ sessions: true });
   // poll the session list so the sidebar's background-run dots stay current
   setInterval(() => loadSessions().catch(() => {}), 8000);

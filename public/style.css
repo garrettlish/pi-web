@@ -88,6 +88,15 @@ body {
 
 #app { display: flex; height: 100vh; }
 
+/* collapsed sidebar: #sidebar and #resizer leave the layout, a small expand
+   button appears at the left edge of the topbar */
+body.sidebar-collapsed #sidebar,
+body.sidebar-collapsed #resizer { display: none; }
+#btn-sidebar-expand { flex: none; }
+body.sidebar-collapsed #btn-sidebar-expand {
+  background: var(--surface-elev); border-color: var(--border); color: var(--text);
+}
+
 /* draggable divider between sidebar and main content */
 #resizer {
   flex: none; width: 1px; background: var(--border);
@@ -248,6 +257,11 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
 .icon-btn:disabled { opacity: 0.4; cursor: default; }
 .icon-btn:disabled:hover { color: var(--text); border-color: var(--border); background: var(--surface-elev); }
 .sidebar-actions { display: inline-flex; align-items: center; gap: 8px; }
+.sidebar-actions #btn-sidebar-collapse {
+  /* visually grouped with the workspace/new-session controls but reads as
+     "leave the sidebar", so it sits at the far end of the row */
+  margin-left: -4px;
+}
 
 /* dock above the composer: status + queued messages sit where the eye already
    is (next to the input box) instead of up in the header */
@@ -410,6 +424,10 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
 .tc-status.ok { color: var(--success); background: var(--success-soft); }
 .tc-status.error { color: var(--danger); background: var(--danger-soft); }
 .tc-duration { font-size: 12px; color: var(--text-secondary); font-family: var(--font-ui); }
+/* +/- change counts on edit tool rows */
+.tc-stat { font-size: 12px; font-family: var(--font-ui); font-weight: 600; }
+.tc-stat.add { color: var(--success); }
+.tc-stat.del { color: var(--danger); }
 /* Tool bodies are only ever rendered inside the popup (#modal-body), never in
    the transcript — expanding in place pushed the following content off screen. */
 .tc-body { display: block; }
@@ -430,15 +448,30 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
 .tc-result.is-error .tc-text { border-color: var(--danger); }
 
 /* colored unified-diff view inside tool responses */
-.tc-diff { white-space: pre; overflow-x: auto; padding: 4px 0; }
-.tc-diff .dline { padding: 0 12px; min-height: 1.45em; }
+.tc-diff { white-space: pre; overflow-x: auto; padding: 4px 0; font-family: var(--mono); }
+.tc-diff .dline { padding: 0 12px 0 0; min-height: 1.45em; display: flex; align-items: baseline; }
+.tc-diff .dsign { flex: none; width: 1.4em; text-align: center; font-weight: 700; }
+.tc-diff .dnum {
+  flex: none; min-width: 3.2em; padding: 0 6px; text-align: right;
+  color: var(--text-secondary); user-select: none;
+}
+.tc-diff .dbody { flex: 1; white-space: pre-wrap; word-break: break-word; }
+/* GitHub-style full-row tints: green additions, red deletions */
 .tc-diff .dline.dadd { background: var(--success-soft); }
-.tc-diff .dline.dadd .dsign { color: var(--success); font-weight: 700; }
+.tc-diff .dline.dadd .dsign { color: var(--success); }
+.tc-diff .dline.dadd .dnum { color: var(--success); opacity: 0.75; }
 .tc-diff .dline.ddel { background: var(--danger-soft); }
-.tc-diff .dline.ddel .dsign { color: var(--danger); font-weight: 700; }
-.tc-diff .dline.dhunk { color: var(--primary); }
+.tc-diff .dline.ddel .dsign { color: var(--danger); }
+.tc-diff .dline.ddel .dnum { color: var(--danger); opacity: 0.75; }
+.tc-diff .dline.dhunk { background: var(--primary-soft); color: var(--primary); }
 .tc-diff .dline.dfile { font-weight: 700; }
 .tc-diff .dline.dmeta { color: var(--text-secondary); font-style: italic; }
+/* skipped-context marker row inside pi edit diffs ("    12 ...") */
+.tc-diff .dline.dskip { color: var(--text-secondary); }
+.tc-diff-section {
+  background: var(--surface-code); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 8px 0; overflow-x: auto;
+}
 
 /* ---------------- composer ---------------- */
 #composer {
@@ -495,7 +528,9 @@ body.dropping #composer { background: var(--primary-soft); }
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   overflow: hidden; line-height: 0;
 }
-.attachment img { width: 84px; height: 84px; object-fit: cover; display: block; }
+.attachment img { width: 84px; height: 84px; object-fit: cover; display: block; cursor: zoom-in; }
+.attachment-zoom { display: flex; justify-content: center; }
+.attachment-zoom img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: var(--radius-sm); }
 .attachment-remove {
   position: absolute; top: 2px; right: 2px;
   width: 18px; height: 18px; padding: 0;

@@ -37,6 +37,9 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           </button>
           <button id="btn-new-session" title="New session in this workspace">+ New</button>
+          <button id="btn-sidebar-collapse" class="icon-btn" title="Collapse sidebar" aria-label="Collapse sidebar">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="M15 10l-2 2 2 2"/></svg>
+          </button>
         </span>
       </div>
       <div id="sidebar-tabs" class="sidebar-tabs" role="tablist" aria-label="Session views">
@@ -61,11 +64,14 @@
     <main id="main">
       <header id="topbar">
         <div class="topbar-left">
+          <button id="btn-sidebar-expand" class="ghost icon-btn hidden" title="Show sidebar" aria-label="Show sidebar">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+          </button>
+          <span id="session-name">—</span>
           <button id="btn-session-info" class="ghost icon-btn" title="Session details" aria-label="Session details"
                   aria-haspopup="dialog" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5"/><path d="M12 8h.01"/></svg>
           </button>
-          <span id="session-name">—</span>
           <div id="session-info-pop" class="popover hidden" role="dialog" aria-label="Session details"></div>
         </div>
         <div class="topbar-right">

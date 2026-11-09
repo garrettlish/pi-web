@@ -77,11 +77,14 @@ pi-web --cwd ~/code/my-project
   events), with a subset of Markdown rendered inline.
 - Tool calls appear as one-line rows in the transcript; clicking one opens a popup with the request
   arguments, live execution updates and the final response (text, images, `details`, error state,
-  duration). The popup has a **Raw JSON** toggle and copies the full payload — the transcript
-  itself never grows or scrolls, so the surrounding messages stay put.
+  duration). For `edit` calls the popup leads with a colored, line-numbered diff — green additions,
+  red deletions — followed by the raw request and response. The popup has a **Raw JSON** toggle and
+  copies the full payload — the transcript itself never grows or scrolls, so the surrounding
+  messages stay put.
 - Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
 - Queued steering / follow-up messages appear in a dock directly above the composer, next to the
-  running indicator; each can be undone individually or the whole queue cleared.
+  running indicator; each can be undone individually or the whole queue cleared. The queue belongs
+  to the attached session's agent process — switching sessions shows only that session's queue.
 - `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** sit in
   that same dock above the input, so they are visible from where you are typing; if `pi` dies, the
   sidebar status line turns into a restart button.
@@ -105,9 +108,19 @@ pi-web --cwd ~/code/my-project
 
 - Switch model and thinking level from the header. The model list honors `enabledModels` from
   `~/.pi/agent/settings.json`.
-- Context-window usage (used / max / percent), session cost and token totals in the header, with a
-  session-details popover for the full path, session id, cwd and token breakdown.
-- Drop or paste images into the composer to send them as attachments.
+- Context-window usage (used / max / percent), session cost and token totals in the header —
+  updated as each assistant message completes, not only when a run ends — with a session-details
+  popover for the full path, session id, cwd and token breakdown.
+- The list button in the header outlines every user prompt in the session; clicking an entry
+  scrolls the transcript to that message.
+- Drop image files anywhere on the page to attach them to the next message; click a thumbnail to
+  enlarge it.
+- `ArrowUp` / `ArrowDown` in the composer walk back and forward through previously sent
+  prompts (terminal-style, kept in the browser's local storage, capped at 200 entries);
+  the in-progress draft is restored when you arrow past the newest entry. Arrows keep
+  their normal caret role while the cursor is inside a multi-line draft.
+- The sidebar collapses to give the transcript the full window width; the state is
+  remembered across reloads, and a button at the left edge of the header brings it back.
 - Extension UI requests (`select`, `confirm`, `input`, `editor`) surface as real dialogs; `notify`
   becomes a toast.
 - Light and dark themes, a resizable sidebar, keyboard focus styling.
@@ -196,8 +209,7 @@ Either way, put authentication in front of the port before it is reachable by an
 
 - Paths from the browser are resolved and checked against the public asset directory before being
   served; the workspace picker only lists existing directories.
-- Request bodies are capped at 32 MB (image attachments are base64 in a JSON body).
-- Session files are read from the configured session directory only.
+- Session listing walks only the configured session directory.
 - No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
   `textContent`, and the Markdown subset escapes before formatting.
 - Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
@@ -226,8 +238,8 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Limitations
 
-- Only the active branch of a session is rendered; `get_tree` is available server-side but there is
-  no branch visualization yet.
+- Only the active branch of a session is rendered; pi supports branching, but there is no branch
+  visualization yet.
 - The RPC `bash` command is intentionally unused — send prompts instead.
 - No authentication. See [Remote access](#remote-access).
 - No multi-user support: one person, one machine, many tabs.
