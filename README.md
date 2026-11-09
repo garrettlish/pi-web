@@ -95,7 +95,10 @@ pi-web --cwd ~/code/my-project
   and last activity. **Recent** is a flat, cross-project list; **Workspaces** is a two-level
   project → session view.
 - Opening a session rebuilds the transcript from its active branch, including history from before
-  a compaction, so you see the same conversation the terminal would.
+  a compaction, so you see the same conversation the terminal would. The switch is optimistic:
+  the sidebar highlight and URL hash update immediately, sessions opened before in the same tab
+  render from an in-memory cache and pull only entries appended since (via the `get_entries
+  since` cursor), and unseen sessions show a "loading session…" notice while `pi` boots.
 - Every open session runs in **its own `pi --mode rpc` process**. Switching sessions does not stop
   the previous one: it keeps running in the background (marked with a pulsing dot in the sidebar)
   and you can re-attach at any time. Each browser tab is bound to exactly one process, so parallel
@@ -160,7 +163,7 @@ localhost-only by default.
 | `GET /api/config` | Server cwd, session directory, pi binary |
 | `GET /api/health` | Liveness and live process count |
 | `GET /api/events?client=<id>` | SSE stream of pi records for this client's session |
-| `POST /api/open` | `{client, sessionFile?, cwd?}` — attach this client to a session |
+| `POST /api/open` | `{client, sessionFile?, cwd?}` — attach this client to a session; a fresh spawn is awaited until pi answers RPC |
 | `POST /api/cmd` | `{client, type, …}` — forward a pi RPC command, await its response |
 | `POST /api/ui-response` | Answer an extension UI request |
 | `GET /api/sessions` | List sessions with live active/streaming flags |

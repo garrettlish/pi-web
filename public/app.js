@@ -1420,42 +1420,12 @@ async function refresh({ sessions = false, stats = true } = {}) {
     state.items = buildItemsFromEntries(branch);
     // Executions map is live-run data; persisted results now cover it.
     state.executions.clear();
+    // state.items now mirrors the persisted branch — live events appended
+    // after the last refresh are folded back in, so a stashed view of this
+    // session can trust state.leafId again (see stashCurrentView).
+    entriesDirty = false;
     renderTranscript();
-    if (stats) {
-      try {
-        const s = await cmd("get_session_stats");
-        state.stats = s.data;
-      } catch {}
-      try {
-        // captured before the query: a pick made while it is in flight wins
-        const askedAt = Date.now();
-        const st = await cmd("get_state");
-        // `|| null` (not `|| state.sessionFile`): a fresh/new session reports
-        // sessionFile=null and must CLEAR the old one — keeping it would leave
-        // the old title in the header and the old session id in the URL hash.
-        state.sessionFile = st.data?.sessionFile || null;
-        state.sessionId = st.data?.sessionId;
-        state.sessionName = st.data?.sessionName || null;
-        // A model the user picked after this query was issued must win over
-        // the snapshot pi returned: an in-flight get_state still carries the
-        // pre-pick model (typically the first available one) and would
-        // silently reset the dropdown even though the picked model is still
-        // listed. pi itself keeps the pick (set_model wrote a model_change
-        // entry), so dropping the stale snapshot is always safe.
-        const m = st.data?.model;
-        const stalesPick = state.modelPickedAt > askedAt && m && !sameModel(m, state.model);
-        if (m && !stalesPick) state.model = m;
-        state.thinkingLevel = st.data?.thinkingLevel ?? state.thinkingLevel;
-        state.isStreaming = !!st.data?.isStreaming;
-      } catch {}
-      try {
-        const lv = await cmd("get_available_thinking_levels");
-        state.thinkingLevels = lv.data?.levels || [];
-      } catch {}
-      // refresh the slash-command list too: skills/templates/extensions can
-      // change between sessions (different cwd) or after a pi /reload
-      loadCommands();
-    }
+    if (stats) await refreshMeta();
     renderHeader();
     renderStatus();
     if (sessions) await loadSessions();
@@ -1463,6 +1433,45 @@ async function refresh({ sessions = false, stats = true } = {}) {
     console.error(err);
     toast(`refresh failed: ${err.message}`, "error");
   }
+}
+
+/** Header/status state that does not depend on the transcript: stats, the
+ *  get_state snapshot, thinking levels and slash commands. Shared by the full
+ *  refresh and the incremental cached-session refresh. */
+async function refreshMeta() {
+  try {
+    const s = await cmd("get_session_stats");
+    state.stats = s.data;
+  } catch {}
+  try {
+    // captured before the query: a pick made while it is in flight wins
+    const askedAt = Date.now();
+    const st = await cmd("get_state");
+    // `|| null` (not `|| state.sessionFile`): a fresh/new session reports
+    // sessionFile=null and must CLEAR the old one — keeping it would leave
+    // the old title in the header and the old session id in the URL hash.
+    state.sessionFile = st.data?.sessionFile || null;
+    state.sessionId = st.data?.sessionId;
+    state.sessionName = st.data?.sessionName || null;
+    // A model the user picked after this query was issued must win over
+    // the snapshot pi returned: an in-flight get_state still carries the
+    // pre-pick model (typically the first available one) and would
+    // silently reset the dropdown even though the picked model is still
+    // listed. pi itself keeps the pick (set_model wrote a model_change
+    // entry), so dropping the stale snapshot is always safe.
+    const m = st.data?.model;
+    const stalesPick = state.modelPickedAt > askedAt && m && !sameModel(m, state.model);
+    if (m && !stalesPick) state.model = m;
+    state.thinkingLevel = st.data?.thinkingLevel ?? state.thinkingLevel;
+    state.isStreaming = !!st.data?.isStreaming;
+  } catch {}
+  try {
+    const lv = await cmd("get_available_thinking_levels");
+    state.thinkingLevels = lv.data?.levels || [];
+  } catch {}
+  // refresh the slash-command list too: skills/templates/extensions can
+  // change between sessions (different cwd) or after a pi /reload
+  loadCommands();
 }
 
 // Extensions register asynchronously after the pi process spawns (e.g.
@@ -1567,16 +1576,106 @@ async function abort() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// per-session view cache
+//
+// Switching back to a recently seen session reuses the already-rendered items
+// (DOM nodes included) instead of rebuilding the whole transcript, then pulls
+// only the entries appended since the cached leaf via the get_entries `since`
+// cursor. In-memory only: items hold live DOM nodes and must not be persisted.
+// ---------------------------------------------------------------------------
+const viewCache = new Map(); // sessionFile -> { items, leafId }
+const VIEW_CACHE_MAX = 8;
+let switchGen = 0; // guards the optimistic switch against overlapping switches
+// Live events (message_start/message_end) append items without touching
+// state.leafId, so a stashed leafId would under-count the branch until the
+// next full refresh folds them in.
+let entriesDirty = false;
+
+/** Remember the current session's rendered transcript for fast switch-back. */
+function stashCurrentView() {
+  const file = state.sessionFile;
+  // A streaming view cannot be cached: its tail items are still mutating and
+  // the persisted branch has not caught up with what is on screen.
+  if (!file || state.isStreaming || state.isCompacting) return;
+  viewCache.set(file, { items: state.items, leafId: entriesDirty ? null : state.leafId });
+  while (viewCache.size > VIEW_CACHE_MAX) viewCache.delete(viewCache.keys().next().value);
+}
+
+/** True if `entries` chain parent-to-child from `fromId` and end at `leafId`,
+ *  i.e. they linearly extend the cached branch and can be appended to it. */
+function extendsBranch(entries, fromId, leafId) {
+  let prev = fromId;
+  for (const e of entries) {
+    if (e.parentId !== prev) return false;
+    prev = e.id;
+  }
+  return leafId === prev;
+}
+
+/** Refresh after attaching to a session whose view was rendered from cache:
+ *  append only the new entries when they extend the cached branch, else fall
+ *  back to a full refresh (cursor rejected, branch moved, compacted, ...). */
+async function refreshCachedView(file) {
+  const cached = viewCache.get(file);
+  if (cached && state.items === cached.items && cached.leafId) {
+    try {
+      const res = await cmd("get_entries", { since: cached.leafId });
+      const entries = res.data?.entries || [];
+      const leafId = res.data?.leafId ?? null;
+      if (extendsBranch(entries, cached.leafId, leafId)) {
+        state.leafId = leafId;
+        cached.leafId = leafId;
+        if (entries.length) state.items.push(...buildItemsFromEntries(entries));
+        await refreshMeta();
+        renderHeader();
+        renderStatus();
+        renderTranscript();
+        return;
+      }
+    } catch {
+      // `since` rejected or RPC hiccup — full refresh below
+    }
+  }
+  await refresh({ sessions: false });
+}
+
 async function switchSession(file, cwd) {
   if (file === state.sessionFile) return;
+  const gen = ++switchGen;
+  const prevFile = state.sessionFile;
+  const prevView = { items: state.items, leafId: state.leafId };
+  stashCurrentView();
+
+  // Optimistic switch: update highlight, hash and transcript area up front so
+  // a cold spawn (~2s) does not leave the previous session on screen. The
+  // /api/open round-trip below waits for pi to answer RPC before resolving.
+  // NOTE: the previously attached session is NOT aborted — it keeps running
+  // in its own pi process on the server and can be re-attached anytime.
+  state.sessionFile = file;
+  state.executions.clear();
+  // queue chips belong to the previous session's process — leaving them set
+  // would keep showing the old session's queued messages after a switch
+  // (pi has no get_queue RPC, so this is the only source of truth)
+  state.queued = { steering: [], followUp: [] };
+  state.isStreaming = false;
+  state.isCompacting = false;
+  currentAssistant = null;
+  $("#composer-hint").textContent = "";
+  const cached = viewCache.get(file);
+  state.items = cached ? cached.items : [{ kind: "notice", text: "loading session…" }];
+  state.leafId = cached ? cached.leafId : null;
+  renderTranscript({ follow: false });
+  renderSidebar();
+  syncHash();
+
   try {
-    // NOTE: the previously attached session is NOT aborted — it keeps running
-    // in its own pi process on the server and can be re-attached anytime.
     const resp = await api("/api/open", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ client: CLIENT_ID, sessionFile: file, ...(cwd ? { cwd } : {}) }),
     });
+    if (gen !== switchGen) return; // a newer switch took over the UI
     if (resp.cwd) state.cwd = resp.cwd;
     // prefer the caller's cwd, fall back to what the server resolved
     const ws = cwd || resp.cwd;
@@ -1589,20 +1688,18 @@ async function switchSession(file, cwd) {
     // A fresh process avoids the stale-extension-ctx error that in-process
     // switch_session triggers in extensions holding captured contexts.
     await waitPiReady(file);
-    state.sessionFile = file;
-    state.executions.clear();
-    // queue chips belong to the previous session's process — leaving them set
-    // would keep showing the old session's queued messages after a switch
-    // (pi has no get_queue RPC, so this is the only source of truth)
-    state.queued = { steering: [], followUp: [] };
-    state.isStreaming = false;
-    state.isCompacting = false;
-    currentAssistant = null;
-    $("#composer-hint").textContent = "";
-    await refresh({ sessions: false });
+    if (gen !== switchGen) return;
+    await refreshCachedView(file);
     renderSidebar(); // re-render so the .active highlight follows the clicked row
-    syncHash();
   } catch (err) {
+    if (gen !== switchGen) return;
+    // Revert the optimistic switch: put the previous session's view back.
+    state.sessionFile = prevFile;
+    state.items = prevView.items;
+    state.leafId = prevView.leafId;
+    renderTranscript({ follow: false });
+    renderSidebar();
+    syncHash();
     toast(`switch failed: ${err.message}`, "error");
   }
 }
@@ -1615,6 +1712,7 @@ async function newSession() {
       return;
     }
     const cwd = state.workspace || state.cwd;
+    stashCurrentView();
     const resp = await api("/api/open", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1709,6 +1807,9 @@ function handleEvent(record) {
     case "turn_start":
       break;
     case "message_start": {
+      // New live items extend the persisted branch without updating leafId —
+      // mark the sync dirty so a stashed view falls back to a full refresh.
+      entriesDirty = true;
       const m = record.message;
       if (m.role === "user") {
         for (const it of buildItemsFromEntries([{ type: "message", message: m }])) {

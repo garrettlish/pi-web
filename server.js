@@ -290,8 +290,8 @@ function learnSessionFile(proc, file) {
 }
 
 /** Attach `client` to the process for `sessionFile` (spawning it if needed),
- *  or to a brand-new process. Never stops other running sessions. */
-function openSession({ client, sessionFile, cwd }) {
+ *  or to a brand-new process. Never stops other sessions. */
+async function openSession({ client, sessionFile, cwd }) {
   const c = clientEntry(client);
   let key;
   if (sessionFile) {
@@ -301,6 +301,7 @@ function openSession({ client, sessionFile, cwd }) {
     key = `slot:${randomUUID()}`;
   }
   let proc = procs.get(key);
+  let spawned = false;
   if (!proc) {
     let pcwd;
     if (sessionFile) {
@@ -317,7 +318,11 @@ function openSession({ client, sessionFile, cwd }) {
     procs.set(key, proc);
     if (sessionFile) fileAlias.set(path.resolve(sessionFile), key);
     proc.start();
+    spawned = true;
   }
+  // Resolve /api/open only once a fresh spawn answers RPC — otherwise the
+  // client's ready-poll adds up to its 250ms tick on every cold open.
+  if (spawned) await waitPiRpcReady(proc);
   c.key = key;
   if (c.res) {
     try {
@@ -325,6 +330,21 @@ function openSession({ client, sessionFile, cwd }) {
     } catch {}
   }
   return { ok: true, sessionFile: proc.sessionFile, cwd: proc.cwd };
+}
+
+/** Wait until a freshly spawned pi answers an RPC. Bounded: on timeout or
+ *  process death we return anyway — the client's waitPiReady stays as the
+ *  backstop and the pi_error/pi_exit broadcasts report the failure. */
+async function waitPiRpcReady(proc, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (proc.proc && Date.now() < deadline) {
+    try {
+      await proc.sendCommand({ type: "get_state" }, 5000);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
 }
 
 // Reap idle processes: no attached browser tab, nothing streaming, quiet for a while.
@@ -613,7 +633,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: "missing client id" });
         return;
       }
-      const resp = openSession({
+      const resp = await openSession({
         client: body.client,
         sessionFile: typeof body.sessionFile === "string" && body.sessionFile ? body.sessionFile : null,
         cwd: typeof body.cwd === "string" ? body.cwd : null,
