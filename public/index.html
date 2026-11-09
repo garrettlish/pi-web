@@ -78,24 +78,29 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
           </button>
           <div id="prompt-list-pop" class="hidden" role="dialog" aria-label="User prompts"></div>
-          <button id="btn-abort" class="danger hidden" title="Abort (Esc)">Stop</button>
           <button id="btn-theme" class="ghost icon-btn" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
         </div>
       </header>
 
-      <div id="queue-bar" class="hidden"></div>
-      <div id="status-bar" class="hidden"></div>
+      <div id="transcript-wrap">
+        <div id="transcript" tabindex="0"></div>
+        <button id="btn-jump" class="hidden" title="Jump to latest">↓ latest</button>
+      </div>
 
-      <div id="transcript" tabindex="0"></div>
-      <button id="btn-jump" class="hidden" title="Jump to latest">↓ latest</button>
-
-      <div id="composer">
-        <div id="attachments" class="attachments hidden"></div>
-        <textarea id="input" rows="1" placeholder="Message pi…  (type / for commands & skills, drop images to attach, Enter to send, Shift+Enter for newline)"></textarea>
-        <div class="composer-row">
-          <span class="hint dim" id="composer-hint"></span>
-          <span class="spacer"></span>
-          <button id="btn-send">Send</button>
+      <!-- status and queued messages live directly above the input, where the
+           eye already is; in the header they were easy to miss -->
+      <div id="composer-dock">
+        <div id="status-bar" class="hidden"></div>
+        <div id="queue-bar" class="hidden"></div>
+        <div id="composer">
+          <div id="attachments" class="attachments hidden"></div>
+          <textarea id="input" rows="1" placeholder="Message pi…  (type / for commands & skills, drop images to attach, Enter to send, Shift+Enter for newline)"></textarea>
+          <div class="composer-row">
+            <span class="hint dim" id="composer-hint"></span>
+            <span class="spacer"></span>
+            <button id="btn-abort" class="danger hidden" title="Abort (Esc)">Stop</button>
+            <button id="btn-send">Send</button>
+          </div>
         </div>
       </div>
     </main>
@@ -106,6 +111,7 @@
       <div class="modal-head">
         <span id="modal-title">Details</span>
         <span class="spacer"></span>
+        <button id="modal-raw" class="ghost hidden" title="Toggle raw JSON">Raw JSON</button>
         <button id="modal-copy" class="ghost" title="Copy JSON">Copy</button>
         <button id="modal-close" class="ghost" title="Close (Esc)">✕</button>
       </div>

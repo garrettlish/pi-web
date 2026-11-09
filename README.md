@@ -75,13 +75,16 @@ pi-web --cwd ~/code/my-project
 - Assistant text, thinking and tool-call arguments stream in as pi works
   (`message_start` / `message_update` / `message_end`, `tool_execution_*`, retry and compaction
   events), with a subset of Markdown rendered inline.
-- Tool calls appear as collapsible cards: request arguments, live execution updates, the final
-  response (text, images, `details`, error state, duration), and — on double-click — the raw JSON.
+- Tool calls appear as one-line rows in the transcript; clicking one opens a popup with the request
+  arguments, live execution updates and the final response (text, images, `details`, error state,
+  duration). The popup has a **Raw JSON** toggle and copies the full payload — the transcript
+  itself never grows or scrolls, so the surrounding messages stay put.
 - Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
-- Queued steering / follow-up messages are shown above the transcript; each can be undone
-  individually or the whole queue cleared.
-- `Esc` or **Stop** aborts the current run; if `pi` dies, the status line turns into a restart
-  button.
+- Queued steering / follow-up messages appear in a dock directly above the composer, next to the
+  running indicator; each can be undone individually or the whole queue cleared.
+- `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** sit in
+  that same dock above the input, so they are visible from where you are typing; if `pi` dies, the
+  sidebar status line turns into a restart button.
 
 **Sessions**
 

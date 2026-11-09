@@ -83,7 +83,6 @@ const TAB_KEY = "piweb-sidebar-tab";
 const state = {
   items: [], // transcript items (ordered, active branch + live)
   executions: new Map(), // toolCallId -> { status, updates[], result, isError, durationMs }
-  openToolcalls: new Set(), // toolCallId -> card expanded (per call, not per message)
   isStreaming: false,
   isCompacting: false,
   sessionFile: null,
@@ -468,39 +467,31 @@ function diffBlock(text) {
   return wrap;
 }
 
-/** one tool call card */
-function renderToolcall(item, block) {
+/** derive the live view state for one tool call block (shared by the row and
+ *  the popup, so both agree on status, result and duration) */
+function toolcallState(block) {
   const call = block.call;
   const ex = state.executions.get(call.id);
   const result = block.result || (ex && ex.result != null ? { content: ex.result.content, isError: ex.isError, details: ex.result.details } : null);
   const exec = ex || { status: block.result ? "done" : "pending", updates: [] };
   if (block.result) exec.status = block.result.isError ? "error" : "ok";
+  const statusText = exec.status === "running" ? "running" : exec.status === "pending" ? "queued" : result?.isError || exec.isError ? "error" : "done";
+  return { call, ex, result, exec, statusText };
+}
 
-  const statusText = exec.status === "running" ? "running" : exec.status === "pending" ? "queued" : block.result?.isError || exec.isError ? "error" : "done";
-  // expand state is per tool call: one assistant message can contain several
-  // toolCall blocks, and a shared flag would open/close them all together
-  const isOpen = state.openToolcalls.has(call.id);
-  const card = el("div", { class: `toolcall ${exec.status === "running" ? "running" : ""} ${statusText === "error" ? "error" : ""} ${isOpen ? "open" : ""}`, "data-call-id": call.id });
+// Tool output is unbounded (a grep over a repo, a full file read). The popup
+// scrolls, so text is shown in full up to this cap instead of being clipped
+// behind a "show all" toggle.
+const MAX_TOOL_TEXT = 200000;
+function capText(t) {
+  const s = String(t ?? "");
+  return s.length > MAX_TOOL_TEXT ? `${s.slice(0, MAX_TOOL_TEXT)}\n… truncated (${s.length} chars total)` : s;
+}
 
-  const summary = argsSummary(call) || JSON.stringify(call.arguments || {}).slice(0, 80);
-  const head = el(
-    "div",
-    {
-      class: "tc-head",
-      role: "button",
-      tabindex: "0",
-      "aria-expanded": String(isOpen),
-      onclick: () => toggleToolcall(item, call.id, head),
-      onkeydown: onActivate(() => toggleToolcall(item, call.id, head)),
-    },
-    el("span", { class: "tc-chevron", text: "▸" }),
-    el("span", { class: "tc-name", text: call.name }),
-    el("span", { class: "tc-summary", text: summary }),
-    exec.durationMs != null ? el("span", { class: "tc-duration", text: fmtDuration(exec.durationMs) }) : null,
-    el("span", { class: `tc-status ${statusText}`, text: statusText })
-  );
-  card.append(head);
-
+/** rich body for one tool call: arguments, live execution updates, response.
+ *  Rendered inside the popup — never inline, so it cannot shove the rest of
+ *  the transcript off screen. */
+function buildToolcallBody(call, exec, result) {
   const body = el("div", { class: "tc-body" });
 
   // request
@@ -508,7 +499,7 @@ function renderToolcall(item, block) {
   try {
     reqPre.append(jsonBlock(call.arguments ?? call.argsRaw ?? {}));
   } catch {
-    reqPre.append(jsonBlock(String(call.argsRaw ?? "")));
+    reqPre.append(jsonBlock(capText(call.argsRaw)));
   }
   body.append(reqPre);
 
@@ -517,8 +508,7 @@ function renderToolcall(item, block) {
     const sec = el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: `execution updates (${exec.updates.length})` }));
     const last = exec.updates[exec.updates.length - 1];
     const txt = resultText(last?.content) || JSON.stringify(last);
-    const pre = el("div", { class: "tc-text clipped", text: txt.slice(-4000) });
-    sec.append(pre);
+    sec.append(el("div", { class: "tc-text", text: capText(txt) }));
     body.append(sec);
   }
 
@@ -527,31 +517,51 @@ function renderToolcall(item, block) {
     const sec = el("div", { class: `tc-section tc-result ${result.isError ? "is-error" : ""}` }, el("div", { class: "tc-label", text: `response ${result.isError ? "· ERROR" : ""}` }));
     for (const b of result.content || []) {
       if (b.type === "text") {
-        const txt = b.text || "";
-        const pre = looksLikeDiff(txt) ? diffBlock(txt) : el("div", { class: "tc-text", text: txt });
-        if (txt.length > 2000) {
-          pre.classList.add("clipped");
-          const more = el("span", { class: "tc-expand", text: `show all (${txt.length} chars)`, onclick: () => { pre.classList.toggle("clipped"); more.textContent = pre.classList.contains("clipped") ? `show all (${txt.length} chars)` : "collapse"; } });
-          sec.append(pre, more);
-        } else sec.append(pre);
+        const txt = capText(b.text || "");
+        sec.append(looksLikeDiff(txt) ? diffBlock(txt) : el("div", { class: "tc-text", text: txt }));
       } else if (b.type === "image") {
         sec.append(el("img", { src: `data:${b.mimeType};base64,${b.data}` }));
       }
     }
     if (result.details != null) {
-      const det = el("div", { class: "tc-label", text: "details" });
-      sec.append(det, jsonBlock(result.details));
+      sec.append(el("div", { class: "tc-label", text: "details" }), jsonBlock(result.details));
     }
     body.append(sec);
   }
+  return body;
+}
 
-  card.append(body);
+/** one tool call row: a single line in the transcript. Clicking it opens the
+ *  full request/response in the popup — expanding in place pushed everything
+ *  after the card (notably the assistant's summary) below the fold. */
+function renderToolcall(item, block) {
+  const { call, result, exec, statusText } = toolcallState(block);
 
-  // double-click the header for the full raw JSON inspector
-  head.addEventListener("dblclick", () => {
-    const payload = { toolCall: call, execution: ex || null, toolResult: block.result || null };
-    openModal(`tool: ${call.name}`, payload);
+  const card = el("div", {
+    class: `toolcall ${exec.status === "running" ? "running" : ""} ${statusText === "error" ? "error" : ""}`,
+    "data-call-id": call.id,
   });
+
+  const summary = argsSummary(call) || JSON.stringify(call.arguments || {}).slice(0, 80);
+  const open = () => openToolcall(call, block);
+  const head = el(
+    "div",
+    {
+      class: "tc-head",
+      role: "button",
+      tabindex: "0",
+      title: "Open request / response",
+      "aria-haspopup": "dialog",
+      onclick: open,
+      onkeydown: onActivate(open),
+    },
+    el("span", { class: "tc-open-icon", text: "↗" }),
+    el("span", { class: "tc-name", text: call.name }),
+    el("span", { class: "tc-summary", text: summary }),
+    exec.durationMs != null ? el("span", { class: "tc-duration", text: fmtDuration(exec.durationMs) }) : null,
+    el("span", { class: `tc-status ${statusText}`, text: statusText })
+  );
+  card.append(head);
   return card;
 }
 
@@ -571,7 +581,7 @@ function renderAssistantMeta(meta) {
     meta.errorMessage ? el("span", { class: "stop-error", text: `error: ${meta.errorMessage}` }) : null,
     ...parts.map((p) => el("span", { text: p }))
   );
-  line.addEventListener("click", () => openModal("assistant message", meta._raw || meta));
+  line.addEventListener("click", () => openJson("assistant message", meta._raw || meta));
   return line;
 }
 
@@ -623,29 +633,28 @@ function renderItem(item) {
     case "toolResultOrphan": {
       const m = item.message;
       // orphaned results can carry a huge payload (e.g. every replayed read);
-      // keep them collapsed by default like normal tool cards — the head
-      // toggles the body, double-click opens the raw JSON inspector
+      // one summary row — the popup holds the payload
       const key = `orphan-${m.toolCallId || m.timestamp || ""}`;
-      const isOpen = state.openToolcalls.has(key);
-      const card = el("div", { class: `toolcall ${isOpen ? "open" : ""}`, "data-call-id": key });
+      const statusText = m.isError ? "error" : "done";
+      const card = el("div", { class: `toolcall ${m.isError ? "error" : ""}`, "data-call-id": key });
+      const open = () => openRawTool(`tool result: ${m.toolName}`, () => el("div", { class: "tc-body" }, el("div", { class: "tc-text", text: capText(resultText(m.content)) })), m);
       const head = el(
         "div",
         {
           class: "tc-head",
           role: "button",
           tabindex: "0",
-          "aria-expanded": String(isOpen),
-          title: "Click to expand · double-click for raw JSON",
-          onclick: () => toggleToolcall(item, key, head),
-          onkeydown: onActivate(() => toggleToolcall(item, key, head)),
+          title: "Open tool result",
+          "aria-haspopup": "dialog",
+          onclick: open,
+          onkeydown: onActivate(open),
         },
-        el("span", { class: "tc-chevron", text: "▸" }),
+        el("span", { class: "tc-open-icon", text: "↗" }),
         el("span", { class: "tc-name", text: m.toolName }),
         el("span", { class: "tc-summary", text: "(orphaned tool result)" }),
-        el("span", { class: `tc-status ${m.isError ? "error" : "ok"}`, text: m.isError ? "error" : "done" })
+        el("span", { class: `tc-status ${statusText}`, text: statusText })
       );
-      head.addEventListener("dblclick", () => openModal(`tool result: ${m.toolName}`, m));
-      card.append(head, el("div", { class: "tc-body" }, el("div", { class: "tc-text", text: resultText(m.content).slice(0, 4000) })));
+      card.append(head);
       return el("div", { class: "item" }, card);
     }
     case "bash": {
@@ -667,12 +676,12 @@ function renderItem(item) {
     }
     case "summary": {
       const chip = el("div", { class: "notice-chip" }, el("div", { class: "n-title", text: item.title }), el("div", { class: "n-body", text: (item.text || "").slice(0, 2000) }));
-      chip.addEventListener("click", () => openModal(item.title, { title: item.title, text: item.text, data: item.data }));
+      chip.addEventListener("click", () => openJson(item.title, { title: item.title, text: item.text, data: item.data }));
       return el("div", { class: "item item-notice" }, chip);
     }
     case "notice": {
       const chip = el("div", { class: "notice-chip", text: item.text });
-      if (item.data) chip.addEventListener("click", () => openModal("entry", item.data));
+      if (item.data) chip.addEventListener("click", () => openJson("entry", item.data));
       return el("div", { class: "item item-notice" }, chip);
     }
     default:
@@ -721,29 +730,10 @@ function renderTranscript({ follow = true } = {}) {
       cur.splice(i, 1);
     }
   }
-  // auto-follow the bottom is for streaming content only — user-initiated
-  // re-renders (e.g. expanding a tool card) must not fling the page
+  // auto-follow the bottom is for streaming content only — a re-render must not
+  // fling a user who has scrolled up back to the bottom
   if (follow && nearBottom) scrollBottom();
   updateJumpButton();
-}
-
-function rerenderItem(item) {
-  item.dirty = true;
-  renderTranscript({ follow: false });
-}
-
-/** toggle one tool card and keep it anchored at the same viewport position:
- *  the re-render replaces the node, so measure the card's screen position
- *  before and after and compensate scrollTop by the difference */
-function toggleToolcall(item, callId, headEl) {
-  const before = headEl.getBoundingClientRect().top;
-  state.openToolcalls.has(callId) ? state.openToolcalls.delete(callId) : state.openToolcalls.add(callId);
-  rerenderItem(item);
-  const fresh = item.node && item.node.querySelector(`[data-call-id="${CSS.escape(callId)}"]`);
-  if (fresh) {
-    const delta = fresh.getBoundingClientRect().top - before;
-    if (Math.abs(delta) > 1) transcriptEl.scrollTop += delta;
-  }
 }
 
 let renderScheduled = false;
@@ -1288,7 +1278,6 @@ async function refresh({ sessions = false, stats = true } = {}) {
     state.items = buildItemsFromEntries(branch);
     // Executions map is live-run data; persisted results now cover it.
     state.executions.clear();
-    state.openToolcalls.clear();
     renderTranscript();
     if (stats) {
       try {
@@ -1415,7 +1404,6 @@ async function switchSession(file, cwd) {
     await waitPiReady(file);
     state.sessionFile = file;
     state.executions.clear();
-    state.openToolcalls.clear();
     state.isStreaming = false;
     state.isCompacting = false;
     currentAssistant = null;
@@ -1449,7 +1437,6 @@ async function newSession() {
     await waitPiReady(null);
     state.sessionFile = null;
     state.executions.clear();
-    state.openToolcalls.clear();
     state.isStreaming = false;
     state.isCompacting = false;
     currentAssistant = null;
@@ -1733,6 +1720,8 @@ function markToolcallDirty(toolCallId) {
     }
   }
   scheduleRender();
+  // an open popup for this call follows the run live
+  repaintModal();
 }
 
 let refreshTimer = null;
@@ -1825,23 +1814,90 @@ function handleExtensionUI(record) {
 }
 
 // ---------------------------------------------------------------------------
-// modal (full JSON inspector)
+// popup: tool request/response viewer, and the raw JSON inspector
 // ---------------------------------------------------------------------------
-let modalPayload = null;
-function openModal(title, payload) {
-  modalPayload = payload;
-  $("#modal-title").textContent = title;
+// `livePaint` renders the rich view and is re-run when the tool emits more
+// output, so an open popup follows a running call. `payload` is evaluated
+// lazily for the Raw JSON toggle and Copy.
+let livePaint = null;
+let payloadFn = null;
+let showRaw = false;
+
+function renderModalBody() {
   const body = $("#modal-body");
   body.innerHTML = "";
-  body.append(jsonBlock(payload, ""));
-  $("#modal-overlay").classList.remove("hidden");
+  const rawBtn = $("#modal-raw");
+  const canToggle = Boolean(livePaint && payloadFn);
+  rawBtn.classList.toggle("hidden", !canToggle);
+  rawBtn.textContent = showRaw ? "Rendered" : "Raw JSON";
+  if (livePaint && !showRaw) body.append(livePaint());
+  else if (payloadFn) body.append(jsonBlock(payloadFn(), ""));
+  else body.append(el("div", { class: "dim", text: "(nothing to show)" }));
 }
-$("#modal-close").addEventListener("click", () => $("#modal-overlay").classList.add("hidden"));
+
+function openPopup(title, { paint = null, payload = null } = {}) {
+  livePaint = paint;
+  payloadFn = payload;
+  showRaw = false; // a fresh popup always opens rendered
+  $("#modal-title").textContent = title;
+  renderModalBody();
+  $("#modal-body").scrollTop = 0;
+  $("#modal-overlay").classList.remove("hidden");
+  $("#modal-close").focus({ preventScroll: true });
+}
+
+function closeModal() {
+  $("#modal-overlay").classList.add("hidden");
+  livePaint = null;
+  payloadFn = null;
+  showRaw = false;
+}
+
+/** repaint an open live popup without moving its scroll position */
+function repaintModal() {
+  if (!livePaint || showRaw || $("#modal-overlay").classList.contains("hidden")) return;
+  const keep = $("#modal-body").scrollTop;
+  renderModalBody();
+  $("#modal-body").scrollTop = keep;
+}
+
+/** open one tool call: arguments, execution updates and response in a popup */
+function openToolcall(call, block) {
+  openPopup(`tool: ${call.name}`, {
+    paint: () => {
+      // re-read live state so a running call stays current between repaints
+      const st = toolcallState(block);
+      return buildToolcallBody(st.call, st.exec, st.result);
+    },
+    payload: () => {
+      const st = toolcallState(block);
+      return { toolCall: st.call, execution: st.exec || null, toolResult: st.result };
+    },
+  });
+}
+
+/** raw JSON popup for a message / entry / summary chip */
+function openJson(title, payload) {
+  openPopup(title, { payload: () => payload });
+}
+
+/** orphaned tool result (a result whose call is gone): plain-text body in a popup */
+function openRawTool(title, buildBody, payload) {
+  openPopup(title, { paint: buildBody, payload: () => payload });
+}
+
+$("#modal-close").addEventListener("click", closeModal);
 $("#modal-overlay").addEventListener("click", (e) => {
-  if (e.target === $("#modal-overlay")) $("#modal-overlay").classList.add("hidden");
+  if (e.target === $("#modal-overlay")) closeModal();
+});
+$("#modal-raw").addEventListener("click", () => {
+  showRaw = !showRaw;
+  renderModalBody();
+  $("#modal-body").scrollTop = 0;
 });
 $("#modal-copy").addEventListener("click", () => {
-  navigator.clipboard.writeText(JSON.stringify(modalPayload, null, 2)).then(() => toast("copied"), () => toast("copy failed", "error"));
+  const text = JSON.stringify(payloadFn ? payloadFn() : null, null, 2);
+  navigator.clipboard.writeText(text).then(() => toast("copied"), () => toast("copy failed", "error"));
 });
 
 // ---------------------------------------------------------------------------
@@ -2252,7 +2308,7 @@ document.addEventListener("keydown", (e) => {
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
       $("#dialog-cancel").click();
     } else if (!$("#modal-overlay").classList.contains("hidden")) {
-      $("#modal-overlay").classList.add("hidden");
+      closeModal();
     } else if (state.isStreaming && document.activeElement !== inputEl) {
       abort();
     }
