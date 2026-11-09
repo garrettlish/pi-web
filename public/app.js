@@ -144,19 +144,37 @@ function inlineMd(s) {
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
+/** true for a markdown table separator row, e.g. "| --- | :---: |" */
+function isTableSep(line) {
+  const t = line.trim();
+  if (!t.includes("|") || !t.includes("-")) return false;
+  const cells = t.replace(/^\|/, "").replace(/\|$/, "").split("|");
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.trim()));
+}
+
+/** true when line i is a table header row (contains | and next line is a separator) */
+function isTableStart(lines, i) {
+  return lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]);
+}
+
 function renderMarkdown(text) {
   const out = [];
   const lines = esc(text).split("\n");
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    const fence = line.match(/^```\S*\s*$/);
+    const fence = line.match(/^```(\S*)\s*$/);
     if (fence) {
       const buf = [];
       i++;
       while (i < lines.length && !/^```\s*$/.test(lines[i])) buf.push(lines[i++]);
       i++; // closing fence
-      out.push(`<pre><code>${buf.join("\n")}</code></pre>`);
+      const lang = fence[1] ? `<span class="code-lang">${esc(fence[1])}</span>` : "";
+      // buf is already HTML-escaped (renderMarkdown escapes up front), which also
+      // makes it attribute-safe; dataset.code decodes it back to the raw text
+      out.push(
+        `<div class="code-block"><div class="code-head">${lang}<button class="code-copy" type="button" data-code="${buf.join("\n")}">copy</button></div><pre><code>${buf.join("\n")}</code></pre></div>`
+      );
       continue;
     }
     const h = line.match(/^(#{1,4})\s+(.*)/);
@@ -182,13 +200,41 @@ function renderMarkdown(text) {
       out.push(`<blockquote>${buf.join("<br>")}</blockquote>`);
       continue;
     }
+    // table: | header | ... | followed by a | --- | ... | separator row
+    if (isTableStart(lines, i)) {
+      const splitRow = (row) => {
+        let t = row.trim();
+        if (t.startsWith("|")) t = t.slice(1);
+        if (t.endsWith("|") && !t.endsWith("\\|")) t = t.slice(0, -1);
+        return t.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+      };
+      const head = splitRow(lines[i]);
+      // column alignment from the separator row: :--- / :---: / ---:
+      const aligns = splitRow(lines[i + 1]).map((c) =>
+        /^:-+:$/.test(c) ? "center" : /-+:$/.test(c) ? "right" : /^:-+/.test(c) ? "left" : null
+      );
+      i += 2; // skip header + separator
+      const rows = [];
+      while (i < lines.length && lines[i].trim() !== "" && lines[i].includes("|")) rows.push(splitRow(lines[i++]));
+      const cell = (text, tag, k) =>
+        `<${tag}${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${inlineMd(text)}</${tag}>`;
+      const thead = `<thead><tr>${head.map((c, k) => cell(c, "th", k)).join("")}</tr></thead>`;
+      const tbody = `<tbody>${rows.map((r) => `<tr>${r.map((c, k) => cell(c, "td", k)).join("")}</tr>`).join("")}</tbody>`;
+      out.push(`<div class="md-table-wrap"><table>${thead}${tbody}</table></div>`);
+      continue;
+    }
     if (line.trim() === "") {
       i++;
       continue;
     }
     // paragraph: gather until blank line
     const buf = [];
-    while (i < lines.length && lines[i].trim() !== "" && !/^(```|#{1,4}\s|\s*([-*]|\d+\.)\s|\s*>\s?)/.test(lines[i])) {
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^(```|#{1,4}\s|\s*([-*]|\d+\.)\s|\s*>\s?)/.test(lines[i]) &&
+      !isTableStart(lines, i)
+    ) {
       buf.push(inlineMd(lines[i]));
       i++;
     }
@@ -637,6 +683,16 @@ function renderItem(item) {
 // Transcript DOM reconciliation: each item keeps a cached node; re-render only
 // dirty items, append/remove as needed.
 const transcriptEl = $("#transcript");
+// one delegated listener for all "copy" buttons inside rendered code blocks
+transcriptEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".code-copy");
+  if (!btn) return;
+  navigator.clipboard.writeText(btn.dataset.code).then(() => {
+    btn.textContent = "copied";
+    btn.classList.add("done");
+    setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("done"); }, 1500);
+  }).catch(() => toast("copy failed", "error"));
+});
 function renderTranscript({ follow = true } = {}) {
   const nearBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 120;
   const nodes = [];
@@ -820,6 +876,69 @@ sessionInfoBtn.addEventListener("click", (e) => {
 // Click-away and Esc close it; clicks inside the popover must not bubble out.
 $("#session-info-pop").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("click", () => setSessionInfoOpen(false));
+
+/**
+ * User-prompt outline: lists every user message in the current session;
+ * clicking an entry scrolls the transcript to that message and flashes it.
+ */
+function collectUserPrompts() {
+  const prompts = [];
+  for (const item of state.items) if (item.kind === "user") prompts.push(item);
+  return prompts;
+}
+
+function renderPromptList() {
+  const pop = $("#prompt-list-pop");
+  pop.innerHTML = "";
+  const prompts = collectUserPrompts();
+  if (!prompts.length) {
+    pop.append(el("div", { class: "pl-empty", text: "no user prompts in this session yet" }));
+    return;
+  }
+  prompts.forEach((item, n) => {
+    const text = (item.text || "").replace(/\s+/g, " ").trim() || "(images only)";
+    pop.append(
+      el("div", {
+        class: "pl-entry",
+        title: item.text || "",
+        onclick: () => {
+          setPromptListOpen(false);
+          scrollToUserPrompt(item);
+        },
+      },
+        el("span", { class: "pl-num", text: String(n + 1) }),
+        el("span", { class: "pl-text", text: text }),
+        el("span", { class: "pl-time", text: item.ts ? fmtTime(item.ts) : "" })
+      )
+    );
+  });
+}
+
+function scrollToUserPrompt(item) {
+  // the item's cached node lives in the DOM (renderTranscript reconciles 1:1);
+  // force a sync re-render first if a pending dirty flag would replace it
+  if (item.dirty || !item.node) item.node = renderItem(item);
+  const node = item.node;
+  if (!node || !node.isConnected) return;
+  node.scrollIntoView({ block: "start", behavior: "smooth" });
+  node.classList.remove("prompt-flash");
+  void node.offsetWidth; // restart the animation if it is already flashing
+  node.classList.add("prompt-flash");
+  setTimeout(() => node.classList.remove("prompt-flash"), 1600);
+}
+
+const promptListBtn = $("#btn-prompt-list");
+function setPromptListOpen(open) {
+  $("#prompt-list-pop").classList.toggle("hidden", !open);
+  promptListBtn.setAttribute("aria-expanded", String(open));
+}
+promptListBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  renderPromptList(); // rebuild on every open so new prompts are included
+  setPromptListOpen($("#prompt-list-pop").classList.contains("hidden"));
+});
+$("#prompt-list-pop").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", () => setPromptListOpen(false));
 
 function renderStatus() {
   const bar = $("#status-bar");
@@ -1696,6 +1815,7 @@ function handleExtensionUI(record) {
     const ok = el("button", { text: "OK", onclick: () => send({ value: inp.value }) });
     body.append(inp, el("div", { style: "margin-top:10px" }, ok));
     inp.addEventListener("keydown", (e) => {
+      if (e.isComposing || e.keyCode === 229) return; // IME candidate confirmation
       if (e.key === "Enter" && record.method === "input" && !e.shiftKey) send({ value: inp.value });
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send({ value: inp.value });
     });
@@ -1835,6 +1955,9 @@ inputEl.addEventListener("input", () => {
 });
 inputEl.addEventListener("blur", closeCmdMenu);
 inputEl.addEventListener("keydown", (e) => {
+  // IME (e.g. Chinese pinyin) in flight: Enter confirms the candidate and must
+  // not send or trigger the command menu (keyCode 229 = IME on old Safari/Edge)
+  if (e.isComposing || e.keyCode === 229) return;
   if (!cmdMenuEl.classList.contains("hidden")) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -2122,6 +2245,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (!$("#session-info-pop").classList.contains("hidden")) {
       setSessionInfoOpen(false);
+    } else if (!$("#prompt-list-pop").classList.contains("hidden")) {
+      setPromptListOpen(false);
     } else if (!$("#ws-overlay").classList.contains("hidden")) {
       closeWsPicker();
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
