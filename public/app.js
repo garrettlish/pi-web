@@ -302,6 +302,27 @@ function blocksOf(message) {
   return blocks;
 }
 
+/** Attach a toolResult message to the toolCall block that issued it, in place.
+ *  Live events deliver a result as its own message pair; the transcript renders
+ *  results inside their call's block, so both the start and the end of that
+ *  pair resolve it here instead of creating a row. Returns false when no block
+ *  claims the call — a result left over from a branch the view no longer shows,
+ *  which is the only case that deserves an orphan row. */
+function attachToolResult(m) {
+  const toolCallId = m?.toolCallId;
+  if (!toolCallId) return false;
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const item = state.items[i];
+    if (item.kind !== "assistant") continue;
+    const block = item.blocks.find((b) => b.type === "toolcall" && b.call.id === toolCallId);
+    if (!block) continue;
+    block.result = { content: m.content, details: m.details, isError: m.isError, usage: m.usage, ts: m.timestamp };
+    item.dirty = true;
+    return true;
+  }
+  return false;
+}
+
 /** Build transcript items from ordered session entries (active branch). */
 function buildItemsFromEntries(entries) {
   const items = [];
@@ -2720,6 +2741,14 @@ function handleEvent(record) {
         const item = { kind: "assistant", blocks: [], streaming: true, meta: null, ts: m.timestamp, _live: true };
         state.items.push(item);
         currentAssistant = item;
+      } else if (m.role === "toolResult") {
+        // A tool result is not its own transcript item: it belongs to the
+        // toolCall block of the assistant turn that issued it. Attaching here
+        // (and again at message_end) keeps the row filling in live and avoids
+        // the placeholder this branch used to push — buildItemsFromEntries
+        // sees a single message in isolation, so it could never resolve the
+        // call and every result became an orphan row.
+        attachToolResult(m);
       } else {
         for (const it of buildItemsFromEntries([{ type: "message", message: m }])) {
           it._live = true;
@@ -2784,6 +2813,18 @@ function handleEvent(record) {
           state.items.push(built);
         }
         currentAssistant = null;
+      } else if (m.role === "toolResult") {
+        // The authoritative result for the call. message_start already attached
+        // it; this repeat keeps the final payload when they differ, and only a
+        // result no block claims becomes an orphan row (deduplicated by call id,
+        // since start and end both report the same result).
+        if (!attachToolResult(m)) {
+          const key = m.toolCallId || m.timestamp;
+          const exists = state.items.some(
+            (it) => it.kind === "toolResultOrphan" && (it.message?.toolCallId || it.message?.timestamp) === key
+          );
+          if (!exists) state.items.push({ kind: "toolResultOrphan", message: m, ts: m.timestamp, _live: true });
+        }
       } else {
         // replace the tentative live item pushed by message_start
         const kind = roleKind(m.role);
