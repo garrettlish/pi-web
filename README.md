@@ -137,6 +137,11 @@ pi-web --cwd ~/code/my-project
 - Switch model and thinking level from the header. The model list honors `enabledModels` from
   `~/.pi/agent/settings.json`. Both are in-app menus anchored below their button, with the height
   clamped to the space left under it, so they scroll instead of spilling off the window.
+- A new session starts on the model configured in `~/.pi/agent/settings.json` (`defaultProvider`
+  plus `defaultModel`), and a resumed session restarts on the last model its own file recorded, so
+  the header never disagrees with the picker. Providers that register late — workbuddy resolves
+  credentials and fetches its catalog after pi boots — would otherwise lose the race for pi's
+  default and leave the session on an unrelated provider.
 - Context-window usage (used / max / percent), session cost and token totals in the header —
   updated as each assistant message completes, not only when a run ends — with a session-details
   popover for the session title, full path, session id, cwd and token breakdown.

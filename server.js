@@ -16,6 +16,7 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { readFileSync, openSync, readSync, closeSync, createReadStream } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -195,6 +196,10 @@ class PiProc {
     if (this.proc) return this.proc;
     const args = ["--mode", "rpc"];
     if (this.sessionFile) args.push("--session", this.sessionFile);
+    // A new session starts on the configured default; a resumed one keeps the
+    // model its own file recorded.
+    const startupModel = this.sessionFile ? sessionModel(this.sessionFile) : defaultModelSetting();
+    if (startupModel) args.push("--model", startupModel);
     console.log(`[pi-web] starting: ${PI_BIN} ${args.join(" ")} (cwd=${this.cwd})`);
     const p = spawn(PI_BIN, args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"] });
     this.proc = p;
@@ -412,6 +417,59 @@ function sessionCwd(file) {
   }
 }
 
+/** The model a session file last recorded, as `provider/id`, or null.
+ *
+ *  pi restores a resumed session's model from its `model_change` entries, but
+ *  only through `modelRuntime.getModel()`, which needs the provider registered
+ *  at that moment. A lazy provider such as workbuddy is not registered yet, so
+ *  `--session <file>` silently opens on whatever provider did register first
+ *  and every resume of a workbuddy session lands on the wrong model. Passing
+ *  the recorded model back as `--model` closes that gap.
+ *
+ *  Scanned in chunks, not read whole: a session whose transcript carries large
+ *  tool output reaches tens of megabytes. The last model_change wins, so the
+ *  whole file is walked rather than only its head or tail — the entry can sit
+ *  anywhere in between once output is appended after it. */
+function sessionModel(file) {
+  let f;
+  let decoder;
+  try {
+    f = openSync(file, "r");
+    decoder = new StringDecoder("utf8");
+    const buf = Buffer.alloc(64 * 1024);
+    let carry = "";
+    let last = null;
+    const scan = (line) => {
+      if (!line || !line.includes("model_change")) return;
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        return; // a partially written trailing line is normal for a live session
+      }
+      if (e.type === "model_change" && e.provider && e.modelId) last = `${e.provider}/${e.modelId}`;
+    };
+    for (;;) {
+      const n = readSync(f, buf, 0, buf.length, null);
+      if (!n) break;
+      const text = carry + decoder.write(buf.subarray(0, n));
+      const lines = text.split("\n");
+      carry = lines.pop(); // the unterminated tail continues in the next chunk
+      for (const line of lines) scan(line);
+    }
+    scan(carry + decoder.end());
+    return last;
+  } catch {
+    return null;
+  } finally {
+    if (f !== undefined) {
+      try {
+        closeSync(f);
+      } catch {}
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Configured models: filter the catalog down to settings.enabledModels patterns
 // (same semantics as pi's model scope: case-insensitive globs matched against
@@ -420,13 +478,34 @@ function sessionCwd(file) {
 
 const PI_SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
 
-function enabledModelPatterns() {
+function readPiSettings() {
   try {
-    const settings = JSON.parse(readFileSync(PI_SETTINGS_FILE, "utf8"));
-    return Array.isArray(settings.enabledModels) ? settings.enabledModels.filter((p) => typeof p === "string") : [];
+    return JSON.parse(readFileSync(PI_SETTINGS_FILE, "utf8"));
   } catch {
-    return [];
+    return null;
   }
+}
+
+function enabledModelPatterns() {
+  const settings = readPiSettings();
+  return Array.isArray(settings?.enabledModels) ? settings.enabledModels.filter((p) => typeof p === "string") : [];
+}
+
+/** The configured startup model as `provider/id`, or null.
+ *
+ *  Passed to a NEWLY spawned pi as `--model`. Without it pi resolves its startup
+ *  model while extension providers are still registering — a lazy provider such
+ *  as workbuddy (credential resolve + catalog fetch) is not in the catalog yet,
+ *  so `findInitialModel` falls through to any model that already is, and the
+ *  session opens on a provider the model picker does not even list. Re-registering
+ *  the provider later does not repair that: pi only refreshes the CURRENT
+ *  provider/model from the registry. A resumed session uses its own recorded
+ *  model instead (see sessionModel). */
+function defaultModelSetting() {
+  const settings = readPiSettings();
+  const provider = settings?.defaultProvider;
+  const model = settings?.defaultModel;
+  return typeof provider === "string" && provider && typeof model === "string" && model ? `${provider}/${model}` : null;
 }
 
 function patternMatches(pattern, provider, id) {
