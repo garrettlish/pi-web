@@ -6,18 +6,19 @@
   <title>pi-web</title>
   <meta name="description" content="A local web UI for the pi coding agent: streamed transcripts, session history, and a full inspector for every LLM and tool call.">
   <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#efe9ff">
+  <meta name="theme-color" content="#eef6ff">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script>
     // apply the saved palette before first paint to avoid a flash. Unknown
-    // values (including the older "light"/"dark") resolve to a current step.
+    // values (a retired palette, or the older "light"/"dark") resolve to one
+    // of the current moods.
     (function () {
-      var known = ["paper", "lilac", "orchid", "dusk", "indigo", "midnight"];
+      var known = ["mono", "sky", "grove", "ember", "elegant", "night"];
       var saved = localStorage.getItem("piweb-theme");
       document.documentElement.dataset.theme = known.indexOf(saved) >= 0
         ? saved
-        : saved === "dark" ? "midnight" : "lilac";
+        : saved === "dark" ? "night" : "sky";
     })();
   </script>
 </head>

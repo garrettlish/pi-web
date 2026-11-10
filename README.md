@@ -139,7 +139,7 @@ pi-web --cwd ~/code/my-project
   clamped to the space left under it, so they scroll instead of spilling off the window.
 - Context-window usage (used / max / percent), session cost and token totals in the header —
   updated as each assistant message completes, not only when a run ends — with a session-details
-  popover for the full path, session id, cwd and token breakdown.
+  popover for the session title, full path, session id, cwd and token breakdown.
 - The list button in the header outlines every user prompt in the session; clicking an entry
   scrolls the transcript to that message.
 - Attach images to the next message either way: drop files anywhere on the page, or use the
@@ -159,9 +159,10 @@ pi-web --cwd ~/code/my-project
   the image itself (click to enlarge into a full-window viewer layered over the popup, so the
   request/response stays readable underneath), not just as `{"content": "", "fileSize": …}` —
   whether pi returned the bytes inline or only reported the file size and path.
-- Six palettes on one depth ramp — paper, lilac, orchid, dusk, indigo, midnight — picked from a
-  swatch dropdown in the header, with the choice remembered across reloads; a resizable sidebar
-  and keyboard focus styling.
+- Six independent palettes — mono (minimal grey/white), sky (fresh blue), grove (natural green),
+  ember (energetic orange), elegant (soft violet) and night (dark) — picked from a swatch dropdown
+  in the header, with the choice remembered across reloads; a resizable sidebar and keyboard
+  focus styling.
 
 ## Architecture
 

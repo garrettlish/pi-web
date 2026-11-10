@@ -1416,8 +1416,19 @@ $("#btn-jump").addEventListener("click", scrollBottom);
 // ---------------------------------------------------------------------------
 // header / sidebar
 // ---------------------------------------------------------------------------
+/** Sidebar metadata for the open session. `sessionName` is only ever set when a
+ *  session has been explicitly renamed (pi reports it exclusively through
+ *  set_session_name / --name), so an ordinary session has no name and has to
+ *  fall back to its first prompt — the same title the sidebar row shows. */
+function currentSessionMeta() {
+  if (!state.sessionFile) return null;
+  return state.sessions.find((s) => s.file === state.sessionFile) || null;
+}
+
 function renderHeader() {
-  $("#session-name").textContent = state.sessionName || (state.sessionFile ? state.sessionFile.split("/").pop().replace(/\.jsonl$/, "") : "—");
+  const meta = currentSessionMeta();
+  const fallback = state.sessionFile ? state.sessionFile.split("/").pop().replace(/\.jsonl$/, "") : "—";
+  $("#session-name").textContent = state.sessionName || meta?.title || fallback;
   const cu = state.stats?.contextUsage;
   // `tokens`/`percent` are null right after compaction until a fresh response;
   // contextWindow comes from the active model, so fall back to it for the max.
@@ -1679,7 +1690,7 @@ function renderSessionInfo() {
   const cu = st?.contextUsage;
   const cuMax = cu?.contextWindow != null ? Number(cu.contextWindow) : Number(state.model?.contextWindow);
   const rows = [
-    ["session", state.sessionName || "—"],
+    ["session", state.sessionName || currentSessionMeta()?.title || "—"],
     ["file", state.sessionFile || "—"],
     ["id", state.sessionId || "—"],
     ["cwd", state.cwd || "—"],
@@ -2149,7 +2160,12 @@ async function loadSessions() {
     // the list actually changed so the sidebar is not rebuilt under the cursor.
     const changed =
       state.workspace === undefined || JSON.stringify(data.sessions) !== JSON.stringify(state.sessions);
+    const prevTitle = currentSessionMeta()?.title || null;
     state.sessions = data.sessions;
+    // the open session's display title comes from this list (a session only
+    // carries an explicit name once renamed), so a first prompt landing or a
+    // rename has to reach the header without waiting for a full refresh
+    if ((currentSessionMeta()?.title || null) !== prevTitle) renderHeader();
     if (state.workspace === undefined) {
       // hash wins over localStorage over server cwd
       const hs = hashState();
@@ -3743,29 +3759,29 @@ applySidebarWidth(Number(localStorage.getItem(SIDEBAR_WIDTH_KEY)) || 280);
 // ---------------------------------------------------------------------------
 // theme
 //
-// Six palettes ordered by depth, not a light/dark switch: the button opens a
+// Six standalone palettes, not a light/dark or depth ramp: the button opens a
 // listbox of swatches and picking one re-points the tokens in style.css. The
 // theme name is also the document attribute, so no per-theme class juggling is
 // needed and an unknown saved value falls back to the default.
 // ---------------------------------------------------------------------------
 const ICON_SUN = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`;
 const ICON_MOON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
-/** the palette ramp, lightest first: this order is the menu order */
-const THEMES = ["paper", "lilac", "orchid", "dusk", "indigo", "midnight"];
-const DEFAULT_THEME = "lilac";
+/** the palette list, lightest mood first: this order is the menu order */
+const THEMES = ["mono", "sky", "grove", "ember", "elegant", "night"];
+const DEFAULT_THEME = "sky";
 const THEME_CHROME = {
-  paper: "#fbf9ff",
-  lilac: "#efe9ff",
-  orchid: "#e3d8ff",
-  dusk: "#2c2354",
-  indigo: "#141033",
-  midnight: "#08061a",
+  mono: "#f6f6f7",
+  sky: "#eef6ff",
+  grove: "#eff7ee",
+  ember: "#fff6ec",
+  elegant: "#f3edff",
+  night: "#0b0a14",
 };
-/** a saved value from an older build ("light"/"dark") or a hand-edited one
- *  still has to resolve, so anything unknown maps onto the closest step */
+/** a saved value from an older build (a retired palette, or "light"/"dark")
+ *  still has to resolve, so anything unknown maps onto the closest match */
 function normalizeTheme(theme) {
   if (THEMES.includes(theme)) return theme;
-  return theme === "dark" ? "midnight" : DEFAULT_THEME;
+  return theme === "dark" ? "night" : DEFAULT_THEME;
 }
 /** parse a static SVG string into a live element (no untrusted input) */
 function svgIcon(markup) {
@@ -3802,7 +3818,7 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = next;
   localStorage.setItem("piweb-theme", next);
   // the icon echoes the polarity, not the palette: sun while dark, moon while light
-  $("#btn-theme").replaceChildren(svgIcon(themeIndex(next) < 3 ? ICON_MOON : ICON_SUN));
+  $("#btn-theme").replaceChildren(svgIcon(next === "night" ? ICON_SUN : ICON_MOON));
   renderThemePicker(next);
   // keep the browser chrome (mobile address bar, PWA shell) on the same page color
   const meta = document.querySelector('meta[name="theme-color"]');

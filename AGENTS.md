@@ -72,8 +72,8 @@ Match the existing files exactly:
 - Two-space indentation, double quotes, semicolons, `const`/`let` (no `var`).
 - Comments explain *why*, not *what*.
 - Plain, descriptive identifiers; no clever one-letter names outside tiny local scopes.
-- CSS uses the design tokens in `public/style.css` (`:root`, `[data-theme="light"]`); new styles
-  must work in both light and dark themes.
+- CSS uses the design tokens in `public/style.css` (`:root`, `[data-theme="<palette>"]`); new
+  styles must work in all six palettes, light and dark.
 
 ## Security invariants
 
