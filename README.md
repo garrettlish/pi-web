@@ -184,7 +184,7 @@ localhost-only by default.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/config` | Server cwd, session directory, pi binary |
-| `GET /api/health` | Liveness and live process count |
+| `GET /api/health` | Liveness, live process count, and tracked client count |
 | `GET /api/events?client=<id>` | SSE stream of pi records for this client's session |
 | `POST /api/open` | `{client, sessionFile?, cwd?}` — attach this client to a session; a fresh spawn is awaited until pi answers RPC |
 | `POST /api/cmd` | `{client, type, …}` — forward a pi RPC command, await its response |
@@ -245,6 +245,8 @@ Either way, put authentication in front of the port before it is reachable by an
 - Session listing walks only the configured session directory.
 - Cross-session search reads only the same session directory, returns snippets and never writes.
   Parsed indexes live in a byte-capped in-memory cache and are keyed by each file's mtime and size.
+- Session summaries for the sidebar are cached per file under the same mtime+size key, so polling
+  re-parses only the sessions that changed instead of re-reading the whole corpus.
 - No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
   `textContent`, and the Markdown subset escapes before formatting.
 - Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
@@ -262,11 +264,13 @@ npm test           # end-to-end smoke test (starts a throwaway server)
 `npm test` boots the server on a random port and verifies what has actually broken before: the page
 and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
 skips the system prompt and thinking blocks, foreign `Host`/`Origin` requests are rejected, path
-traversal cannot escape `public/`, and malformed commands return a clean 4xx. It runs against a
-throwaway session directory, needs no agent credentials, and — when `pi` happens to be installed —
-also checks the agent round-trip, otherwise it skips that check.
+traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also pins the
+static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event streams from
+accumulating. It runs against a throwaway session directory, needs no agent credentials, and — when
+`pi` happens to be installed — also checks the agent round-trip, otherwise it skips that check.
 
-Frontend changes apply on reload (static files are served with `Cache-Control: no-cache`). Server
+Frontend changes apply on reload (static files are served with `Cache-Control: no-cache` plus an
+`ETag`, so an unchanged asset revalidates as a bodyless `304` instead of being re-sent). Server
 changes need a restart. Session files are plain JSONL and readable with any text editor, which is
 often the fastest way to debug an event you did not expect.
 

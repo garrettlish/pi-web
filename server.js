@@ -77,7 +77,7 @@ const PI_BIN = argValue("--pi", process.env.PI_BIN || "pi");
 function isLoopbackHost(hostHeader) {
   if (!hostHeader) return false;
   const host = hostHeader.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
-  return host === "localhost" || host === "::1" || /^127\./.test(host);
+  return host === "localhost" || host === "::1" || host.startsWith("127.");
 }
 
 // Binding to a non-loopback address is itself the opt-in to remote serving, so
@@ -101,18 +101,47 @@ const ALLOW_REMOTE =
 const procs = new Map();
 /** abs session file -> proc key (live processes only) */
 const fileAlias = new Map();
-/** clientId -> { res (SSE response), key (attached proc key) } */
+/** clientId -> { res (SSE response), key (attached proc key), detachedAt } */
 const clients = new Map();
 /** procs with no viewer and no run are stopped after this idle time */
 const IDLE_REAP_MS = 30 * 60 * 1000;
+/** How long a client entry survives without an SSE stream. EventSource
+ *  reconnects on its own with the same id, so an entry cannot be dropped the
+ *  moment its stream closes — that would lose the process attachment and make
+ *  the reconnected tab's commands fail with 503. Past this window the tab is
+ *  gone. Without this sweep every page load left an entry behind forever, and
+ *  every broadcast (one per pi event) walked all of them. */
+const CLIENT_GRACE_MS = 60 * 1000;
+/** Hard bound on tracked clients, so a pathological churn of page loads cannot
+ *  grow the map faster than the grace period drains it. */
+const CLIENTS_MAX = 200;
 
 function clientEntry(id) {
   let c = clients.get(id);
   if (!c) {
-    c = { res: null, key: null };
+    // Enforce the bound at registration: new connections are exactly when the
+    // map grows, and waiting for the 25 s heartbeat would let a burst of page
+    // loads past the cap.
+    if (clients.size >= CLIENTS_MAX) sweepClients(Date.now(), CLIENTS_MAX - 1);
+    c = { res: null, key: null, detachedAt: 0 };
     clients.set(id, c);
   }
   return c;
+}
+
+/** Drop client entries whose stream has been gone past the grace period, then
+ *  enforce a hard bound by evicting the oldest detached entries. `target` is
+ *  the size to get down to — callers about to add an entry pass one less. */
+function sweepClients(now = Date.now(), target = CLIENTS_MAX) {
+  for (const [id, c] of clients) {
+    if (!c.res && c.detachedAt && now - c.detachedAt > CLIENT_GRACE_MS) clients.delete(id);
+  }
+  if (clients.size <= target) return;
+  const detached = [...clients].filter(([, c]) => !c.res).sort((a, b) => a[1].detachedAt - b[1].detachedAt);
+  for (const [id] of detached) {
+    if (clients.size <= target) break;
+    clients.delete(id);
+  }
 }
 
 /** live SSE responses attached to a proc key */
@@ -176,8 +205,9 @@ class PiProc {
       this.buffer += chunk.toString("utf8");
       // Strict JSONL framing: split on LF only (docs warn against readline,
       // which also splits on U+2028/U+2029).
-      let idx;
-      while ((idx = this.buffer.indexOf("\n")) >= 0) {
+      for (;;) {
+        const idx = this.buffer.indexOf("\n");
+        if (idx < 0) break;
         let line = this.buffer.slice(0, idx);
         this.buffer = this.buffer.slice(idx + 1);
         if (line.endsWith("\r")) line = line.slice(0, -1);
@@ -268,7 +298,7 @@ class PiProc {
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
-        this.proc.stdin.write(JSON.stringify(record) + "\n");
+        this.proc.stdin.write(`${JSON.stringify(record)}\n`);
       } catch (err) {
         this.pending.delete(id);
         clearTimeout(timer);
@@ -465,62 +495,87 @@ async function sessionFilesWithStats(limit = 400) {
   return stats.filter(Boolean).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs).slice(0, limit);
 }
 
+/** One-line summary of a session file for its sidebar row.
+ *  Assistant-message cost and `usage` entries are summed together on purpose:
+ *  pi documents a `usage` entry as model-attributed usage that is *not* part of
+ *  an assistant message (e.g. cache warming), so both contribute to the total
+ *  without overlapping. */
+function summarizeSessionText(text, st, f) {
+  let header = null;
+  let name = null;
+  let title = null;
+  let messages = 0;
+  let cost = 0;
+  let lastTs = null;
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue; // a partially written trailing line is normal for a live session
+    }
+    if (e.type === "session") header = e;
+    else if (e.type === "session_info" && e.name) name = e.name;
+    else if (e.type === "message") {
+      messages++;
+      lastTs = e.timestamp;
+      if (title === null && e.message?.role === "user") title = userText(e.message.content);
+      if (e.message?.role === "assistant" && e.message?.usage?.cost) cost += e.message.usage.cost.total || 0;
+    } else if (e.type === "usage" && e.usage?.cost) {
+      cost += e.usage.cost.total || 0;
+    }
+  }
+  if (!header) return null;
+  return {
+    file: f,
+    id: header.id,
+    cwd: header.cwd,
+    timestamp: header.timestamp,
+    lastTimestamp: lastTs,
+    name: name || null,
+    title: (title || "").slice(0, 120),
+    messages,
+    cost: Number(cost.toFixed(4)),
+    mtime: st.mtimeMs,
+  };
+}
+
+/** Per-file summaries, keyed by path and validated by mtime+size. Session files
+ *  are append-mostly, so the sidebar only re-parses the files that changed
+ *  instead of re-reading the whole (often hundreds of megabytes) corpus on
+ *  every poll. */
+const sessionSummaryCache = new Map();
+
+async function sessionSummary(f, st) {
+  const key = `${st.mtimeMs}:${st.size}`;
+  const cached = sessionSummaryCache.get(f);
+  if (cached && cached.key === key) return cached.summary;
+  let summary = null;
+  try {
+    summary = summarizeSessionText(await fsp.readFile(f, "utf8"), st, f);
+  } catch {
+    summary = null;
+  }
+  sessionSummaryCache.set(f, { key, summary });
+  return summary;
+}
+
 async function listSessions(limit = 400) {
   const usable = await sessionFilesWithStats(limit);
+  const sessions = await Promise.all(usable.map(({ f, st }) => sessionSummary(f, st)));
 
-  const sessions = await Promise.all(
-    usable.map(async ({ f, st }) => {
-      try {
-        const text = await fsp.readFile(f, "utf8");
-        let header = null;
-        let name = null;
-        let title = null;
-        let messages = 0;
-        let cost = 0;
-        let lastTs = null;
-        for (const line of text.split("\n")) {
-          if (!line) continue;
-          let e;
-          try {
-            e = JSON.parse(line);
-          } catch {
-            continue;
-          }
-          if (e.type === "session") header = e;
-          else if (e.type === "session_info" && e.name) name = e.name;
-          else if (e.type === "message") {
-            messages++;
-            lastTs = e.timestamp;
-            if (title === null && e.message?.role === "user") title = userText(e.message.content);
-            if (e.message?.role === "assistant" && e.message?.usage?.cost) cost += e.message.usage.cost.total || 0;
-          } else if (e.type === "usage" && e.usage?.cost) {
-            cost += e.usage.cost.total || 0;
-          }
-        }
-        if (!header) return null;
-        return {
-          file: f,
-          id: header.id,
-          cwd: header.cwd,
-          timestamp: header.timestamp,
-          lastTimestamp: lastTs,
-          name: name || null,
-          title: (title || "").slice(0, 120),
-          messages,
-          cost: Number(cost.toFixed(4)),
-          mtime: st.mtimeMs,
-        };
-      } catch {
-        return null;
-      }
-    })
-  );
+  // Sessions get deleted and pruned; drop their summaries so the cache cannot
+  // grow without bound over a long-running server.
+  const live = new Set(usable.map(({ f }) => f));
+  for (const file of sessionSummaryCache.keys()) if (!live.has(file)) sessionSummaryCache.delete(file);
 
   return sessions.filter(Boolean);
 }
 
 // listSessions walks the whole session dir; cache briefly so several tabs
-// polling /api/sessions share one walk.
+// polling /api/sessions share one walk. The walk is cheap now that parsing is
+// cached per file, so the TTL only has to absorb simultaneous polls.
 let sessionsCache = { at: 0, promise: null };
 function listSessionsCached() {
   if (sessionsCache.promise && Date.now() - sessionsCache.at < 2000) return sessionsCache.promise;
@@ -605,7 +660,12 @@ function searchRecordsOf(entry) {
       }
     }
   } else if (m.role === "toolResult") {
-    const text = blocks.map((b) => (b.type === "text" ? b.text || "" : b.type === "image" ? "[image]" : "[block]")).join("\n");
+    const text = blocks
+      .map((b) => {
+        if (b.type === "text") return b.text || "";
+        return b.type === "image" ? "[image]" : "[block]";
+      })
+      .join("\n");
     if (text.trim()) out.push({ role: "toolResult", toolName: m.toolName || "", toolCallId: m.toolCallId || null, text });
     // A subagent result's text is the parent's combined answer; each child's
     // own output lives only in details.results[].finalOutput. Index the child
@@ -885,8 +945,11 @@ const server = http.createServer(async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: "server", event: "hello" })}\n\n`);
       const c = clientEntry(url.searchParams.get("client") || "");
       c.res = res;
+      c.detachedAt = 0;
       req.on("close", () => {
-        if (c.res === res) c.res = null;
+        if (c.res !== res) return;
+        c.res = null;
+        c.detachedAt = Date.now();
       });
       return;
     }
@@ -951,7 +1014,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const { client, ...rest } = body;
-      proc.proc.stdin.write(JSON.stringify({ type: "extension_ui_response", ...rest }) + "\n");
+      proc.proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", ...rest })}\n`);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -975,7 +1038,7 @@ const server = http.createServer(async (req, res) => {
     // Directory listing for the workspace picker (local folders only, no dotfiles)
     if (pathname === "/api/browse" && req.method === "GET") {
       const params = new URL(req.url, "http://localhost").searchParams;
-      let dir = path.resolve(params.get("path") || os.homedir());
+      const dir = path.resolve(params.get("path") || os.homedir());
       const parent = path.dirname(dir) === dir ? null : path.dirname(dir);
       let dirs = [];
       try {
@@ -993,7 +1056,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/health" && req.method === "GET") {
-      sendJson(res, 200, { ok: true, procs: procs.size });
+      sendJson(res, 200, { ok: true, procs: procs.size, clients: clients.size });
       return;
     }
 
@@ -1042,7 +1105,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Static files
-    let rel = pathname === "/" ? "/index.html" : pathname;
+    const rel = pathname === "/" ? "/index.html" : pathname;
     const file = path.normalize(path.join(PUBLIC_DIR, rel));
     // the trailing separator stops a sibling like /public-evil from matching
     if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) {
@@ -1051,11 +1114,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
+      const st = await fsp.stat(file);
+      // Strong-ish validator from metadata, not content: hashing app.js on
+      // every request would cost as much as sending it.
+      const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+      const inm = req.headers["if-none-match"];
+      if (inm && inm.split(",").some((t) => t.trim() === etag)) {
+        res.writeHead(304, { ETag: etag, "Cache-Control": "no-cache" });
+        res.end();
+        return;
+      }
       const data = await fsp.readFile(file);
       res.writeHead(200, {
         "Content-Type": MIME[path.extname(file)] || "application/octet-stream",
-        // dev tool: always revalidate so client code changes apply on reload
+        // dev tool: always revalidate so client code changes apply on reload.
+        // The ETag turns that revalidation into a bodyless 304 when the file
+        // has not changed.
         "Cache-Control": "no-cache",
+        ETag: etag,
       });
       res.end(data);
     } catch {
@@ -1067,7 +1143,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Heartbeat so proxies keep SSE connections open
+// Heartbeat so proxies keep SSE connections open. It also carries the detached
+// client sweep: a dead stream is only noticed on write, and the ping is the
+// one place that happens on a timer.
 setInterval(() => {
   for (const c of clients.values()) {
     if (!c.res) continue;
@@ -1075,8 +1153,10 @@ setInterval(() => {
       c.res.write(`: ping\n\n`);
     } catch {
       c.res = null;
+      c.detachedAt = Date.now();
     }
   }
+  sweepClients();
 }, 25000).unref();
 
 function shutdown() {

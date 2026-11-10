@@ -315,6 +315,38 @@ try {
   }
 
   check("server still alive after the request matrix", (await fetch(`${BASE}/api/health`)).ok);
+
+  // Static assets must revalidate: a conditional request for an unchanged file
+  // has to be a bodyless 304, otherwise every reload re-downloads app.js.
+  const asset = await fetch(`${BASE}/app.js`);
+  const etag = asset.headers.get("etag");
+  await asset.text();
+  check("static assets carry an ETag", !!etag, `etag=${etag}`);
+  const revalidated = await fetch(`${BASE}/app.js`, { headers: { "If-None-Match": etag } });
+  check("unchanged asset revalidates as 304", revalidated.status === 304, `got ${revalidated.status}`);
+  const stale = await fetch(`${BASE}/app.js`, { headers: { "If-None-Match": '"0-0"' } });
+  check("stale ETag still returns the file", stale.status === 200 && (await stale.text()).length > 0, `got ${stale.status}`);
+
+  // A closed event stream must not leak its client entry: every page load used
+  // to leave one behind, and every broadcast walked all of them. Each stream
+  // here reads its first chunk, because a request aborted before the response
+  // headers never registers a client at all. The grace period keeps a
+  // reconnecting EventSource attached, so this asserts the map stays bounded
+  // rather than that it drops to zero immediately.
+  const openThenClose = async (id) => {
+    const ctl = new AbortController();
+    const res = await fetch(`${BASE}/api/events?client=${id}`, { signal: ctl.signal });
+    await res.body.getReader().read();
+    ctl.abort();
+  };
+  for (let i = 0; i < 260; i++) await openThenClose(`churn-${i}`).catch(() => {});
+  await new Promise((r) => setTimeout(r, 200));
+  const healthAfter = await (await fetch(`${BASE}/api/health`)).json();
+  check(
+    "closed event streams do not accumulate past the cap",
+    healthAfter.clients <= 200,
+    `clients=${healthAfter.clients} after 260 closed streams`
+  );
 } finally {
   stopServer();
   fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });
