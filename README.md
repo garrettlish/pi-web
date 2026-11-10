@@ -97,15 +97,19 @@ pi-web --cwd ~/code/my-project
 - Queued steering / follow-up messages appear in a dock directly above the composer, next to the
   running indicator; each can be undone individually or the whole queue cleared. The queue belongs
   to the attached session's agent process — switching sessions shows only that session's queue.
-- `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** sit in
-  that same dock above the input, so they are visible from where you are typing; if `pi` dies, the
-  sidebar status line turns into a restart button.
+- `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** share one
+  row in that same dock above the input — indicator on the left, **Stop** at its far right — so they
+  are visible from where you are typing; if `pi` dies, the sidebar status line turns into a restart
+  button.
 
 **Sessions**
 
 - The sidebar lists every session under the pi session directory with title, message count, cost
   and last activity. **Recent** is a flat, cross-project list; **Workspaces** is a two-level
-  project → session view.
+  project → session view; **Favorites** is a flat list of the sessions you starred. The star beside
+  the session details button in the header adds or removes the open session, and each row in the
+  Favorites tab carries a star that removes it. Stars live in the browser's local storage, so they
+  are per-browser and survive reloads; a starred session that no longer exists is skipped.
 - Opening a session rebuilds the transcript from its active branch, including history from before
   a compaction, so you see the same conversation the terminal would. The switch is optimistic:
   the sidebar highlight and URL hash update immediately, sessions opened before in the same tab
@@ -140,7 +144,9 @@ pi-web --cwd ~/code/my-project
   scrolls the transcript to that message.
 - Attach images to the next message either way: drop files anywhere on the page, or use the
   image button beside the composer hint to pick them from the OS file dialog (both paths accept
-  image files only and land in the same thumbnail row); click a thumbnail to enlarge it.
+  image files only and land in the same thumbnail row); click a thumbnail to enlarge it. Images
+  already in a transcript prompt open the same way — click one to see it in a popup, then click the
+  picture in that popup for the full-window viewer (the same two steps a tool-result image takes).
 - `ArrowUp` / `ArrowDown` in the composer walk back and forward through previously sent
   prompts (terminal-style, kept in the browser's local storage, capped at 200 entries);
   the in-progress draft is restored when you arrow past the newest entry. Arrows keep

@@ -86,6 +86,7 @@ function onActivate(fn) {
 // state
 // ---------------------------------------------------------------------------
 const TAB_KEY = "piweb-sidebar-tab";
+const SIDEBAR_TABS = ["recent", "workspaces", "favorites"];
 const SIDEBAR_COLLAPSED_KEY = "piweb-sidebar-collapsed";
 const PROMPT_HISTORY_KEY = "piweb-prompt-history";
 const PROMPT_HISTORY_MAX = 200;
@@ -113,8 +114,9 @@ const state = {
   cwd: null,
   /** selected workspace cwd; null = workspace list view; undefined = not yet initialized */
   workspace: undefined,
-  /** sidebar view: "recent" = flat list across all workspaces, "workspaces" = two-level */
-  sidebarTab: localStorage.getItem(TAB_KEY) === "workspaces" ? "workspaces" : "recent",
+  /** sidebar view: "recent" = flat list across all workspaces, "workspaces" = two-level,
+   *  "favorites" = flat list of sessions starred by the user */
+  sidebarTab: SIDEBAR_TABS.includes(localStorage.getItem(TAB_KEY)) ? localStorage.getItem(TAB_KEY) : "recent",
 };
 
 // ---------------------------------------------------------------------------
@@ -1242,7 +1244,12 @@ function renderItem(item) {
       body.style.whiteSpace = "pre-wrap";
       body.textContent = item.text;
       box.append(body);
-      for (const img of item.images || []) box.append(el("img", { src: `data:${img.mimeType};base64,${img.data}` }));
+      for (const img of item.images || []) {
+        const src = `data:${img.mimeType};base64,${img.data}`;
+        box.append(
+          el("img", { src, alt: "prompt image", title: "Click to enlarge", onclick: () => openImagePopup(src, "prompt image") })
+        );
+      }
       return box;
     }
     case "assistant": {
@@ -1434,7 +1441,42 @@ function renderHeader() {
 
   renderModelPicker();
   renderThinkingPicker();
+  renderFavoriteButton();
 }
+
+/** Header star: filled + "remove" label when the current session is starred,
+ *  outlined + "add" when it is not. Hidden for an unsaved new session, which
+ *  has no file to star yet. */
+function renderFavoriteButton() {
+  const btn = $("#btn-favorite");
+  const file = state.sessionFile;
+  btn.classList.toggle("hidden", !file);
+  if (!file) {
+    btn.dataset.sig = "";
+    return;
+  }
+  // renderHeader runs on nearly every event; only rebuild when the starred
+  // state of this session actually changed, so an in-progress click is not
+  // swapped out from under the pointer
+  const on = isFavorite(file);
+  const sig = `${file}#${on}`;
+  if (btn.dataset.sig === sig) return;
+  btn.dataset.sig = sig;
+  btn.replaceChildren(...htmlFragment(on ? STAR_ICON : STAR_OUTLINE_ICON));
+  btn.classList.toggle("starred", on);
+  btn.setAttribute("aria-pressed", String(on));
+  const label = on ? "Remove from Favorites" : "Add to Favorites";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+}
+
+$("#btn-favorite").addEventListener("click", () => {
+  if (!state.sessionFile) return;
+  const added = toggleFavorite(state.sessionFile);
+  renderFavoriteButton();
+  renderSidebar();
+  toast(added ? "added to favorites" : "removed from favorites");
+});
 
 /** Header label of a picker button: the current value, or a placeholder when
  *  nothing is selected yet. */
@@ -1748,7 +1790,7 @@ document.addEventListener("click", () => setPromptListOpen(false));
 function renderStatus() {
   const bar = $("#status-bar");
   if (state.isStreaming) {
-    bar.textContent = state.isCompacting ? "compacting…" : "pi is working…";
+    $("#status-text").textContent = state.isCompacting ? "compacting…" : "pi is working…";
     bar.classList.remove("hidden");
   } else bar.classList.add("hidden");
   $("#btn-abort").classList.toggle("hidden", !state.isStreaming);
@@ -1834,6 +1876,11 @@ function truncate(s, n) {
 
 const WS_KEY = "piweb-workspace";
 const WS_PINNED_KEY = "piweb-pinned-workspaces";
+/** session files (absolute paths) the user starred; rendered by the Favorites tab */
+const FAV_KEY = "piweb-favorites";
+/** star glyphs: filled = starred, outlined = not starred */
+const STAR_ICON = `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.85-4.2 4.1 1 5.8-5.2-2.75-5.2 2.75 1-5.8-4.2-4.1 5.8-.85z"/></svg>`;
+const STAR_OUTLINE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.85-4.2 4.1 1 5.8-5.2-2.75-5.2 2.75 1-5.8-4.2-4.1 5.8-.85z"/></svg>`;
 
 /** two-level display name, e.g. /home/me/work/pi-web -> "work/pi-web" */
 function wsLabel(p) {
@@ -1885,6 +1932,30 @@ function pinWorkspace(cwd) {
   }
 }
 
+/** session files the user starred, newest star first */
+function favoriteFiles() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(FAV_KEY) || "[]");
+    return Array.isArray(arr) ? arr.filter((p) => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function isFavorite(file) {
+  return !!file && favoriteFiles().includes(file);
+}
+
+/** star / unstar a session file; returns true when it was added */
+function toggleFavorite(file) {
+  const favs = favoriteFiles();
+  const at = favs.indexOf(file);
+  if (at === -1) favs.unshift(file); // newest star first; the order is stable, so rows do not jump around
+  else favs.splice(at, 1);
+  localStorage.setItem(FAV_KEY, JSON.stringify(favs));
+  return at === -1;
+}
+
 /** group sessions by cwd -> [{ cwd, name, sessions, last, cost }] sorted by recency; merges pinned dirs */
 function workspaces() {
   const map = new Map();
@@ -1915,60 +1986,105 @@ function sessionLastMs(s) {
   return isNaN(t) ? s.mtime || 0 : t;
 }
 
+/** true when the sidebar filter matches a session's title/name (and, for flat
+ *  cross-workspace lists, its workspace path) */
+function sessionMatches(s, filter, { includeCwd = true } = {}) {
+  return (
+    !filter ||
+    (s.name || "").toLowerCase().includes(filter) ||
+    (s.title || "").toLowerCase().includes(filter) ||
+    (includeCwd && (s.cwd || "").toLowerCase().includes(filter))
+  );
+}
+
+/** One sidebar row for a session. `showWorkspace` adds the workspace chip (flat
+ *  lists); `unstar` adds the remove-from-favorites control (Favorites tab). */
+function sessionRow(s, { showWorkspace = false, unstar = false } = {}) {
+  const active = s.file === state.sessionFile;
+  return el(
+    "div",
+    {
+      class: `session-item ${active ? "active" : ""}`,
+      tabindex: "0",
+      title: `${s.cwd || ""}\n${s.name || s.title || ""}`,
+      onclick: () => switchSession(s.file, s.cwd),
+      onkeydown: onActivate(() => switchSession(s.file, s.cwd)),
+    },
+    el(
+      "div",
+      { class: "s-title" },
+      s.active ? el("span", { class: `s-dot${s.streaming ? " streaming" : ""}`, title: s.streaming ? "running in background" : "open in background" }) : null,
+      s.name || s.title || "(untitled)"
+    ),
+    el(
+      "div",
+      { class: "s-meta" },
+      showWorkspace ? el("span", { class: "s-ws", text: wsLabel(s.cwd) || "(unknown)" }) : null,
+      el("span", { text: fmtDate(showWorkspace ? sessionLastMs(s) : s.lastTimestamp ? Date.parse(s.lastTimestamp) : s.mtime) }),
+      el("span", { text: `${s.messages} msg` }),
+      s.cost ? el("span", { text: fmtCost(s.cost) }) : null,
+      unstar
+        ? el("button", {
+            class: "s-unstar",
+            title: "Remove from Favorites",
+            "aria-label": "Remove from Favorites",
+            html: STAR_ICON,
+            onclick: (e) => {
+              // the row itself opens the session; the star must not
+              e.stopPropagation();
+              toggleFavorite(s.file);
+              renderSidebar();
+              renderHeader();
+              toast("removed from favorites");
+            },
+            onkeydown: (e) => e.stopPropagation(),
+          })
+        : null
+    )
+  );
+}
+
 function renderSidebar() {
   const list = $("#session-list");
   list.innerHTML = "";
   const filter = $("#session-filter").value.trim().toLowerCase();
   const crumb = $("#sidebar-crumb");
 
-  // view tabs: "recent" (flat, all workspaces) vs "workspaces" (two-level)
-  const recent = state.sidebarTab === "recent";
-  $("#tab-workspaces").classList.toggle("active", !recent);
-  $("#tab-recent").classList.toggle("active", recent);
-  $("#tab-workspaces").setAttribute("aria-selected", String(!recent));
-  $("#tab-recent").setAttribute("aria-selected", String(recent));
+  // view tabs: "recent" (flat, all workspaces), "workspaces" (two-level),
+  // "favorites" (flat, starred only)
+  const tab = state.sidebarTab;
+  for (const name of SIDEBAR_TABS) {
+    const btn = $(`#tab-${name}`);
+    btn.classList.toggle("active", tab === name);
+    btn.setAttribute("aria-selected", String(tab === name));
+  }
 
-  if (recent) {
+  if (tab === "favorites") {
+    // flat list of starred sessions, in star order (newest star first); a
+    // starred file whose session disappeared from disk is simply not rendered
+    crumb.classList.add("hidden");
+    const favs = favoriteFiles();
+    const byFile = new Map(state.sessions.map((s) => [s.file, s]));
+    const starred = favs.map((f) => byFile.get(f)).filter((s) => s && sessionMatches(s, filter));
+    for (const s of starred) list.append(sessionRow(s, { showWorkspace: true, unstar: true }));
+    if (!starred.length) {
+      list.append(
+        el("div", {
+          class: "list-empty",
+          text: favs.length ? "No favorites match" : "No favorites yet — star a session from the header",
+        })
+      );
+    }
+    return;
+  }
+
+  if (tab === "recent") {
     // flat list: every session, most recent first, workspace shown as a chip
     crumb.classList.add("hidden");
     const all = state.sessions
-      .filter(
-        (s) =>
-          !filter ||
-          (s.name || "").toLowerCase().includes(filter) ||
-          (s.title || "").toLowerCase().includes(filter) ||
-          (s.cwd || "").toLowerCase().includes(filter)
-      )
+      .filter((s) => sessionMatches(s, filter))
       .sort((a, b) => sessionLastMs(b) - sessionLastMs(a));
-    for (const s of all) {
-      const active = s.file === state.sessionFile;
-      list.append(
-        el(
-          "div",
-          {
-            class: `session-item ${active ? "active" : ""}`,
-            tabindex: "0",
-            title: `${s.cwd || ""}\n${s.name || s.title || ""}`,
-            onclick: () => switchSession(s.file, s.cwd),
-            onkeydown: onActivate(() => switchSession(s.file, s.cwd)),
-          },
-          el(
-            "div",
-            { class: "s-title" },
-            s.active ? el("span", { class: `s-dot${s.streaming ? " streaming" : ""}`, title: s.streaming ? "running in background" : "open in background" }) : null,
-            s.name || s.title || "(untitled)"
-          ),
-          el(
-            "div",
-            { class: "s-meta" },
-            el("span", { class: "s-ws", text: wsLabel(s.cwd) || "(unknown)" }),
-            el("span", { text: fmtDate(sessionLastMs(s)) }),
-            el("span", { text: `${s.messages} msg` }),
-            s.cost ? el("span", { text: fmtCost(s.cost) }) : null
-          )
-        )
-      );
-    }
+    for (const s of all) list.append(sessionRow(s, { showWorkspace: true }));
     if (!all.length) list.append(el("div", { class: "list-empty", text: "No sessions yet" }));
     return;
   }
@@ -2013,35 +2129,8 @@ function renderSidebar() {
   $("#crumb-name").title = state.workspace;
   const inWs = state.sessions
     .filter((s) => (s.cwd || "(unknown)") === state.workspace)
-    .filter((s) => !filter || (s.name || "").toLowerCase().includes(filter) || (s.title || "").toLowerCase().includes(filter));
-  for (const s of inWs) {
-    const active = s.file === state.sessionFile;
-    list.append(
-      el(
-        "div",
-        {
-          class: `session-item ${active ? "active" : ""}`,
-          tabindex: "0",
-          title: s.name || s.title || "",
-          onclick: () => switchSession(s.file, s.cwd),
-          onkeydown: onActivate(() => switchSession(s.file, s.cwd)),
-        },
-        el(
-          "div",
-          { class: "s-title" },
-          s.active ? el("span", { class: `s-dot${s.streaming ? " streaming" : ""}`, title: s.streaming ? "running in background" : "open in background" }) : null,
-          s.name || s.title || "(untitled)"
-        ),
-        el(
-          "div",
-          { class: "s-meta" },
-          el("span", { text: fmtDate(s.lastTimestamp ? Date.parse(s.lastTimestamp) : s.mtime) }),
-          el("span", { text: `${s.messages} msg` }),
-          s.cost ? el("span", { text: fmtCost(s.cost) }) : null
-        )
-      )
-    );
-  }
+    .filter((s) => sessionMatches(s, filter, { includeCwd: false }));
+  for (const s of inWs) list.append(sessionRow(s));
   if (!inWs.length) list.append(el("div", { class: "list-empty", text: "No sessions here yet — use the new-session button" }));
 }
 
@@ -2587,6 +2676,7 @@ async function switchSession(file, cwd) {
   state.items = cached ? cached.items : [{ kind: "notice", text: "loading session…" }];
   state.leafId = cached ? cached.leafId : null;
   renderTranscript({ follow: false });
+  renderFavoriteButton(); // the star reflects this session, not the previous one
   renderSidebar();
   syncHash();
 
@@ -2619,6 +2709,7 @@ async function switchSession(file, cwd) {
     state.items = prevView.items;
     state.leafId = prevView.leafId;
     renderTranscript({ follow: false });
+    renderFavoriteButton();
     renderSidebar();
     syncHash();
     toast(`switch failed: ${err.message}`, "error");
@@ -3106,6 +3197,22 @@ function openPopup(title, { paint = null, payload = null } = {}) {
   $("#modal-close").focus({ preventScroll: true });
 }
 
+/** Enlarge an image from the transcript in the modal. Same presentation as a
+ *  composer attachment (`attachment-zoom`): the inline thumbnail stays in the
+ *  flow, the popup shows the picture at up to 70vh so details are readable.
+ *  Clicking it there goes one step further, to the full-window viewer — the
+ *  same two-step path a tool-result image takes. */
+function openImagePopup(src, title = "image") {
+  openPopup(title, {
+    paint: () =>
+      el(
+        "div",
+        { class: "attachment-zoom" },
+        el("img", { src, alt: title, title: "Click for full screen", onclick: () => openImageViewer(src, title) })
+      ),
+  });
+}
+
 function closeModal() {
   $("#modal-overlay").classList.add("hidden");
   livePaint = null;
@@ -3419,7 +3526,7 @@ function renderAttachments() {
   attachmentsEl.classList.toggle("hidden", !attachments.length);
   attachments.forEach((a, i) => {
     // clicking a thumbnail opens the full image in the popup for detail review
-    const zoom = () => openPopup("attachment", { paint: () => el("div", { class: "attachment-zoom" }, el("img", { src: a.url, alt: "attachment" })) });
+    const zoom = () => openImagePopup(a.url, "attachment");
     attachmentsEl.append(
       el(
         "div",
@@ -3510,6 +3617,7 @@ function selectTab(tab) {
 }
 $("#tab-workspaces").addEventListener("click", () => selectTab("workspaces"));
 $("#tab-recent").addEventListener("click", () => selectTab("recent"));
+$("#tab-favorites").addEventListener("click", () => selectTab("favorites"));
 
 // ---------------------------------------------------------------------------
 // workspace directory picker (local folder chooser dialog)

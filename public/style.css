@@ -329,7 +329,14 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
   background: var(--warning-soft); border-radius: var(--radius-sm);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-#status-bar { color: var(--primary); background: var(--primary-soft); }
+#status-bar {
+  color: var(--primary); background: var(--primary-soft);
+  display: flex; align-items: center; gap: 8px; padding: 3px 10px;
+}
+#status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Stop rides at the far right of the running line, so the action sits on the
+   same row as the indicator instead of competing with Send */
+#btn-abort { flex: none; padding: 1px 10px; font-size: 11px; line-height: 1.6; background: transparent; }
 /* queued steering / follow-up chips, each with a per-item undo (x) */
 #queue-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; overflow: visible; padding: 4px 10px; }
 .q-item {
@@ -363,7 +370,9 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
   background: var(--primary-soft-bg); border: 1px solid var(--primary-soft-border);
   border-radius: var(--radius); padding: 8px 12px; white-space: pre-wrap; word-break: break-word;
 }
-.item-user img { max-width: 320px; max-height: 240px; border-radius: var(--radius-sm); display: block; margin-top: 6px; }
+/* prompt images stay thumbnails in the bubble; clicking one enlarges it in the
+   modal (cursor + title, same affordance as composer attachment previews) */
+.item-user img { max-width: 320px; max-height: 240px; border-radius: var(--radius-sm); display: block; margin-top: 6px; cursor: zoom-in; }
 .item-user .who, .item-assistant .who {
   font-size: 12px; color: var(--text-secondary); margin-bottom: 3px; letter-spacing: 0.4px; font-family: var(--font-ui);
 }
@@ -701,7 +710,8 @@ body.dropping #composer { background: var(--primary-soft); }
 }
 .attachment img { width: 84px; height: 84px; object-fit: cover; display: block; cursor: zoom-in; }
 .attachment-zoom { display: flex; justify-content: center; }
-.attachment-zoom img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: var(--radius-sm); }
+/* the popup image is itself a step: click it for the full-window viewer */
+.attachment-zoom img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: var(--radius-sm); cursor: zoom-in; }
 .attachment-remove {
   position: absolute; top: 2px; right: 2px;
   width: 18px; height: 18px; padding: 0;
@@ -717,7 +727,6 @@ body.dropping #composer { background: var(--primary-soft); }
 #btn-attach:hover { color: var(--primary); border-color: var(--primary); }
 #btn-attach svg { width: 16px; height: 16px; display: block; }
 .hint { font-size: 12px; font-family: var(--font-ui); }
-#btn-abort { padding: 4px 12px; font-size: 13px; }
 #btn-send { background: var(--primary); color: var(--primary-contrast); border-color: var(--primary); font-weight: 700; }
 #btn-send:hover { background: var(--primary-hover); border-color: var(--primary-hover); color: var(--primary-contrast); }
 #btn-send:disabled { opacity: 0.4; cursor: default; }
@@ -823,10 +832,12 @@ body.dropping #composer { background: var(--primary-soft); }
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+/* three tabs share a narrow sidebar, so the labels are set smaller and the
+   tracking is tightened rather than letting the strip wrap or overflow */
 #sidebar .sidebar-tabs button {
   flex: 1; padding: 4px 0;
   background: transparent; border-color: transparent;
-  color: var(--text-secondary); font-size: 12px;
+  color: var(--text-secondary); font-size: 11px;
 }
 #sidebar .sidebar-tabs button:hover {
   background: transparent; border-color: transparent; color: var(--primary);
@@ -835,6 +846,19 @@ body.dropping #composer { background: var(--primary-soft); }
   background: var(--surface-elev); border-color: var(--border);
   color: var(--primary); font-weight: 600;
 }
+/* star glyphs: header toggle + per-row unstar control. Both need an ID so they
+   beat the `#sidebar button` / `#topbar .icon-btn` button chrome. */
+#btn-favorite.starred { color: var(--warning); }
+#btn-favorite.starred:hover { color: var(--warning); border-color: var(--warning); }
+#sidebar .session-item .s-unstar {
+  margin-left: auto; flex: none; padding: 0; width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; color: var(--warning);
+}
+#sidebar .session-item .s-unstar:hover {
+  background: transparent; border-color: var(--warning); color: var(--warning);
+}
+.s-unstar svg, #btn-favorite svg { width: 15px; height: 15px; display: block; }
 /* workspace chip on Recent-tab session rows */
 .session-item .s-ws {
   flex: none; max-width: 120px;
