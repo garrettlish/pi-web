@@ -42,5 +42,5 @@ Please do not open a public issue. See [SECURITY.md](SECURITY.md).
 | Transcript item model (entries → renderable items) | `public/app.js` (`buildItemsFromEntries`) |
 | Live event handling | `public/app.js` (`handleEvent`) |
 | Transcript reconciliation (no full re-render) | `public/app.js` (`renderTranscript`) |
-| Design tokens and themes | `public/style.css` (`:root`, `[data-theme="light"]`) |
+| Design tokens and themes | `public/style.css` (`:root`, `[data-theme="<palette>"]`) |
 | HTTP-level regression checks | `test/smoke.js` |

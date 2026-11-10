@@ -6,12 +6,19 @@
   <title>pi-web</title>
   <meta name="description" content="A local web UI for the pi coding agent: streamed transcripts, session history, and a full inspector for every LLM and tool call.">
   <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#f5f7fa">
+  <meta name="theme-color" content="#efe9ff">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script>
-    // apply saved theme before first paint to avoid a flash; light is the default
-    document.documentElement.dataset.theme = localStorage.getItem("piweb-theme") || "light";
+    // apply the saved palette before first paint to avoid a flash. Unknown
+    // values (including the older "light"/"dark") resolve to a current step.
+    (function () {
+      var known = ["paper", "lilac", "orchid", "dusk", "indigo", "midnight"];
+      var saved = localStorage.getItem("piweb-theme");
+      document.documentElement.dataset.theme = known.indexOf(saved) >= 0
+        ? saved
+        : saved === "dark" ? "midnight" : "lilac";
+    })();
   </script>
 </head>
 <body>
@@ -22,8 +29,9 @@
           <svg class="logo-mark" width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
             <defs>
               <linearGradient id="logo-grad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#1677ff"/>
-                <stop offset="1" stop-color="#8b5cf6"/>
+                <stop offset="0" stop-color="#7c4dff"/>
+                <stop offset="0.55" stop-color="#b13ef0"/>
+                <stop offset="1" stop-color="#f0429b"/>
               </linearGradient>
             </defs>
             <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#logo-grad)"/>
@@ -101,7 +109,11 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
           </button>
           <div id="prompt-list-pop" class="hidden" role="dialog" aria-label="User prompts"></div>
-          <button id="btn-theme" class="ghost icon-btn" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
+          <div class="picker">
+            <button id="btn-theme" class="ghost icon-btn" title="Theme" aria-label="Theme"
+                    aria-haspopup="listbox" aria-expanded="false"></button>
+            <div id="theme-menu" class="picker-menu hidden" role="listbox" aria-label="Theme"></div>
+          </div>
         </div>
       </header>
 

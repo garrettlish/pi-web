@@ -159,8 +159,9 @@ pi-web --cwd ~/code/my-project
   the image itself (click to enlarge into a full-window viewer layered over the popup, so the
   request/response stays readable underneath), not just as `{"content": "", "fileSize": …}` —
   whether pi returned the bytes inline or only reported the file size and path.
-- Light and dark themes — light by default, with the choice remembered across reloads — a
-  resizable sidebar, keyboard focus styling.
+- Six palettes on one depth ramp — paper, lilac, orchid, dusk, indigo, midnight — picked from a
+  swatch dropdown in the header, with the choice remembered across reloads; a resizable sidebar
+  and keyboard focus styling.
 
 ## Architecture
 
@@ -171,7 +172,7 @@ pi-web --cwd ~/code/my-project
 | `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, static files |
 | `public/index.html` | Application shell |
 | `public/app.js` | State, transcript reconciliation, event handling — no framework |
-| `public/style.css` | Design tokens, light/dark themes, layout |
+| `public/style.css` | Design tokens, the six palettes, layout |
 
 The server keeps one `pi` subprocess per open session, keyed by session file. A browser tab
 registers a client id; `/api/open` attaches the tab to a process (spawning one if needed) and all

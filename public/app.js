@@ -1609,6 +1609,7 @@ function positionPickerMenu(menu) {
 function closePickers() {
   setPickerOpen($("#model-menu"), false);
   setPickerOpen($("#thinking-menu"), false);
+  setPickerOpen($("#theme-menu"), false);
 }
 
 /** Bind a header picker button to its menu. Opening one closes the other, and
@@ -1997,10 +1998,17 @@ function sessionMatches(s, filter, { includeCwd = true } = {}) {
   );
 }
 
-/** One sidebar row for a session. `showWorkspace` adds the workspace chip (flat
- *  lists); `unstar` adds the remove-from-favorites control (Favorites tab). */
+/** One sidebar row for a session. `showWorkspace` picks the timestamp that
+ *  reads best in a flat list (last activity) versus a workspace-scoped one
+ *  (the session's own last timestamp); `unstar` adds the remove-from-favorites
+ *  control (Favorites tab).
+ *
+ *  Three lines: title, then the repository on a line of its own, then the
+ *  metadata. The repository used to share its line with the date and message
+ *  count, which cut long `owner/name` pairs to an unusable stub. */
 function sessionRow(s, { showWorkspace = false, unstar = false } = {}) {
   const active = s.file === state.sessionFile;
+  const repo = wsLabel(s.cwd) || "(unknown)";
   return el(
     "div",
     {
@@ -2016,10 +2024,10 @@ function sessionRow(s, { showWorkspace = false, unstar = false } = {}) {
       s.active ? el("span", { class: `s-dot${s.streaming ? " streaming" : ""}`, title: s.streaming ? "running in background" : "open in background" }) : null,
       s.name || s.title || "(untitled)"
     ),
+    el("div", { class: "s-repo", title: s.cwd || repo, text: repo }),
     el(
       "div",
       { class: "s-meta" },
-      showWorkspace ? el("span", { class: "s-ws", text: wsLabel(s.cwd) || "(unknown)" }) : null,
       el("span", { text: fmtDate(showWorkspace ? sessionLastMs(s) : s.lastTimestamp ? Date.parse(s.lastTimestamp) : s.mtime) }),
       el("span", { text: `${s.messages} msg` }),
       s.cost ? el("span", { text: fmtCost(s.cost) }) : null,
@@ -3733,29 +3741,91 @@ $("#resizer").addEventListener("dblclick", () => {
 applySidebarWidth(Number(localStorage.getItem(SIDEBAR_WIDTH_KEY)) || 280);
 
 // ---------------------------------------------------------------------------
-// theme (light / dark)
+// theme
+//
+// Six palettes ordered by depth, not a light/dark switch: the button opens a
+// listbox of swatches and picking one re-points the tokens in style.css. The
+// theme name is also the document attribute, so no per-theme class juggling is
+// needed and an unknown saved value falls back to the default.
 // ---------------------------------------------------------------------------
 const ICON_SUN = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`;
 const ICON_MOON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+/** the palette ramp, lightest first: this order is the menu order */
+const THEMES = ["paper", "lilac", "orchid", "dusk", "indigo", "midnight"];
+const DEFAULT_THEME = "lilac";
+const THEME_CHROME = {
+  paper: "#fbf9ff",
+  lilac: "#efe9ff",
+  orchid: "#e3d8ff",
+  dusk: "#2c2354",
+  indigo: "#141033",
+  midnight: "#08061a",
+};
+/** a saved value from an older build ("light"/"dark") or a hand-edited one
+ *  still has to resolve, so anything unknown maps onto the closest step */
+function normalizeTheme(theme) {
+  if (THEMES.includes(theme)) return theme;
+  return theme === "dark" ? "midnight" : DEFAULT_THEME;
+}
 /** parse a static SVG string into a live element (no untrusted input) */
 function svgIcon(markup) {
   return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
 }
+function renderThemePicker(current) {
+  const menu = $("#theme-menu");
+  menu.innerHTML = "";
+  for (const name of THEMES) {
+    const isCurrent = name === current;
+    menu.append(
+      el(
+        "button",
+        {
+          class: `picker-item theme-item${isCurrent ? " selected" : ""}`,
+          role: "option",
+          "aria-selected": String(isCurrent),
+          "data-theme-name": name,
+          onclick: () => applyTheme(name),
+        },
+        el("span", { class: `theme-swatch swatch-${name}`, "aria-hidden": "true" }),
+        el("span", { class: "theme-name", text: name }),
+        el("span", { class: "theme-dot", text: isCurrent ? "✓" : "" })
+      )
+    );
+  }
+}
+/** index of a palette name in THEMES, or -1 when it is not one */
+function themeIndex(name) {
+  return THEMES.indexOf(name);
+}
 function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme;
-  localStorage.setItem("piweb-theme", theme);
-  $("#btn-theme").replaceChildren(svgIcon(theme === "light" ? ICON_MOON : ICON_SUN));
+  const next = normalizeTheme(theme);
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("piweb-theme", next);
+  // the icon echoes the polarity, not the palette: sun while dark, moon while light
+  $("#btn-theme").replaceChildren(svgIcon(themeIndex(next) < 3 ? ICON_MOON : ICON_SUN));
+  renderThemePicker(next);
   // keep the browser chrome (mobile address bar, PWA shell) on the same page color
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute("content", theme === "light" ? "#f5f7fa" : "#0d1117");
+  if (meta) meta.setAttribute("content", THEME_CHROME[next]);
 }
-$("#btn-theme").addEventListener("click", () => {
-  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+wirePicker("#btn-theme", "#theme-menu");
+document.addEventListener("keydown", (e) => {
+  // the theme list is a radio group: arrows move the selection while it is open
+  if ($("#theme-menu").classList.contains("hidden")) return;
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  const step = e.key === "ArrowDown" ? 1 : -1;
+  const at = themeIndex(document.documentElement.dataset.theme);
+  applyTheme(THEMES[Math.min(THEMES.length - 1, Math.max(0, at + step))]);
 });
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (!$("#model-menu").classList.contains("hidden") || !$("#thinking-menu").classList.contains("hidden")) {
+    if (
+      !$("#model-menu").classList.contains("hidden") ||
+      !$("#thinking-menu").classList.contains("hidden") ||
+      !$("#theme-menu").classList.contains("hidden")
+    ) {
       closePickers();
     } else if (!$("#session-info-pop").classList.contains("hidden")) {
       setSessionInfoOpen(false);
@@ -3802,7 +3872,7 @@ function connectEvents() {
 // boot
 // ---------------------------------------------------------------------------
 (async function boot() {
-  applyTheme(localStorage.getItem("piweb-theme") || "light");
+  applyTheme(localStorage.getItem("piweb-theme") || DEFAULT_THEME);
   const cfg = await api("/api/config").catch(() => null);
   state.cwd = cfg?.cwd;
   connectEvents();
