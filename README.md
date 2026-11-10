@@ -81,6 +81,18 @@ pi-web --cwd ~/code/my-project
   red deletions — followed by the raw request and response. The popup has a **Raw JSON** toggle and
   copies the full payload — the transcript itself never grows or scrolls, so the surrounding
   messages stay put.
+- **Subagent runs are shown as their own transcript card**, not as an opaque tool row. When the
+  `subagent` tool fans work out to child agents, the card head summarizes the run (agents involved,
+  running/failed/done counts, wall time, tokens) and one row per child carries its live state and
+  current activity — the tool it is running, its most recent tools and output, and its error when
+  it fails. Clicking the card (or any child row) opens a run inspector: a summary strip with mode,
+  child count, run id, duration, tokens and cost, then one panel per child with its task, live
+  `now` activity, recent tools, recent output, final Markdown output, error, model/thinking level
+  and an **open transcript** button that switches this tab to that child's own session. A run with
+  some failed children is marked as a partial success rather than a failed tool call, and a
+  background launch explains that its children are reported when the run completes. Both live
+  progress (`tool_execution_update` snapshots) and the persisted result render from one normalized
+  view model, so an open inspector keeps updating while the run is still going.
 - Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
 - Queued steering / follow-up messages appear in a dock directly above the composer, next to the
   running indicator; each can be undone individually or the whole queue cleared. The queue belongs
@@ -109,7 +121,9 @@ pi-web --cwd ~/code/my-project
 - The sidebar filter matches a session's title only. The search button beside the workspace button
   (or `Cmd/Ctrl`+`K`) opens a dialog that searches **every prompt, response, tool request and tool
   result in every workspace**: all typed terms must match (case-insensitive), newest occurrences
-  first, and each hit shows its role, workspace, session and a snippet around the match. Clicking
+  first, and each hit shows its role, workspace, session and a snippet around the match. A
+  subagent's child output is indexed too and labelled by agent (`subagent/reviewer`), so a
+  reviewer's own wording is findable even when the parent's summary paraphrases it. Clicking
   a hit switches to that session and jumps to the occurrence — scrolling to the message, or
   opening the tool call's request/response popup. The system prompt and thinking blocks are left
   out of the index: identical in every session, they would bury every query under false hits.
@@ -124,8 +138,9 @@ pi-web --cwd ~/code/my-project
   popover for the full path, session id, cwd and token breakdown.
 - The list button in the header outlines every user prompt in the session; clicking an entry
   scrolls the transcript to that message.
-- Drop image files anywhere on the page to attach them to the next message; click a thumbnail to
-  enlarge it.
+- Attach images to the next message either way: drop files anywhere on the page, or use the
+  image button beside the composer hint to pick them from the OS file dialog (both paths accept
+  image files only and land in the same thumbnail row); click a thumbnail to enlarge it.
 - `ArrowUp` / `ArrowDown` in the composer walk back and forward through previously sent
   prompts (terminal-style, kept in the browser's local storage, capped at 200 entries);
   the in-progress draft is restored when you arrow past the newest entry. Arrows keep
@@ -138,16 +153,12 @@ pi-web --cwd ~/code/my-project
   the image itself (click to enlarge into a full-window viewer layered over the popup, so the
   request/response stays readable underneath), not just as `{"content": "", "fileSize": …}` —
   whether pi returned the bytes inline or only reported the file size and path.
-- Light and dark themes, a resizable sidebar, keyboard focus styling.
+- Light and dark themes — light by default, with the choice remembered across reloads — a
+  resizable sidebar, keyboard focus styling.
 
 ## Architecture
 
-```text
-browser tab A ──SSE /api/events?client=A──►  server.js  ──JSONL over stdio──►  pi --mode rpc (session 1)
-              ──POST /api/cmd {client:A}──►      │
-browser tab B ──SSE /api/events?client=B──►  process pool ──JSONL over stdio──►  pi --mode rpc (session 2)
-              ──POST /api/cmd {client:B}──►      │
-```
+![pi-web architecture: browser tabs talk to one Node process over POST /api/* and the SSE event stream; that process keeps one pi --mode rpc subprocess per session, exchanging JSONL over stdio, and lists and searches the session directory those subprocesses write](docs/pi-web-architecture.png)
 
 | File | Role |
 | --- | --- |

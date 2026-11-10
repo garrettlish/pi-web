@@ -607,6 +607,24 @@ function searchRecordsOf(entry) {
   } else if (m.role === "toolResult") {
     const text = blocks.map((b) => (b.type === "text" ? b.text || "" : b.type === "image" ? "[image]" : "[block]")).join("\n");
     if (text.trim()) out.push({ role: "toolResult", toolName: m.toolName || "", toolCallId: m.toolCallId || null, text });
+    // A subagent result's text is the parent's combined answer; each child's
+    // own output lives only in details.results[].finalOutput. Index the child
+    // output when the combined text does not already contain it, so a
+    // reviewer's own wording is searchable without duplicating a hit.
+    if (Array.isArray(m.details?.results)) {
+      const flat = (s) => s.replace(/\s+/g, " ").trim();
+      const combined = flat(text);
+      for (const child of m.details.results) {
+        const output = typeof child?.finalOutput === "string" ? child.finalOutput.trim() : "";
+        if (!output || combined.includes(flat(output))) continue;
+        out.push({
+          role: "toolResult",
+          toolName: `${m.toolName || "tool"}/${child.agent || "child"}`,
+          toolCallId: m.toolCallId || null,
+          text: output,
+        });
+      }
+    }
   } else if (m.role === "bashExecution") {
     out.push({ role: "bash", text: `$ ${m.command || ""}\n${m.output || ""}` });
   }

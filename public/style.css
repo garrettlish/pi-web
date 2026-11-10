@@ -302,6 +302,14 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
 .icon-btn:disabled { opacity: 0.4; cursor: default; }
 .icon-btn:disabled:hover { color: var(--text); border-color: var(--border); background: var(--surface-elev); }
 .sidebar-actions { display: inline-flex; align-items: center; gap: 8px; }
+/* the new-session action keeps its emphasis as an icon: a soft brand tint sets
+   it apart from the neutral search / workspace / collapse controls beside it */
+#sidebar #btn-new-session {
+  color: var(--primary); background: var(--primary-soft); border-color: var(--primary-soft-border);
+}
+#sidebar #btn-new-session:hover {
+  color: var(--primary-contrast); background: var(--primary); border-color: var(--primary);
+}
 .sidebar-actions #btn-sidebar-collapse {
   /* visually grouped with the workspace/new-session controls but reads as
      "leave the sidebar", so it sits at the far end of the row */
@@ -498,7 +506,119 @@ button.ghost:hover { color: var(--text); border-color: var(--border); background
   border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: zoom-in;
 }
 
-/* colored unified-diff view inside tool responses */
+/* ---------------- subagent run card ---------------- */
+/* A subagent fan-out shows its children inline: the head line summarises the
+   run, one row per child carries live activity. The popup holds the full
+   per-child detail, so the transcript stays one glanceable block. */
+.toolcall.subagent .tc-open-icon { color: var(--primary); }
+.toolcall.subagent.partial { box-shadow: inset 3px 0 0 var(--warning); }
+.sa-count {
+  flex: none; font-family: var(--font-ui); font-size: 11px; padding: 1px 8px;
+  border-radius: 10px; color: var(--text-secondary); background: var(--surface-elev);
+  border: 1px solid var(--border);
+}
+.sa-count.running { color: var(--warning); background: var(--warning-soft); border-color: var(--warning-soft); }
+.sa-count.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-soft); }
+.sa-rows { border-top: 1px solid var(--border); padding: 4px 0; }
+.sa-child {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 12px 3px 14px; cursor: pointer;
+  font-size: 12px; font-family: var(--font-ui);
+}
+.sa-child:hover { background: var(--surface-elev); }
+.sa-more {
+  padding: 3px 12px 3px 29px; cursor: pointer;
+  font-size: 12px; font-family: var(--font-ui); color: var(--primary);
+}
+.sa-more:hover { text-decoration: underline; }
+.sa-dot {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-secondary); align-self: center;
+}
+.sa-dot.running { background: var(--warning); animation: s-dot-pulse 1.2s ease-in-out infinite; }
+.sa-dot.ok { background: var(--success); }
+.sa-dot.error { background: var(--danger); }
+.sa-agent { flex: none; color: var(--text); font-weight: 700; max-width: 20%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sa-what {
+  flex: 1 1 auto; min-width: 0; color: var(--text-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sa-child.running .sa-what { color: var(--text); }
+.sa-child.error .sa-what { color: var(--danger); }
+.sa-meta { flex: none; color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* popup: run summary strip + one panel per child */
+.sa-body { display: flex; flex-direction: column; gap: 12px; }
+.sa-strip { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sa-chip {
+  font-family: var(--font-ui); font-size: 11px; padding: 1px 8px;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface-elev); color: var(--text-secondary);
+  white-space: nowrap;
+}
+.sa-chip.running { color: var(--warning); background: var(--warning-soft); border-color: var(--warning-soft); }
+.sa-chip.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-soft); }
+.sa-panel {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); overflow: hidden;
+}
+.sa-panel.running { box-shadow: inset 3px 0 0 var(--warning); }
+.sa-panel.error { box-shadow: inset 3px 0 0 var(--danger); }
+.sa-panel.ok { box-shadow: inset 3px 0 0 var(--success); }
+.sa-panel-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  background: var(--surface-elev); font-family: var(--font-ui); font-size: 12px;
+}
+.sa-panel-head .sa-agent { max-width: none; }
+.sa-state {
+  flex: none; font-size: 11px; padding: 0 8px; border-radius: 10px;
+  color: var(--text-secondary); border: 1px solid var(--border); background: var(--surface);
+}
+.sa-state.running { color: var(--warning); background: var(--warning-soft); border-color: var(--warning-soft); }
+.sa-state.ok { color: var(--success); background: var(--success-soft); border-color: var(--success-soft); }
+.sa-state.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-soft); }
+.sa-dim { color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+.sa-panel-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.sa-panel-body .tc-label { margin-bottom: 0; }
+.sa-task { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.sa-tools { display: flex; flex-direction: column; gap: 2px; }
+.sa-tool {
+  display: flex; gap: 8px; align-items: baseline;
+  background: var(--surface-code); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 3px 8px; font-size: 12px;
+}
+.sa-tool.current { border-color: var(--warning-soft); background: var(--warning-soft); }
+.sa-tool-name { flex: none; color: var(--primary); font-weight: 700; }
+.sa-tool.current .sa-tool-name { color: var(--warning); }
+.sa-tool-args { min-width: 0; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sa-log {
+  margin: 0; background: var(--surface-code); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 10px; font-size: 12px;
+  max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+.sa-error { color: var(--danger); border-color: var(--danger); }
+.sa-output {
+  background: var(--surface-code); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 8px 12px;
+  max-height: 420px; overflow: auto; word-break: break-word;
+}
+.sa-session { display: flex; align-items: center; gap: 8px; margin-top: 2px; min-width: 0; }
+.sa-open { flex: none; padding: 2px 10px; font-size: 12px; }
+.sa-session-path {
+  min-width: 0; font-family: var(--mono); font-size: 11px; color: var(--text-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
+}
+.sa-note {
+  font-family: var(--font-ui); font-size: 12px; color: var(--text-secondary);
+  background: var(--primary-soft); border: 1px solid var(--primary-soft-border);
+  border-radius: var(--radius-sm); padding: 6px 10px;
+}
+.sa-request { border-top: 1px solid var(--border); padding-top: 8px; }
+.sa-request > summary { cursor: pointer; font-family: var(--font-ui); font-size: 12px; color: var(--text-secondary); }
+.sa-request[open] > summary { margin-bottom: 6px; }
+
+/* ---------------- diff view inside tool responses ---------------- */
 .tc-diff { white-space: pre; overflow-x: auto; padding: 4px 0; font-family: var(--mono); }
 .tc-diff .dline { padding: 0 12px 0 0; min-height: 1.45em; display: flex; align-items: baseline; }
 .tc-diff .dsign { flex: none; width: 1.4em; text-align: center; font-weight: 700; }
@@ -592,6 +712,10 @@ body.dropping #composer { background: var(--primary-soft); }
 .attachment-remove:hover { background: var(--danger); color: var(--text); border: none; }
 
 .composer-row { display: flex; align-items: center; margin-top: 8px; gap: 8px; }
+/* attach control sits with the hint, left of the send button */
+#btn-attach { flex: none; width: 28px; height: 28px; padding: 0; color: var(--text-secondary); }
+#btn-attach:hover { color: var(--primary); border-color: var(--primary); }
+#btn-attach svg { width: 16px; height: 16px; display: block; }
 .hint { font-size: 12px; font-family: var(--font-ui); }
 #btn-abort { padding: 4px 12px; font-size: 13px; }
 #btn-send { background: var(--primary); color: var(--primary-contrast); border-color: var(--primary); font-weight: 700; }
@@ -866,6 +990,8 @@ select:focus-visible,
 .ws-item:focus-visible,
 #sidebar .sidebar-tabs button:focus-visible,
 .tc-head:focus-visible,
+.sa-child:focus-visible,
+.sa-more:focus-visible,
 #dialog-body .opt:focus-visible,
 #dialog-body input:focus-visible,
 #dialog-body select:focus-visible,

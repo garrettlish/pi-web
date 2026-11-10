@@ -103,6 +103,34 @@ writeFixture("--tmp-ws-alpha--", "2026-01-01T00-00-00-000Z_aaaa.jsonl", [
     timestamp: "2026-01-01T00:00:03.000Z",
     message: { role: "toolResult", toolCallId: "call-1", toolName: "grep", content: [{ type: "text", text: "SEARCHTOOLOUT flibbertigibbet.js:1" }] },
   },
+  {
+    type: "message",
+    id: "a3",
+    parentId: "r1",
+    timestamp: "2026-01-01T00:00:04.000Z",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call-sub", name: "subagent", arguments: { agent: "reviewer", task: "SEARCHSUBTASK review auth" } }],
+    },
+  },
+  // A subagent fan-out: the tool result text is the parent's combined answer,
+  // while each child's own output lives only in details.results[].finalOutput.
+  {
+    type: "message",
+    id: "r2",
+    parentId: "a3",
+    timestamp: "2026-01-01T00:00:05.000Z",
+    message: {
+      role: "toolResult",
+      toolCallId: "call-sub",
+      toolName: "subagent",
+      content: [{ type: "text", text: "combined answer" }],
+      details: {
+        mode: "single",
+        results: [{ index: 0, agent: "reviewer", exitCode: 0, finalOutput: "SEARCHCHILDOUT the token check trusts the alg header" }],
+      },
+    },
+  },
 ]);
 writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
   { type: "session", version: 3, id: "bbbb", timestamp: "2026-02-02T00:00:00.000Z", cwd: "/tmp/ws-beta" },
@@ -198,6 +226,12 @@ try {
   check("/api/search matches tool-call arguments", toolArg.hits.length > 0 && toolArg.hits.every((h) => h.role === "tool"));
   const toolOut = await search("SEARCHTOOLOUT");
   check("/api/search matches tool results", toolOut.hits.length > 0 && toolOut.hits.every((h) => h.role === "toolResult"));
+
+  // Subagent child output is only in details.results[].finalOutput; searching it
+  // must reach the child run even though the tool result text differs.
+  const childOut = await search("SEARCHCHILDOUT");
+  check("/api/search reaches subagent child output", childOut.hits.length === 1, JSON.stringify(childOut.hits.map((h) => h.toolName)));
+  check("/api/search labels the subagent child by agent", childOut.hits[0]?.toolName === "subagent/reviewer", childOut.hits[0]?.toolName);
   check(
     "/api/search ignores the system prompt",
     (await search("SEARCHSYSTEMONLY")).hits.length === 0

@@ -656,10 +656,421 @@ function imageResultSection(title, blocks) {
   return sec;
 }
 
+// ---------------------------------------------------------------------------
+// subagent runs
+// ---------------------------------------------------------------------------
+// The subagents extension reports a run through the generic tool channel: a
+// `subagent` call whose result carries `details.results[]` (one row per child)
+// plus a `progress` snapshot that is re-sent whole on every
+// tool_execution_update. Everything below reads only that documented shape —
+// unknown fields are ignored, so a newer extension version degrades to the
+// generic tool view instead of breaking the transcript.
+const SUBAGENT_TOOL = "subagent";
+/** children listed under the card head; the popup holds the rest */
+const SUBAGENT_INLINE_MAX = 6;
+const REDACTED_TASK = "[prompt redacted]";
+
+/** Child task texts from the call arguments, in launch order. The results
+ *  themselves redact `task`, so the request is the only place the prompt the
+ *  user actually saw still exists. */
+function subagentTasks(call) {
+  const a = call?.arguments || {};
+  const out = [];
+  const push = (agent, task) =>
+    out.push({ agent: typeof agent === "string" && agent ? agent : null, task: typeof task === "string" ? task : "" });
+  if (Array.isArray(a.tasks)) for (const t of a.tasks) push(t?.agent, t?.task);
+  if (Array.isArray(a.chain)) {
+    for (const step of a.chain) {
+      if (Array.isArray(step?.parallel)) for (const t of step.parallel) push(t?.agent, t?.task);
+      else push(step?.agent, step?.task);
+    }
+  }
+  if (!out.length && (a.agent || a.task)) push(a.agent, a.task);
+  return out;
+}
+
+/** Most recent streamed details snapshot of a running subagent call. */
+function liveSubagentDetails(exec) {
+  const updates = exec?.updates || [];
+  for (let i = updates.length - 1; i >= 0; i--) {
+    const d = updates[i]?.details;
+    if (d && Array.isArray(d.results)) return d;
+  }
+  return null;
+}
+
+function subagentStatus(progressStatus, exitCode, error) {
+  if (["pending", "running", "detached", "completed", "failed"].includes(progressStatus)) return progressStatus;
+  if (exitCode != null) return exitCode === 0 ? "completed" : "failed";
+  return error ? "failed" : "completed";
+}
+
+/** css tone for a child state: "running" | "ok" | "error" | "" */
+function subagentTone(status) {
+  if (status === "running" || status === "pending") return "running";
+  if (status === "failed") return "error";
+  if (status === "completed") return "ok";
+  return "";
+}
+
+function subagentStatusText(status) {
+  return { pending: "queued", running: "running", completed: "done", failed: "error", detached: "detached" }[status] || status || "";
+}
+
+/** Normalize one `subagent` call + its result into child rows both the card and
+ *  the popup render from, so the two never disagree about state. */
+function subagentView(call, exec, result) {
+  const finalDetails = result?.details && Array.isArray(result.details.results) ? result.details : null;
+  const live = liveSubagentDetails(exec);
+  const details = finalDetails || live;
+  const tasks = subagentTasks(call);
+
+  const progressByIndex = new Map();
+  for (const p of [...(details?.progress || []), ...(live?.progress || [])]) {
+    if (p && Number.isInteger(p.index)) progressByIndex.set(p.index, p);
+  }
+
+  const rows = (details?.results || []).map((raw, i) => {
+    const index = Number.isInteger(raw.index) ? raw.index : i;
+    const liveRow = Array.isArray(live?.results) ? live.results[i] : null;
+    const progress = raw.progress || liveRow?.progress || progressByIndex.get(index) || null;
+    const usage = raw.usage || {};
+    const task = tasks[index];
+    const taskText = [task?.task, progress?.task]
+      .find((t) => typeof t === "string" && t.trim() && t !== REDACTED_TASK) || "";
+    const tokens = progress?.tokens || (usage.input || 0) + (usage.output || 0) || null;
+    return {
+      agent: raw.agent || progress?.agent || task?.agent || "subagent",
+      name: raw.sessionName || progress?.sessionName || null,
+      task: taskText,
+      status: subagentStatus(progress?.status, raw.exitCode, raw.error),
+      model: progress?.model || raw.model || raw.requestedModel || null,
+      thinking: progress?.thinking || raw.thinking || null,
+      currentTool: progress?.currentTool || null,
+      currentToolArgs: progress?.currentToolArgs || null,
+      recentTools: Array.isArray(progress?.recentTools) ? progress.recentTools.slice(-3) : [],
+      recentOutput: Array.isArray(progress?.recentOutput) ? progress.recentOutput.slice(-8) : [],
+      tokens,
+      cost: usage.cost?.total || null,
+      // 0 is "not measured yet" for a queued child, not an instant run
+      durationMs: progress?.durationMs || raw.progressSummary?.durationMs || null,
+      toolCount: progress?.toolCount ?? raw.progressSummary?.toolCount ?? null,
+      error: raw.error || progress?.error || null,
+      output: typeof raw.finalOutput === "string" ? raw.finalOutput : "",
+      sessionFile: raw.sessionFile || null,
+    };
+  });
+
+  return {
+    mode: details?.mode || null,
+    runId: details?.runId || null,
+    /** A background launch answers immediately with no child rows: the run is
+     *  detached and its result arrives later as a completion message. */
+    asyncId: details?.asyncId || null,
+    background: !!details?.background,
+    rows,
+    running: rows.filter((r) => r.status === "running" || r.status === "pending" || r.status === "detached").length,
+    failed: rows.filter((r) => r.status === "failed").length,
+    tokens: rows.reduce((sum, r) => sum + (r.tokens || 0), 0) || null,
+    cost: rows.reduce((sum, r) => sum + (r.cost || 0), 0) || null,
+    durationMs: rows.reduce((max, r) => Math.max(max, r.durationMs || 0), 0) || null,
+  };
+}
+
+/** true when the tool result is a subagent run this module can render richly.
+ *  Management calls (`status`, `stop`, agent CRUD) answer with the same envelope
+ *  but are not runs, so they keep the generic tool view. */
+function isSubagentRun(call, exec, result) {
+  if (call?.name !== SUBAGENT_TOOL) return false;
+  const live = liveSubagentDetails(exec);
+  const details = result?.details && Array.isArray(result.details.results) ? result.details : live;
+  if (!details || details.mode === "management") return false;
+  return details.results.length > 0 || details.mode === "single" || !!details.asyncId || !!live;
+}
+
+function subagentHeadline(view) {
+  if (!view.rows.length) {
+    if (view.background || view.asyncId) return "background run · detached";
+    return view.mode ? `${view.mode} run` : "starting…";
+  }
+  const agents = view.rows.map((r) => r.agent);
+  const unique = [...new Set(agents)];
+  if (view.rows.length === 1) {
+    const one = view.rows[0];
+    return one.task ? `${one.agent} · ${truncate(one.task, 90)}` : one.agent;
+  }
+  // "2 × reviewer" reads better than "2 agents · reviewer, reviewer"
+  const who = unique.length === 1 ? `${view.rows.length} × ${unique[0]}` : unique.join(", ");
+  return truncate(who, 90);
+}
+
+/** one line of live activity for a child row */
+function subagentActivity(row) {
+  if (row.status === "failed" && row.error) return truncate(row.error, 160);
+  if (row.currentTool) {
+    const args = row.currentToolArgs ? ` ${truncate(String(row.currentToolArgs), 80)}` : "";
+    return `${row.currentTool}${args}`;
+  }
+  const lastOutput = row.recentOutput[row.recentOutput.length - 1];
+  if (lastOutput) return truncate(lastOutput.trim(), 160);
+  if (row.status === "pending") return "queued";
+  if (row.status === "running") return "working…";
+  // A finished row is identified by what it was asked to do, not by a tool count
+  if (row.task) return truncate(row.task, 160);
+  if (row.status === "completed") return "done";
+  return "";
+}
+
+function subagentMeta(row) {
+  const parts = [];
+  if (row.toolCount) parts.push(`${row.toolCount} tool${row.toolCount === 1 ? "" : "s"}`);
+  if (row.durationMs) parts.push(fmtDuration(row.durationMs));
+  if (row.tokens) parts.push(`${fmtTokens(row.tokens)} tok`);
+  return parts.join(" · ");
+}
+
+/** inline card: the run on one head line, its children as compact rows. A
+ *  subagent's children are the part worth seeing without opening a popup. */
+function renderSubagentCard(call, block) {
+  const { result, exec, statusText } = toolcallState(block);
+  const view = subagentView(call, exec, result);
+  const done = view.rows.length - view.running - view.failed;
+  // A run with one failed child is not itself a failure: pi still returned a
+  // usable result. Only an all-failed run (or a failed tool result) gets the
+  // error accent; a partial failure gets the warning one.
+  const allFailed = view.rows.length > 0 && view.failed === view.rows.length;
+  const accent = statusText === "error" || allFailed ? "error" : view.failed ? "partial" : "";
+  const card = el("div", {
+    class: `toolcall subagent ${exec.status === "running" || view.running ? "running" : ""} ${accent}`,
+    "data-call-id": call.id,
+  });
+
+  const open = () => openSubagent(call, block);
+  const headOpts = {
+    class: "tc-head",
+    role: "button",
+    tabindex: "0",
+    title: "Open subagent run",
+    "aria-haspopup": "dialog",
+    onclick: open,
+    onkeydown: onActivate(open),
+  };
+  card.append(
+    el(
+      "div",
+      headOpts,
+      el("span", { class: "tc-open-icon", text: "⧉" }),
+      el("span", { class: "tc-name", text: "subagent" }),
+      el("span", { class: "tc-summary", text: subagentHeadline(view) }),
+      view.running ? el("span", { class: "sa-count running", text: `${view.running} running` }) : null,
+      view.failed ? el("span", { class: "sa-count error", text: `${view.failed} failed` }) : null,
+      done > 0 && view.running ? el("span", { class: "sa-count", text: `${done} done` }) : null,
+      view.durationMs != null ? el("span", { class: "tc-duration", text: fmtDuration(view.durationMs) }) : null,
+      view.tokens != null ? el("span", { class: "tc-duration", text: `${fmtTokens(view.tokens)} tok` }) : null,
+      el("span", { class: `tc-status ${statusText}`, text: statusText })
+    )
+  );
+
+  if (view.rows.length) {
+    const rows = el("div", { class: "sa-rows" });
+    for (const row of view.rows.slice(0, SUBAGENT_INLINE_MAX)) rows.append(subagentChildRow(row, open));
+    if (view.rows.length > SUBAGENT_INLINE_MAX) {
+      rows.append(
+        el("div", {
+          class: "sa-more",
+          role: "button",
+          tabindex: "0",
+          text: `+${view.rows.length - SUBAGENT_INLINE_MAX} more — open the run`,
+          onclick: open,
+          onkeydown: onActivate(open),
+        })
+      );
+    }
+    card.append(rows);
+  }
+  return card;
+}
+
+function subagentChildRow(row, open) {
+  const tone = subagentTone(row.status);
+  return el(
+    "div",
+    {
+      class: `sa-child ${tone}`,
+      role: "button",
+      tabindex: "0",
+      title: row.task || row.name || row.agent,
+      onclick: open,
+      onkeydown: onActivate(open),
+    },
+    el("span", { class: `sa-dot ${tone}` }),
+    el("span", { class: "sa-agent", text: row.agent }),
+    el("span", { class: "sa-what", text: subagentActivity(row) }),
+    el("span", { class: "sa-meta", text: subagentMeta(row) })
+  );
+}
+
+/** Rich popup body for one subagent run: a summary strip plus one panel per
+ *  child with its task, live activity, output and session file. */
+let subagentRequestOpen = false;
+function buildSubagentBody(call, exec, result) {
+  const view = subagentView(call, exec, result);
+  const body = el("div", { class: "sa-body" });
+
+  const strip = el("div", { class: "sa-strip" });
+  const chip = (text, tone = "") => el("span", { class: `sa-chip ${tone}`, text });
+  if (view.mode) strip.append(chip(`mode: ${view.mode}${view.background ? " · background" : ""}`));
+  strip.append(chip(`${view.rows.length} child${view.rows.length === 1 ? "" : "ren"}`));
+  if (view.running) strip.append(chip(`${view.running} running`, "running"));
+  if (view.failed) strip.append(chip(`${view.failed} failed`, "error"));
+  if (view.durationMs != null) strip.append(chip(`wall ${fmtDuration(view.durationMs)}`));
+  if (view.tokens != null) strip.append(chip(`${fmtTokens(view.tokens)} tok`));
+  if (view.cost) strip.append(chip(fmtCost(view.cost)));
+  if (view.runId) {
+    const run = chip(`run ${view.runId.slice(0, 8)}`);
+    run.title = `${view.runId}\nClick to copy`;
+    run.style.cursor = "pointer";
+    run.addEventListener("click", () =>
+      navigator.clipboard.writeText(view.runId).then(() => toast("run id copied"), () => toast("copy failed", "error"))
+    );
+    strip.append(run);
+  }
+  body.append(strip);
+
+  if (!view.rows.length) {
+    const text = resultText(result?.content).trim();
+    const note = view.background || view.asyncId
+      ? el("div", { class: "sa-note" }, el("span", { text: "This run continues in the background. " }),
+          el("span", { text: "Its result arrives as a completion message; the child rows appear once the run reports them." }))
+      : null;
+    if (note) body.append(note);
+    body.append(el("div", { class: "tc-text", text: capText(text || "(no child results reported yet)") }));
+  }
+
+  for (const row of view.rows) {
+    body.append(subagentPanel(row));
+  }
+
+  const request = el("details", { class: "sa-request" });
+  // A running run repaints this body on every progress tick; remember whether
+  // the reader expanded the request so the repaint does not collapse it.
+  request.open = subagentRequestOpen;
+  request.addEventListener("toggle", () => {
+    subagentRequestOpen = request.open;
+  });
+  request.append(el("summary", { text: "request · arguments" }), jsonBlock(call.arguments ?? call.argsRaw ?? {}));
+  body.append(request);
+  return body;
+}
+
+function subagentPanel(row) {
+  const tone = subagentTone(row.status);
+  const panel = el("div", { class: `sa-panel ${tone}` });
+
+  const head = el(
+    "div",
+    { class: "sa-panel-head" },
+    el("span", { class: `sa-dot ${tone}` }),
+    el("span", { class: "sa-agent", text: row.agent }),
+    el("span", { class: `sa-state ${tone}`, text: subagentStatusText(row.status) }),
+    row.model ? el("span", { class: "sa-chip", text: row.model }) : null,
+    row.thinking ? el("span", { class: "sa-chip", text: `think: ${row.thinking}` }) : null,
+    el("span", { class: "spacer" }),
+    row.toolCount ? el("span", { class: "sa-dim", text: `${row.toolCount} tools` }) : null,
+    row.tokens ? el("span", { class: "sa-dim", text: `${fmtTokens(row.tokens)} tok` }) : null,
+    row.durationMs ? el("span", { class: "sa-dim", text: fmtDuration(row.durationMs) }) : null
+  );
+  panel.append(head);
+
+  const content = el("div", { class: "sa-panel-body" });
+  if (row.task) content.append(el("div", { class: "sa-task", text: row.task }));
+
+  if (row.currentTool) {
+    const tool = el("div", { class: "sa-tool current" });
+    tool.append(
+      el("span", { class: "sa-tool-name", text: row.currentTool }),
+      el("span", { class: "sa-tool-args", text: truncate(String(row.currentToolArgs || "running…"), 200) })
+    );
+    content.append(el("div", { class: "tc-label", text: "now" }), tool);
+  }
+
+  if (row.recentTools.length) {
+    const list = el("div", { class: "sa-tools" });
+    for (const t of row.recentTools) {
+      const line = el("div", { class: "sa-tool" });
+      line.append(
+        el("span", { class: "sa-tool-name", text: t.tool || "tool" }),
+        el("span", { class: "sa-tool-args", text: truncate(String(t.args || ""), 160) })
+      );
+      list.append(line);
+    }
+    content.append(el("div", { class: "tc-label", text: "recent tools" }), list);
+  }
+
+  if (row.recentOutput.length) {
+    content.append(
+      el("div", { class: "tc-label", text: "recent output" }),
+      el("pre", { class: "sa-log", text: capText(row.recentOutput.join("\n")) })
+    );
+  }
+
+  if (row.error) {
+    content.append(el("div", { class: "tc-label", text: "error" }), el("div", { class: "tc-text sa-error", text: row.error }));
+  }
+
+  if (row.output.trim()) {
+    const out = el("div", { class: "sa-output assistant-text" });
+    out.replaceChildren(...htmlFragment(renderMarkdown(row.output)));
+    content.append(el("div", { class: "tc-label", text: "output" }), out);
+  }
+
+  if (row.sessionFile) {
+    const foot = el("div", { class: "sa-session" });
+    const copy = el("button", {
+      class: "ghost sa-open",
+      text: "open transcript",
+      title: row.sessionFile,
+      onclick: () => openChildSession(row.sessionFile),
+    });
+    foot.append(copy, el("span", { class: "sa-session-path", text: row.sessionFile, title: row.sessionFile }));
+    content.append(foot);
+  }
+
+  panel.append(content);
+  return panel;
+}
+
+/** Open a finished child's own session in this tab. Switching spawns a pi
+ *  process for that file, exactly like any other session switch. */
+async function openChildSession(file) {
+  if (!file) return;
+  closeModal();
+  const meta = state.sessions.find((s) => s.file === file);
+  await switchSession(file, meta?.cwd || state.cwd);
+}
+
+function openSubagent(call, block) {
+  const { exec, result } = toolcallState(block);
+  const view = subagentView(call, exec, result);
+  subagentRequestOpen = false;
+  const label = view.rows.length === 1 ? `: ${view.rows[0].agent}` : view.rows.length > 1 ? `: ${view.rows.length} children` : "";
+  openPopup(`subagent${label}`, {
+    paint: () => {
+      const st = toolcallState(block);
+      return buildSubagentBody(st.call, st.exec, st.result);
+    },
+    payload: () => {
+      const st = toolcallState(block);
+      return { toolCall: st.call, execution: st.exec || null, toolResult: st.result };
+    },
+  });
+}
+
 /** rich body for one tool call: arguments, live execution updates, response.
  *  Rendered inside the popup — never inline, so it cannot shove the rest of
  *  the transcript off screen. */
 function buildToolcallBody(call, exec, result) {
+  if (isSubagentRun(call, exec, result)) return buildSubagentBody(call, exec, result);
   const body = el("div", { class: "tc-body" });
   const diff = typeof result?.details?.diff === "string" ? result.details.diff : null;
 
@@ -725,6 +1136,10 @@ function buildToolcallBody(call, exec, result) {
  *  after the card (notably the assistant's summary) below the fold. */
 function renderToolcall(_item, block) {
   const { call, result, exec, statusText } = toolcallState(block);
+
+  // A subagent call is a fan-out, not a single request/response: its children
+  // get their own rows so progress is readable without opening anything.
+  if (isSubagentRun(call, exec, result)) return renderSubagentCard(call, block);
 
   const card = el("div", {
     class: `toolcall ${exec.status === "running" ? "running" : ""} ${statusText === "error" ? "error" : ""}`,
@@ -1606,7 +2021,7 @@ function renderSidebar() {
       )
     );
   }
-  if (!inWs.length) list.append(el("div", { class: "list-empty", text: "No sessions here yet — use + New" }));
+  if (!inWs.length) list.append(el("div", { class: "list-empty", text: "No sessions here yet — use the new-session button" }));
 }
 
 async function loadSessions() {
@@ -2419,7 +2834,13 @@ function handleEvent(record) {
     case "tool_execution_update": {
       const ex = state.executions.get(record.toolCallId) || { updates: [], status: "running" };
       ex.status = ex.status === "pending" ? "running" : ex.status;
-      if (record.partialResult != null) ex.updates.push(record.partialResult);
+      if (record.partialResult != null) {
+        // A subagent re-sends its whole progress snapshot on every tick; only
+        // the latest one is ever read, so keeping the history would grow the
+        // tab's memory for the whole length of a fan-out.
+        if (record.toolName === SUBAGENT_TOOL) ex.updates = [record.partialResult];
+        else ex.updates.push(record.partialResult);
+      }
       state.executions.set(record.toolCallId, ex);
       markToolcallDirty(record.toolCallId);
       break;
@@ -2661,6 +3082,12 @@ function repaintModal() {
 
 /** open one tool call: arguments, execution updates and response in a popup */
 function openToolcall(call, block) {
+  // the subagent popup leads with the child fan-out, not a generic payload dump
+  const current = toolcallState(block);
+  if (isSubagentRun(current.call, current.exec, current.result)) {
+    openSubagent(call, block);
+    return;
+  }
   // edit popups carry the target file name in the title
   const title =
     call.name === "edit" && call.arguments?.path
@@ -2986,8 +3413,18 @@ function addImageFiles(files) {
     reader.readAsDataURL(f);
   }
   if (added) inputEl.focus();
-  else toast("unsupported file — drop image files only", "error");
+  else toast("unsupported file — images only", "error");
 }
+
+// The attach button opens the OS file picker; dropping files still works.
+// The input is cleared after every pick so choosing the same file twice in a
+// row still fires a change event.
+$("#btn-attach").addEventListener("click", () => $("#file-input").click());
+$("#file-input").addEventListener("change", (e) => {
+  const files = [...(e.target.files || [])];
+  if (files.length) addImageFiles(files);
+  e.target.value = "";
+});
 
 // File drops are accepted anywhere on the page and routed to the composer.
 // Cancelling at window level is what actually prevents the browser's default
@@ -3159,6 +3596,9 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("piweb-theme", theme);
   $("#btn-theme").replaceChildren(svgIcon(theme === "light" ? ICON_MOON : ICON_SUN));
+  // keep the browser chrome (mobile address bar, PWA shell) on the same page color
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", theme === "light" ? "#f5f7fa" : "#0d1117");
 }
 $("#btn-theme").addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
@@ -3213,7 +3653,7 @@ function connectEvents() {
 // boot
 // ---------------------------------------------------------------------------
 (async function boot() {
-  applyTheme(localStorage.getItem("piweb-theme") || "dark");
+  applyTheme(localStorage.getItem("piweb-theme") || "light");
   const cfg = await api("/api/config").catch(() => null);
   state.cwd = cfg?.cwd;
   connectEvents();
