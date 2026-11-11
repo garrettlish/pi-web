@@ -593,6 +593,58 @@ function editDiffStats(diffText) {
   return { added, deleted };
 }
 
+/** Cursor reports an edit as activity text, not as a pi edit result: the
+ *  response starts with "edit <path>", then its own "+N -M" count, then a
+ *  unified diff. Recover the same { path, added, deleted } the edit tool
+ *  carries so both tools share one transcript header. Returns null for every
+ *  other activity of that tool (readLints diagnostics, subagent fan-out, ...).
+ *
+ *  The count is taken while the change is still streaming too: arguments
+ *  already name the file and the activity, so the row does not switch shape
+ *  when the result lands. */
+function cursorEditInfo(call, result) {
+  if (call?.name !== "cursor") return null;
+  const lines = result ? resultText(result.content).trimStart().split("\n") : [];
+  const head = lines[0] || "";
+  const args = call.arguments || {};
+  // "Cursor edit" is what the tool sets for a write to the workspace; the
+  // result's first line is the authoritative form once it exists
+  const path = head.startsWith("edit ")
+    ? head.slice(5).trim()
+    : /^cursor edit$/i.test(String(args.activityTitle || "")) ? String(args.path || "") : "";
+  if (!path) return null;
+
+  let added = null;
+  let deleted = null;
+  for (const line of lines.slice(1, 6)) {
+    const m = line.trim().match(/^\+(\d+) -(\d+)$/);
+    if (m) {
+      added = Number(m[1]);
+      deleted = Number(m[2]);
+      break;
+    }
+  }
+  if (added == null) {
+    // fallback for a report that omitted its count: count the body, skipping
+    // the ---/+++ file headers. A truncated diff undercounts, which is why the
+    // tool's own numbers are preferred above.
+    let seenHunk = false;
+    let a = 0;
+    let d = 0;
+    for (const line of lines) {
+      if (line.startsWith("@@")) seenHunk = true;
+      else if (!seenHunk || /^(---|\+\+\+) /.test(line)) continue;
+      else if (line.startsWith("+")) a++;
+      else if (line.startsWith("-")) d++;
+    }
+    if (seenHunk) {
+      added = a;
+      deleted = d;
+    }
+  }
+  return { path, added, deleted };
+}
+
 /** derive the live view state for one tool call block (shared by the row and
  *  the popup, so both agree on status, result and duration) */
 function toolcallState(block) {
@@ -1089,14 +1141,39 @@ function openSubagent(call, block) {
   });
 }
 
+/** Split a Cursor activity response into its prose preamble and its unified
+ *  diff. Cursor sends both in one text block ("edit <path>\n\n+1 -0\n\n---
+ *  a/x\n+++ b/x\n@@ …"), which lets the popup lead with the colored diff
+ *  while the preamble stays as plain text. Null when there is no hunk. */
+function splitCursorDiff(text) {
+  const lines = String(text ?? "").split("\n");
+  const hunk = lines.findIndex((l) => /^@@ -\d/.test(l));
+  if (hunk < 0) return null;
+  let start = hunk;
+  while (start > 0 && /^(---|\+\+\+) /.test(lines[start - 1])) start--;
+  return { preamble: lines.slice(0, start).join("\n").trim(), diff: lines.slice(start).join("\n") };
+}
+
+/** The change an edit reports, from wherever that tool keeps it: pi's `edit`
+ *  carries it in details.diff, Cursor's activity sends the whole report
+ *  ("edit <path>\n\n+1 -0\n\n--- a/x …") as response text and, in newer
+ *  sessions, repeats the patch in details. Null for every other tool, so their
+ *  popups keep the shape they had. */
+function editDiffOf(call, result) {
+  if (!result) return null;
+  if (call?.name === "edit") return typeof result.details?.diff === "string" ? result.details.diff : null;
+  if (call?.name !== "cursor" || !cursorEditInfo(call, result)) return null;
+  const fromDetails = typeof result.details?.diff === "string" ? result.details.diff : null;
+  return fromDetails || splitCursorDiff(resultText(result.content))?.diff || null;
+}
+
 /** rich body for one tool call: arguments, live execution updates, response.
  *  Rendered inside the popup — never inline, so it cannot shove the rest of
  *  the transcript off screen. */
 function buildToolcallBody(call, exec, result) {
   if (isSubagentRun(call, exec, result)) return buildSubagentBody(call, exec, result);
   const body = el("div", { class: "tc-body" });
-  const diff = typeof result?.details?.diff === "string" ? result.details.diff : null;
-
+  const diff = editDiffOf(call, result);
   // A tool that read a picture and could only report its size is the common
   // case worth leading with: show the image itself, above the JSON.
   const imagePath = imageMetadataPath(call, result);
@@ -1105,8 +1182,9 @@ function buildToolcallBody(call, exec, result) {
   }
 
   // edit calls lead with the colored diff — seeing what changed is the point
-  // of the popup; the raw request/response follow below
-  if (call.name === "edit" && diff) {
+  // of the popup; the raw request/response follow below. A Cursor edit takes
+  // this same branch, so both tools' popups open on the patch.
+  if (diff) {
     body.append(
       el("div", { class: "tc-section tc-diff-section" }, el("div", { class: "tc-label", text: "diff" }), diffBlock(diff))
     );
@@ -1135,19 +1213,25 @@ function buildToolcallBody(call, exec, result) {
     const sec = el("div", { class: `tc-section tc-result ${result.isError ? "is-error" : ""}` }, el("div", { class: "tc-label", text: `response ${result.isError ? "· ERROR" : ""}` }));
     for (const b of result.content || []) {
       if (b.type === "text") {
+        // a Cursor edit's text block is "edit <path>", the counts and the
+        // patch; the patch is the diff section above, so only the preamble is
+        // left to print — the same role pi's "edited" text plays below its diff
+        const rest = call.name === "cursor" && diff ? splitCursorDiff(b.text || "") : null;
+        if (rest) {
+          if (rest.preamble) sec.append(el("div", { class: "tc-text", text: capText(rest.preamble) }));
+          continue;
+        }
         const txt = capText(b.text || "");
         sec.append(looksLikeDiff(txt) ? diffBlock(txt) : el("div", { class: "tc-text", text: txt }));
       } else if (b.type === "image") {
         sec.append(imageEl(`data:${b.mimeType};base64,${b.data}`));
       }
     }
-    if (result.details != null && !(call.name === "edit" && diff)) {
-      // edit results carry a computed diff — already shown above for edit
-      if (typeof result.details.diff === "string") {
-        sec.append(el("div", { class: "tc-label", text: "diff" }), diffBlock(result.details.diff));
-      } else {
-        sec.append(el("div", { class: "tc-label", text: "details" }), jsonBlock(result.details));
-      }
+    if (result.details != null && !diff) {
+      // A popup that led with the diff has nothing left to say here: pi's edit
+      // details carry the patch, and Cursor's carry a second copy of it plus
+      // the counts the row already shows. The raw JSON keeps both.
+      sec.append(el("div", { class: "tc-label", text: "details" }), jsonBlock(result.details));
     }
     body.append(sec);
   }
@@ -1181,18 +1265,30 @@ function renderToolcall(_item, block) {
   };
 
   // edit calls get the compact pi-style header: pencil, file name, +/- counts.
-  // Clicking still opens the full request/response popup shared by all tools.
-  if (call.name === "edit") {
-    const filePath = String(call.arguments?.path || call.arguments?.file_path || "");
+  // A Cursor edit is reported as `cursor` activity rather than as an `edit`
+  // result, but its response carries the same "+N -M" numbers plus a unified
+  // diff, so it renders through this same branch. Clicking still opens the
+  // full request/response popup shared by all tools.
+  const cursorEdit = call.name === "edit" ? null : cursorEditInfo(call, result);
+  if (call.name === "edit" || cursorEdit) {
+    const filePath = cursorEdit
+      ? cursorEdit.path
+      : String(call.arguments?.path || call.arguments?.file_path || "");
     const base = filePath.split(/[\\/]/).pop() || filePath;
-    const stats = result?.details?.diff != null ? editDiffStats(result.details.diff) : null;
+    const stats = cursorEdit
+      ? cursorEdit.added == null
+        ? null
+        : { added: cursorEdit.added, deleted: cursorEdit.deleted }
+      : result?.details?.diff != null
+        ? editDiffStats(result.details.diff)
+        : null;
     card.append(
       el(
         "div",
         headOpts,
         el("span", { class: "tc-open-icon", text: "✎" }),
         el("span", { class: "tc-name", text: "edit" }),
-        el("span", { class: "tc-summary", text: base }),
+        el("span", { class: "tc-summary", text: base, title: filePath }),
         stats ? el("span", { class: "tc-stat add", text: `+${stats.added}` }) : null,
         stats ? el("span", { class: "tc-stat del", text: `−${stats.deleted}` }) : null,
         statusText !== "done" ? el("span", { class: `tc-status ${statusText}`, text: statusText }) : null
@@ -3442,11 +3538,10 @@ function openToolcall(call, block) {
     openSubagent(call, block);
     return;
   }
-  // edit popups carry the target file name in the title
-  const title =
-    call.name === "edit" && call.arguments?.path
-      ? `edit: ${String(call.arguments.path).split(/[\\/]/).pop()}`
-      : `tool: ${call.name}`;
+  // edit popups carry the target file name in the title — a Cursor edit is one
+  // too, even though its tool name is `cursor`
+  const editPath = call.name === "edit" ? call.arguments?.path : cursorEditInfo(call, current.result)?.path;
+  const title = editPath ? `edit: ${String(editPath).split(/[\\/]/).pop()}` : `tool: ${call.name}`;
   openPopup(title, {
     paint: () => {
       // re-read live state so a running call stays current between repaints

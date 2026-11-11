@@ -78,9 +78,12 @@ pi-web --cwd ~/code/my-project
 - Tool calls appear as one-line rows in the transcript; clicking one opens a popup with the request
   arguments, live execution updates and the final response (text, images, `details`, error state,
   duration). For `edit` calls the popup leads with a colored, line-numbered diff — green additions,
-  red deletions — followed by the raw request and response. The popup has a **Raw JSON** toggle and
-  copies the full payload — the transcript itself never grows or scrolls, so the surrounding
-  messages stay put.
+  red deletions — followed by the raw request and response. Edits Cursor performs through its own
+  activity tool render identically: the row shows the file and its `+N −M` counts, the popup title
+  names the file, and the body opens on the colored diff even though Cursor reports the change as
+  response text (or as a `diff` next to the counts) rather than as an `edit` result. The popup has a
+  **Raw JSON** toggle and copies the full payload — the transcript itself never grows or scrolls, so
+  the surrounding messages stay put.
 - **Subagent runs are shown as their own transcript card**, not as an opaque tool row. When the
   `subagent` tool fans work out to child agents, the card head summarizes the run (agents involved,
   running/failed/done counts, wall time, tokens) and one row per child carries its live state and
