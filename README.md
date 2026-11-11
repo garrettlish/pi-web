@@ -127,11 +127,12 @@ pi-web --cwd ~/code/my-project
   bookmarked or shared between your own tabs.
 - Idle processes with no attached tab are reaped after 30 minutes.
 - The sidebar filter matches a session's title only. The search button beside the workspace button
-  (or `Cmd/Ctrl`+`K`) opens a dialog with two tabs. **Everything** searches **every prompt,
-  response, tool request and tool result in every workspace**: all typed terms must match
-  (case-insensitive), newest occurrences first, and each hit shows its role, workspace, session and
-  a snippet around the match. **Prompts** searches only what you typed, so a word that recurs in
-  tool output cannot bury the prompt that asked for it. A
+  (or `Cmd/Ctrl`+`K`) opens a dialog with two tabs, **Prompts** first and selected by default:
+  it searches only what you typed, so a word that recurs in tool output cannot bury the prompt
+  that asked for it. **Everything** widens the same query to **every prompt, response, tool
+  request and tool result in every workspace**: all typed terms must match (case-insensitive),
+  newest occurrences first, and each hit shows its role, workspace, session and a snippet around
+  the match. Switching tabs re-runs the query and puts the caret back in the search field. A
   subagent's child output is indexed too and labelled by agent (`subagent/reviewer`), so a
   reviewer's own wording is findable even when the parent's summary paraphrases it. Clicking
   a hit switches to that session and jumps to the occurrence — scrolling to the message, or

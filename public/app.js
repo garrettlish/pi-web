@@ -2288,10 +2288,11 @@ async function loadSessions() {
 // cross-session search
 // ---------------------------------------------------------------------------
 // The search button beside the workspace button (or Cmd/Ctrl+K) opens this
-// dialog, which queries the server's index. Two tabs share it: "Everything"
-// covers every prompt, response, tool request and tool result in every
-// workspace; "Prompts" narrows the same index to what the user typed, so a
-// common word in tool output cannot bury the prompt that asked for it.
+// dialog, which queries the server's index. Two tabs share it: "Prompts"
+// narrows the index to what the user typed, so a common word in tool output
+// cannot bury the prompt that asked for it, and it is the default; "Everything"
+// widens the same query to every prompt, response, tool request and tool result
+// in every workspace.
 const searchOverlay = $("#search-overlay");
 const searchInput = $("#search-input");
 const searchResultsEl = $("#search-results");
@@ -2303,8 +2304,10 @@ let searchTimer = null;
 let searchGen = 0; // guards against a slow earlier query overwriting a newer one
 let searchReturnFocus = null;
 // "all" | "prompts" — held in memory only, so a reload always starts from the
-// full corpus while switching tabs inside one tab of the app keeps the choice
-let searchScope = "all";
+// same default scope while switching tabs inside one tab of the app keeps the
+// choice. Prompts is the default: the question "where did I already ask this"
+// is the common one, and a word that recurs in tool output cannot bury it.
+let searchScope = "prompts";
 
 const SEARCH_PLACEHOLDER = {
   all: "Search prompts, responses and tool output in every workspace…",
@@ -2516,6 +2519,10 @@ async function openSearchHit(hit) {
  *  without re-running would leave hits from the other scope on screen and make
  *  a role pill ("result: grep") look like a bug in the Prompts tab */
 function setSearchScope(scope) {
+  // the tab was clicked to narrow or widen the question being typed, so hand
+  // focus back to the field in every case — including a click on the tab that
+  // is already active, where the only sensible next keystroke is still typing
+  searchInput.focus();
   if (searchScope === scope) return;
   searchScope = scope;
   const all = scope === "all";
