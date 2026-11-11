@@ -188,7 +188,12 @@ pi-web --cwd ~/code/my-project
 - Six independent palettes — mono (minimal grey/white), sky (fresh blue), grove (natural green),
   ember (energetic orange), elegant (soft violet) and night (dark) — picked from a swatch dropdown
   in the header, with the choice remembered across reloads; a resizable sidebar and keyboard
-  focus styling.
+  focus styling. Every palette is built from one token set, so the palettes differ only in color:
+  a neutral grouped page, white content surfaces, a single accent reserved for the primary action
+  and the current selection, and a translucent functional layer (toolbar, sidebar, composer) that
+  turns opaque under the system's Reduce Transparency setting.
+- Tool-call state is read twice over: a rail on the row's leading edge and a worded chip, so
+  `queued`, `running`, `done` and `error` are distinguishable without relying on color alone.
 
 ## Architecture
 

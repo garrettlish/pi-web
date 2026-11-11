@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>pi-web</title>
   <meta name="description" content="A local web UI for the pi coding agent: streamed transcripts, session history, and a full inspector for every LLM and tool call.">
-  <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#eef6ff">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#e8f0fa">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script>
@@ -27,18 +27,15 @@
     <aside id="sidebar">
       <div class="sidebar-head">
         <span class="logo">
-          <svg class="logo-mark" width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
-            <defs>
-              <linearGradient id="logo-grad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#7c4dff"/>
-                <stop offset="0.55" stop-color="#b13ef0"/>
-                <stop offset="1" stop-color="#f0429b"/>
-              </linearGradient>
-            </defs>
-            <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#logo-grad)"/>
-            <path d="M9 11l5 5-5 5" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M17 21h6" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
-          </svg>
+          <!-- the mark is drawn in currentColor so it follows the palette: a
+               terminal caret in a rounded square, no gradient, no glow -->
+          <span class="logo-mark">
+            <svg viewBox="0 0 32 32" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="29" height="29" rx="8.5" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M10 11.5l4.5 4.5-4.5 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M17.5 20.5h5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            </svg>
+          </span>
           <span class="logo-text">pi<span class="logo-dim">web</span></span>
         </span>
         <span class="sidebar-actions">

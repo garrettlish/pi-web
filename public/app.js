@@ -4272,12 +4272,12 @@ const ICON_MOON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" f
 const THEMES = ["mono", "sky", "grove", "ember", "elegant", "night"];
 const DEFAULT_THEME = "sky";
 const THEME_CHROME = {
-  mono: "#f6f6f7",
-  sky: "#eef6ff",
-  grove: "#eff7ee",
-  ember: "#fff6ec",
-  elegant: "#f3edff",
-  night: "#0b0a14",
+  mono: "#eef0f2",
+  sky: "#e8f0fa",
+  grove: "#e9f2e8",
+  ember: "#fbf2e9",
+  elegant: "#f2eef9",
+  night: "#1c1c1e",
 };
 /** a saved value from an older build (a retired palette, or "light"/"dark")
  *  still has to resolve, so anything unknown maps onto the closest match */
