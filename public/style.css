@@ -1586,15 +1586,19 @@ body.dropping #input { border-color: var(--accent); border-style: dashed; box-sh
 /* ---------------- cross-session search ---------------- */
 #search-overlay {
   position: fixed; inset: 0; z-index: 70;
-  display: flex; align-items: flex-start; justify-content: center;
-  padding-top: 10vh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 2vh 2vw;
   background: var(--overlay);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
 }
+/* the same footprint as the resources inspector (#resources-dialog): the results
+   list is the part people actually read, so the dialog takes the window and
+   caps out at a comfortable reading width instead of a fixed 780x620 box */
 #search-dialog {
   display: flex; flex-direction: column; overflow: hidden;
-  width: min(780px, 94vw); height: min(620px, 76vh);
+  width: 100%; max-width: 1500px;
+  height: 100%; max-height: 1100px;
   background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--radius-xl);
   box-shadow: var(--shadow-lg);
@@ -1695,6 +1699,12 @@ body.dropping #input { border-color: var(--accent); border-style: dashed; box-sh
   /* the tokens carry more than the static title, so the title yields */
   #search-title { display: none; }
   .search-tabs { margin-left: 0; }
+}
+@media (max-width: 560px) {
+  /* a phone-sized window has no room to spare, so the dialog takes all of it,
+     same as the resources inspector */
+  #search-overlay { padding: 0; }
+  #search-dialog { max-width: 100%; max-height: 100%; border-radius: 0; border: 0; }
 }
 
 /* ---------------------------------------------------------------------------
