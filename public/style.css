@@ -68,7 +68,6 @@
   --overlay: rgba(0, 0, 0, 0.55);
 
   /* the ink of the logo mark drawn on --text */
-  --mark-ink: #1c1c1e;
   --scrollbar: #54545c;
 
   /* type: the platform UI face for chrome, mono for data and code */
@@ -134,8 +133,6 @@
   --shadow-md: 0 4px 14px rgba(20, 22, 26, 0.1);
   --shadow-lg: 0 18px 48px rgba(20, 22, 26, 0.18);
   --overlay: rgba(30, 32, 38, 0.32);
-
-  --mark-ink: #ffffff;
   --scrollbar: #c3c5c9;
   color-scheme: light;
 }
@@ -174,8 +171,6 @@
   --shadow-md: 0 4px 14px rgba(18, 46, 80, 0.1);
   --shadow-lg: 0 18px 48px rgba(18, 46, 80, 0.18);
   --overlay: rgba(16, 36, 60, 0.3);
-
-  --mark-ink: #ffffff;
   --scrollbar: #b9c7d8;
   color-scheme: light;
 }
@@ -214,8 +209,6 @@
   --shadow-md: 0 4px 14px rgba(20, 45, 30, 0.1);
   --shadow-lg: 0 18px 48px rgba(20, 45, 30, 0.18);
   --overlay: rgba(18, 40, 26, 0.3);
-
-  --mark-ink: #ffffff;
   --scrollbar: #b6c9b4;
   color-scheme: light;
 }
@@ -254,8 +247,6 @@
   --shadow-md: 0 4px 14px rgba(70, 40, 15, 0.1);
   --shadow-lg: 0 18px 48px rgba(70, 40, 15, 0.18);
   --overlay: rgba(58, 34, 14, 0.3);
-
-  --mark-ink: #ffffff;
   --scrollbar: #d5c0ab;
   color-scheme: light;
 }
@@ -294,8 +285,6 @@
   --shadow-md: 0 4px 14px rgba(40, 30, 60, 0.1);
   --shadow-lg: 0 18px 48px rgba(40, 30, 60, 0.18);
   --overlay: rgba(34, 26, 52, 0.3);
-
-  --mark-ink: #ffffff;
   --scrollbar: #c8bad9;
   color-scheme: light;
 }
@@ -407,10 +396,13 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
 .logo { display: inline-flex; align-items: center; gap: 9px; min-width: 0; }
 .logo-mark {
   flex: none; display: inline-flex;
+  /* one ink for the whole mark. The mark outlines itself in currentColor, so it
+     needs no separate fill color; the old --mark-ink token painted the inner
+     paths white on a white page, which erased the caret. */
   color: var(--text);
 }
 .logo-mark svg { width: 26px; height: 26px; display: block; }
-.logo-mark path { stroke: var(--mark-ink); }
+.logo-mark svg * { stroke: currentColor; }
 .logo-text {
   font-size: 15px; font-weight: 600; letter-spacing: -0.2px;
   color: var(--text); white-space: nowrap;
