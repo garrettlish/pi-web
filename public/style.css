@@ -1239,11 +1239,11 @@ details.item-thinking[open] > summary { margin-bottom: 4px; }
 .tc-diff .dline.dfile { font-weight: 600; }
 .tc-diff .dline.dmeta { color: var(--text-3); font-style: italic; }
 .tc-diff .dline.dskip { color: var(--text-3); }
-.tc-diff-section {
-  padding: 6px 0; overflow-x: auto;
-  background: var(--code); border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-}
+/* The diff is a section like any other: the wrapper only groups the label with
+   its block. The frame comes from the .tc-text the diff is drawn on, so a diff
+   and a request/response block sit in one identical card each — an outer frame
+   here would put the diff in a box inside a box. */
+.tc-diff-section { overflow-x: auto; }
 
 /* ---------------------------------------------------------------------------
    Composer
