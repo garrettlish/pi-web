@@ -1744,6 +1744,64 @@ function collectUserPrompts() {
   return prompts;
 }
 
+/** The turn that concludes a run: stopReason says the model finished (or was
+ *  truncated by the length cap), as opposed to toolUse (the loop was still
+ *  going), deferred (the provider's answer is still being retrieved) or
+ *  aborted/error (the run was cut off). A run that did not settle has no
+ *  summary. */
+function isRunSettled(item) {
+  const stop = item.meta && item.meta.stopReason;
+  return stop === "stop" || stop === "length";
+}
+
+/** Whether a turn carries an answer at all — thinking and tool calls alone are
+ *  not something to land a reader on. */
+function hasAnswerText(item) {
+  return (item.blocks || []).some((b) => b.type === "text" && (b.text || "").trim());
+}
+
+/** Which block inside the summary turn to land on: its last answer text, so a
+ *  turn that ends in a tool card still lands on the words above it. */
+function summaryAnchorBlock(item) {
+  const blocks = item.blocks || [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (b.type === "text" && (b.text || "").trim()) return i;
+  }
+  return 0;
+}
+
+/** Map each user prompt to the summary of its run. Built in one pass so the
+ *  outline does not rescan state.items once per entry.
+ *
+ *  A run is everything between two user prompts, and its summary is the last
+ *  turn of that run. The row is offered only when that turn both settled and
+ *  carries answer text: a run still streaming, aborted or failed, cut off mid
+ *  tool loop, or ended on an empty response has nothing to jump to, and a dead
+ *  shortcut is worse than no row. */
+function buildReplyJumpMap() {
+  const map = new Map(); // user item -> { item, blockIdx }
+  let pending = null;
+  let last = null;
+  const settle = () => {
+    if (pending && last && !last.streaming && isRunSettled(last) && hasAnswerText(last)) {
+      map.set(pending, { item: last, blockIdx: summaryAnchorBlock(last) });
+    }
+    pending = null;
+    last = null;
+  };
+  for (const item of state.items) {
+    if (item.kind === "user") {
+      settle();
+      pending = item;
+    } else if (pending && item.kind === "assistant") {
+      last = item;
+    }
+  }
+  settle();
+  return map;
+}
+
 function renderPromptList() {
   const pop = $("#prompt-list-pop");
   pop.innerHTML = "";
@@ -1752,9 +1810,10 @@ function renderPromptList() {
     pop.append(el("div", { class: "pl-empty", text: "no user prompts in this session yet" }));
     return;
   }
+  const replies = buildReplyJumpMap();
   prompts.forEach((item, n) => {
     const text = (item.text || "").replace(/\s+/g, " ").trim() || "(images only)";
-    pop.append(
+    const group = el("div", { class: "pl-group" },
       el("div", {
         class: "pl-entry",
         title: item.text || "",
@@ -1768,6 +1827,29 @@ function renderPromptList() {
         el("span", { class: "pl-time", text: item.ts ? fmtTime(item.ts) : "" })
       )
     );
+    // Indented second row: the prompt above answers "what did I ask", this one
+    // answers "where did pi conclude", which is otherwise a long scroll past the
+    // run's tool cards. A run that was interrupted before concluding has no
+    // summary, so it gets no row rather than a dead shortcut.
+    const summary = replies.get(item);
+    if (summary) {
+      const stamp = summary.item.ts ? fmtTime(summary.item.ts) : "";
+      group.append(
+        el("button", {
+          class: "pl-jump",
+          title: "Jump to pi's summary of this prompt",
+          onclick: () => {
+            setPromptListOpen(false);
+            scrollToSummary(summary);
+          },
+        },
+          el("span", { class: "pl-jump-arrow", text: "↳" }),
+          el("span", { class: "pl-jump-label", text: "summary" }),
+          el("span", { class: "pl-jump-time", text: stamp })
+        )
+      );
+    }
+    pop.append(group);
   });
 }
 
@@ -1779,6 +1861,23 @@ function scrollToUserPrompt(item) {
   if (!node || !node.isConnected) return;
   node.scrollIntoView({ block: "start", behavior: "smooth" });
   flashNode(node);
+}
+
+/** Jump to the answer text inside a run's summary turn. Scrolling the whole
+ *  item to its top is not enough: the turn's tool cards can run for screens, so
+ *  the answer is far below the head the item would land on. */
+function scrollToSummary(summary) {
+  const item = summary.item;
+  // reconcile first when the turn is unsaved or not yet in the DOM, so the
+  // block index below refers to the nodes actually on screen
+  if (item.dirty || !item.node || !item.node.isConnected) renderTranscript({ follow: false });
+  const box = item.node;
+  if (!box || !box.isConnected) return;
+  const blocksEl = box.querySelector(".blocks");
+  const blockNode = blocksEl ? blocksEl.children[summary.blockIdx] : null;
+  const target = blockNode && blockNode.isConnected ? blockNode : box;
+  target.scrollIntoView({ block: "start", behavior: "smooth" });
+  flashNode(target);
 }
 
 /** brief highlight drawing the eye to a node that was just jumped to */

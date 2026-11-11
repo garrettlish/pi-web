@@ -152,7 +152,10 @@ pi-web --cwd ~/code/my-project
   updated as each assistant message completes, not only when a run ends — with a session-details
   popover for the session title, full path, session id, cwd and token breakdown.
 - The list button in the header outlines every user prompt in the session; clicking an entry
-  scrolls the transcript to that message.
+  scrolls the transcript to that message. Each entry carries an indented second row that jumps to
+  the run's summary — the concluding answer after the tool loop, landing on its text rather than on
+  a turn whose tool cards can run for screens. A run that was interrupted (aborted or failed) has no
+  summary, so it shows no such row.
 - Attach images to the next message either way: drop files anywhere on the page, or use the
   image button beside the composer hint to pick them from the OS file dialog (both paths accept
   image files only and land in the same thumbnail row); click a thumbnail to enlarge it. Images

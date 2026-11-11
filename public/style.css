@@ -627,6 +627,22 @@ body.resizing iframe, body.resizing .tc-json, body.resizing .tc-text { pointer-e
 }
 #prompt-list-pop .pl-text { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #prompt-list-pop .pl-time { flex: none; color: var(--text-secondary); font-size: 10px; }
+/* second row of an entry: a jump to the run's summary. Indented to line up
+   under the prompt text (entry padding 10px + num column 22px + 10px gap), so
+   the pair reads as one item with a subordinate action rather than two prompts */
+#prompt-list-pop .pl-group { border-radius: var(--radius-sm); }
+#prompt-list-pop .pl-jump {
+  display: flex; align-items: baseline; gap: 6px;
+  margin: 0 10px 2px 42px; padding: 2px 6px; text-align: left;
+  background: transparent; border-color: transparent;
+  color: var(--text-secondary); font-size: 11px; font-weight: 400;
+}
+#prompt-list-pop .pl-jump:hover {
+  background: var(--primary-soft); border-color: transparent; color: var(--primary-hover);
+}
+#prompt-list-pop .pl-jump-arrow { flex: none; color: var(--primary); }
+#prompt-list-pop .pl-jump-label { flex: 1 1 auto; min-width: 0; }
+#prompt-list-pop .pl-jump-time { flex: none; font-size: 10px; opacity: 0.8; }
 /* brief highlight on a message a prompt-outline or search hit jumps to */
 .prompt-flash { animation: prompt-flash 1.5s ease-out; }
 @keyframes prompt-flash {
@@ -635,6 +651,13 @@ body.resizing iframe, body.resizing .tc-json, body.resizing .tc-text { pointer-e
   100% { box-shadow: inset 0 0 0 2px transparent; }
 }
 .topbar-right { display: flex; align-items: center; gap: 8px; flex: none; }
+/* reads-only session badges (context, cost) sit next to interactive buttons in
+   this row; a hairline keeps the two groups from looking like one strip of
+   controls of the same kind */
+.topbar-sep {
+  flex: none; width: 1px; height: 18px; margin: 0 2px;
+  background: var(--border); pointer-events: none;
+}
 
 /* Header pickers (model, thinking level): in-app listboxes, not native
    <select>. A native popup is drawn by the OS, so near the top of the window
@@ -1580,6 +1603,7 @@ select:focus-visible,
 #input:focus-visible,
 .search-tabs button:focus-visible,
 #search-input:focus-visible,
+#prompt-list-pop .pl-jump:focus-visible,
 .session-item:focus-visible,
 .ws-item:focus-visible,
 #sidebar .sidebar-tabs button:focus-visible,
