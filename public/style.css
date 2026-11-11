@@ -626,15 +626,24 @@ body.resizing iframe, body.resizing .tc-json, body.resizing .tc-text { pointer-e
   color: var(--text-secondary); font-size: 10px; font-weight: 700;
 }
 #prompt-list-pop .pl-text { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#prompt-list-pop .pl-time { flex: none; color: var(--text-secondary); font-size: 10px; }
+#prompt-list-pop .pl-time {
+  flex: none; color: var(--text-secondary); font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
 /* second row of an entry: a jump to the run's summary. Indented to line up
    under the prompt text (entry padding 10px + num column 22px + 10px gap), so
    the pair reads as one item with a subordinate action rather than two prompts */
 #prompt-list-pop .pl-group { border-radius: var(--radius-sm); }
 #prompt-list-pop .pl-jump {
   display: flex; align-items: baseline; gap: 6px;
-  margin: 0 10px 2px 42px; padding: 2px 6px; text-align: left;
-  background: transparent; border-color: transparent;
+  /* right padding 0 and no border (the global button adds one) so both rows'
+     timestamps end on the same right edge of the popover: the prompt row's
+     content edge is 10px in, which is exactly this row's right margin.
+     A <button> shrinks to fit even as a flex container, so the width must be
+     stated for the time to reach that edge. */
+  width: calc(100% - 52px);
+  margin: 0 10px 2px 42px; padding: 2px 0 2px 6px; text-align: left;
+  background: transparent; border: 0;
   color: var(--text-secondary); font-size: 11px; font-weight: 400;
 }
 #prompt-list-pop .pl-jump:hover {
