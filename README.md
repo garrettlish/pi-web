@@ -155,6 +155,14 @@ pi-web --cwd ~/code/my-project
 - Context-window usage (used / max / percent), session cost and token totals in the header —
   updated as each assistant message completes, not only when a run ends — with a session-details
   popover for the session title, full path, session id, cwd and token breakdown.
+- The settings button at the right of the `pi running` status row opens a centered, near-full-window
+  read-only inspector with three tabs: **Models** (every configured model with its provider/id,
+  context window, output cap, per-million-token costs, API dialect, accepted input types and whether
+  it is the current one), **Skills** (each skill pi discovered for this session, with scope, origin,
+  description and `SKILL.md` path) and **MCPs**. The MCP tab asks the
+  server to run `pi mcp list --json` in the session's workspace, so it shows live connection state,
+  scope, exposure, transport, an auth provider, the tools each server offers as chips and the error
+  or stderr tail of a failed one; reopen it or click the tab again to re-read.
 - The list button in the header outlines every user prompt in the session; clicking an entry
   scrolls the transcript to that message. Each entry carries an indented second row that jumps to
   the run's summary — the concluding answer after the tool loop, landing on its text rather than on
@@ -219,6 +227,7 @@ localhost-only by default.
 | `GET /api/sessions` | List sessions with live active/streaming flags |
 | `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
+| `GET /api/mcp?client=<id>` | MCP server state as `pi mcp list --json` reports it, run in that client's session workspace; `{ servers, errors }`, where a disconnected server still returns 200 with its state and error |
 
 ## Configuration
 

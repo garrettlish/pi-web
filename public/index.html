@@ -72,6 +72,10 @@
       <div id="session-list" class="session-list"></div>
       <div id="sidebar-foot">
         <div id="pi-status" class="pi-status">connecting…</div>
+        <button id="btn-resources" class="ghost icon-btn" title="Models, skills and MCP servers"
+                aria-label="Models, skills and MCP servers" aria-haspopup="dialog" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
       </div>
     </aside>
 
@@ -221,6 +225,31 @@
         <span class="dim">All terms must match · newest first</span>
         <span class="spacer"></span>
         <span class="dim search-keys"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- resource inspector: centered and modal, because a sidebar-anchored
+       popover could only be as wide as the sidebar and every row ended as an
+       ellipsis. It shows the same three read-only lists as before. -->
+  <div id="resources-overlay" class="hidden">
+    <div id="resources-dialog" role="dialog" aria-modal="true" aria-labelledby="res-title">
+      <div class="res-head">
+        <span id="res-title">Models, skills and MCP servers</span>
+        <div id="res-tabs" class="res-tabs" role="tablist" aria-label="What to list">
+          <button id="res-tab-models" class="active" role="tab" aria-selected="true">Models</button>
+          <button id="res-tab-skills" role="tab" aria-selected="false">Skills</button>
+          <button id="res-tab-mcps" role="tab" aria-selected="false">MCPs</button>
+        </div>
+        <span class="spacer"></span>
+        <span class="dim" id="res-count"></span>
+        <button id="res-close" class="ghost" title="Close (Esc)">✕</button>
+      </div>
+      <div id="res-body" class="res-body"></div>
+      <div class="res-foot">
+        <span class="dim" id="res-hint"></span>
+        <span class="spacer"></span>
+        <span class="dim search-keys"><kbd>Esc</kbd> close</span>
       </div>
     </div>
   </div>

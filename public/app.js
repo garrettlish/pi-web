@@ -106,6 +106,8 @@ const state = {
   modelPickedAt: 0,
   models: [],
   commands: [], // discoverable slash commands (extension commands, prompt templates, skills)
+  mcps: null, // { servers, errors } from /api/mcp; null = not fetched yet
+  mcpsAt: 0, // when that snapshot was taken
   thinkingLevel: null,
   thinkingLevels: [],
   stats: null,
@@ -1997,6 +1999,225 @@ promptListBtn.addEventListener("click", (e) => {
 $("#prompt-list-pop").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("click", () => setPromptListOpen(false));
 
+// ---------------------------------------------------------------------------
+// resources panel (Models / Skills / MCPs)
+// ---------------------------------------------------------------------------
+// The status row at the bottom of the sidebar is the one place that always
+// describes the agent process itself, so the button that explains what that
+// process has loaded lives there. It opens a centered modal rather than a
+// sidebar-anchored popover: these lists are long and every row carries a path,
+// a description and a set of numbers, none of which fit in a sidebar column.
+// Everything is read-only: this is an inspector for what pi discovered, not a
+// settings editor.
+const resourcesBtn = $("#btn-resources");
+const resourcesOverlay = $("#resources-overlay");
+const resourcesBody = $("#res-body");
+const RES_TABS = ["models", "skills", "mcps"];
+const RES_HINT = {
+  models: "Models come from the running agent, already filtered by enabledModels in settings.json",
+  skills: "Skills pi advertises to the model; the body loads only when a task needs it",
+  mcps: "From `pi mcp list --json`, run in this session's workspace; click the tab again to re-read",
+};
+let resTab = "models";
+let resLoading = null; // in-flight MCP fetch, so a second tab click does not spawn a second `pi mcp list`
+let resReturnFocus = null;
+
+function setResourcesOpen(open) {
+  resourcesOverlay.classList.toggle("hidden", !open);
+  resourcesBtn.setAttribute("aria-expanded", String(open));
+  if (!open) {
+    if (resReturnFocus && resReturnFocus.isConnected) resReturnFocus.focus({ preventScroll: true });
+    return;
+  }
+  resReturnFocus = document.activeElement;
+  $("#res-close").focus({ preventScroll: true });
+  if (!(state.models || []).length) loadModels(); // a tab opened before a session existed
+  renderResources();
+  // Server state is the one thing that has to be asked for, is slow (it
+  // connects every server), and goes stale (sign-in, edits, crashes), so it is
+  // refetched on open rather than kept for the life of the page.
+  if (resTab === "mcps" && Date.now() - (state.mcpsAt || 0) > 60000) loadMcps({ refresh: true });
+}
+
+function setResTab(tab) {
+  if (!RES_TABS.includes(tab)) return;
+  const again = resTab === tab;
+  resTab = tab;
+  for (const t of RES_TABS) {
+    const btn = $(`#res-tab-${t}`);
+    btn.classList.toggle("active", t === tab);
+    btn.setAttribute("aria-selected", String(t === tab));
+  }
+  // clicking the tab already showing is the only way to ask for a fresh read
+  if (tab === "mcps") loadMcps({ refresh: again || state.mcps == null });
+  renderResources();
+}
+
+async function loadMcps({ refresh = false } = {}) {
+  if (resLoading) return resLoading;
+  if (state.mcps && !refresh) return;
+  state.mcps = null;
+  renderResources();
+  resLoading = api(`/api/mcp?client=${encodeURIComponent(CLIENT_ID)}`)
+    .then((res) => {
+      state.mcps = res;
+      state.mcpsAt = Date.now();
+    })
+    .catch((err) => {
+      state.mcps = { servers: [], errors: [{ message: err.message }], unavailable: true };
+      state.mcpsAt = Date.now();
+    })
+    .finally(() => {
+      resLoading = null;
+      // the panel may have been closed or switched while this was in flight
+      if (!resourcesOverlay.classList.contains("hidden") && resTab === "mcps") renderResources();
+    });
+  return resLoading;
+}
+
+function resTag(text, kind = "") {
+  return el("span", { class: `res-tag ${kind}`.trim(), text });
+}
+
+/** One uniform row: name on the left, a state tag on the right, then the
+ *  detail lines the dialog has room for. `facts` renders as uppercase
+ *  key/value pairs that wrap side by side; `tools` as chips. Every value
+ *  arrives from pi or mcp.json, so it is set as text and never as markup. */
+function resItem({ name, tag, sub, desc, facts, tools, error }) {
+  const factNodes = (facts || [])
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => el("span", { class: "res-fact" }, el("b", { text: k }), el("span", { text: String(v) })));
+  return el(
+    "div",
+    { class: "res-item" },
+    el("div", { class: "res-line" }, el("span", { class: "res-name", text: name, title: name }), tag || null),
+    sub ? el("div", { class: "res-sub", text: sub, title: sub }) : null,
+    desc ? el("div", { class: "res-desc", text: desc }) : null,
+    factNodes.length ? el("div", { class: "res-facts" }, factNodes) : null,
+    tools?.length ? el("div", { class: "res-tools" }, tools.map((t) => el("span", { class: "res-tool", text: t }))) : null,
+    error ? el("div", { class: "res-error", text: error }) : null
+  );
+}
+
+function renderModels() {
+  const models = state.models || [];
+  if (!models.length) return [el("div", { class: "res-empty", text: "no models reported yet — open a session first" })];
+  // the current model first: it is what the next prompt will use, and the list
+  // is long enough that finding it by scrolling is the wrong default
+  const sorted = models.slice().sort((a, b) => {
+    const cur = Number(sameModel(b, state.model)) - Number(sameModel(a, state.model));
+    if (cur) return cur;
+    return `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`);
+  });
+  return sorted.map((m) => {
+    const cost = m.cost || {};
+    const money = (n) => (n == null ? "—" : `$${n}`);
+    return resItem({
+      name: m.name || m.id,
+      tag: sameModel(m, state.model) ? resTag("current", "current") : m.reasoning ? resTag("reasoning") : null,
+      sub: `${m.provider}/${m.id}`,
+      facts: [
+        ["ctx", m.contextWindow ? fmtNum(m.contextWindow) : "—"],
+        ["max out", m.maxTokens ? fmtNum(m.maxTokens) : "—"],
+        ["in /M", money(cost.input)],
+        ["out /M", money(cost.output)],
+        ["cache r/w", `${money(cost.cacheRead)} / ${money(cost.cacheWrite)}`],
+        ["api", m.api],
+        ["input", Array.isArray(m.input) ? m.input.join(", ") : null],
+        ["thinking", m.thinkingLevels?.length ? m.thinkingLevels.join(", ") : null],
+      ],
+    });
+  });
+}
+
+function renderSkills() {
+  const skills = (state.commands || []).filter((c) => c.source === "skill");
+  if (!skills.length) return [el("div", { class: "res-empty", text: "no skills discovered for this session" })];
+  return skills.map((c) => {
+    const info = c.sourceInfo || {};
+    return resItem({
+      name: c.name.replace(/^skill:/, ""),
+      tag: resTag(info.scope || "skill"),
+      sub: info.path || "",
+      desc: c.description || "",
+      facts: [
+        ["origin", info.origin],
+        ["from", info.source],
+        ["package", info.package],
+      ],
+    });
+  });
+}
+
+function renderMcps() {
+  const data = state.mcps;
+  if (!data) return [el("div", { class: "res-empty", text: resLoading ? "asking pi about its MCP servers…" : "loading…" })];
+  const nodes = [];
+  if (data.unavailable) {
+    nodes.push(el("div", { class: "res-empty", text: "could not read MCP server state from pi" }));
+  }
+  for (const e of data.errors || []) {
+    nodes.push(resItem({ name: "configuration error", tag: resTag("invalid", "bad"), error: e.message || JSON.stringify(e) }));
+  }
+  for (const s of data.servers || []) {
+    const state = s.state === "connected" ? "ok" : s.state === "needs-auth" ? "warn" : s.enabled === false ? "" : "bad";
+    const label = s.enabled === false ? "disabled" : s.state === "connected" ? "connected" : s.state === "needs-auth" ? "sign in" : s.state || "unknown";
+    nodes.push(
+      resItem({
+        name: s.name,
+        tag: resTag(label, state),
+        sub: s.transport || "",
+        facts: [
+          ["scope", s.scope],
+          ["exposure", s.exposure],
+          ["auth", s.authProvider],
+          ["source", s.source],
+          ["resources", s.resources ? "yes" : null],
+          ["tool exposure", s.toolExposure ? Object.entries(s.toolExposure).map(([k, v]) => `${k}=${v}`).join(", ") : null],
+        ],
+        tools: s.tools || [],
+        error: s.error || null,
+      })
+    );
+  }
+  if (!nodes.length) {
+    nodes.push(
+      el("div", { class: "res-empty", text: "no MCP servers configured\nadd them to ~/.pi/agent/mcp.json or .pi/mcp.json" })
+    );
+  }
+  if (data.note) nodes.push(el("div", { class: "res-error", text: data.note }));
+  return nodes;
+}
+
+function renderResources() {
+  const body = resourcesBody;
+  const keepScroll = body.scrollTop;
+  body.replaceChildren();
+  const items = resTab === "models" ? renderModels() : resTab === "skills" ? renderSkills() : renderMcps();
+  const count =
+    resTab === "models"
+      ? `${(state.models || []).length} models`
+      : resTab === "skills"
+        ? `${(state.commands || []).filter((c) => c.source === "skill").length} skills`
+        : state.mcps
+          ? `${(state.mcps.servers || []).length} servers`
+          : "";
+  $("#res-count").textContent = count;
+  $("#res-hint").textContent = RES_HINT[resTab];
+  for (const item of items) body.append(item);
+  body.scrollTop = keepScroll;
+}
+
+resourcesBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  setResourcesOpen(resourcesOverlay.classList.contains("hidden"));
+});
+// clicks inside the dialog must not reach the overlay's click-away handler
+$("#resources-dialog").addEventListener("click", (e) => e.stopPropagation());
+resourcesOverlay.addEventListener("click", () => setResourcesOpen(false));
+$("#res-close").addEventListener("click", () => setResourcesOpen(false));
+for (const t of RES_TABS) $(`#res-tab-${t}`).addEventListener("click", () => setResTab(t));
+
 function renderStatus() {
   const bar = $("#status-bar");
   if (state.isStreaming) {
@@ -2789,6 +3010,8 @@ async function loadModels({ retry = false } = {}) {
     if (done) break;
     await new Promise((r) => setTimeout(r, 2500));
   }
+  // the resources panel may be open on the model list this just filled in
+  if (!resourcesOverlay.classList.contains("hidden") && resTab === "models") renderResources();
 }
 
 /** pi's get_commands lists every discoverable command (extension commands,
@@ -2800,6 +3023,8 @@ async function loadCommands() {
   } catch {
     state.commands = []; // older pi without get_commands: autocomplete off, prompts still work
   }
+  // the resources panel may be showing the skill list this just replaced
+  if (!resourcesOverlay.classList.contains("hidden") && resTab === "skills") renderResources();
 }
 
 async function sendPrompt() {
@@ -4124,6 +4349,8 @@ document.addEventListener("keydown", (e) => {
       setSessionInfoOpen(false);
     } else if (!$("#prompt-list-pop").classList.contains("hidden")) {
       setPromptListOpen(false);
+    } else if (!resourcesOverlay.classList.contains("hidden")) {
+      setResourcesOpen(false);
     } else if (!searchOverlay.classList.contains("hidden")) {
       setSearchOpen(false);
     } else if (!$("#ws-overlay").classList.contains("hidden")) {

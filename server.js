@@ -553,6 +553,68 @@ function filterConfiguredModels(models, patterns) {
 }
 
 // ---------------------------------------------------------------------------
+// MCP server state (resources panel)
+// ---------------------------------------------------------------------------
+
+const MCP_LIST_TIMEOUT_MS = 20000;
+
+/** Run `pi mcp list --json` and return its parsed report.
+ *
+ *  pi keeps this command out of RPC mode: connection state, per-server tools
+ *  and the tail of a failing server's stderr only exist in the shell command,
+ *  and it works without a session. A disconnected server makes the command
+ *  exit 1 while still printing valid JSON, so the exit code is not the test —
+ *  parseable output is. Arguments are passed as an array, never through a
+ *  shell, and the child inherits no stdin so it cannot block on a prompt.
+ *
+ *  `cwd` matters: a project `.pi/mcp.json` is only read from there, so the run
+ *  uses the workspace of the session the panel is describing. */
+function runPiMcpList(cwd = CWD) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let child;
+    try {
+      child = spawn(PI_BIN, ["mcp", "list", "--json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      resolve({ servers: [], errors: [{ message: err.message }], unavailable: true });
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, MCP_LIST_TIMEOUT_MS);
+    child.stdout.on("data", (c) => {
+      stdout += c.toString("utf8");
+      if (stdout.length > 4 * 1024 * 1024) child.kill("SIGKILL"); // a wedged server must not grow this forever
+    });
+    child.stderr.on("data", (c) => {
+      stderr = (stderr + c.toString("utf8")).slice(-4000);
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ servers: [], errors: [{ message: err.message }], unavailable: true });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(stdout);
+        resolve({
+          servers: Array.isArray(parsed.servers) ? parsed.servers : [],
+          errors: Array.isArray(parsed.errors) ? parsed.errors : [],
+          note: parsed.note,
+        });
+      } catch {
+        resolve({
+          servers: [],
+          errors: [{ message: `${signal ? `pi mcp list was killed (${signal})` : `pi mcp list exited ${code}`}${stderr ? `: ${stderr.trim()}` : ""}` }],
+          unavailable: true,
+        });
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Session history listing
 // ---------------------------------------------------------------------------
 
@@ -1170,6 +1232,24 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, { path: dir, parent, dirs, home: os.homedir() });
+      return;
+    }
+
+    // MCP server state for the resources panel. `pi mcp list --json` is the
+    // only source that reports live connection state, so it is run on demand
+    // rather than cached: a server can be signed in, edited or killed between
+    // two looks. It connects every enabled server, so the result is slow enough
+    // to need its own timeout, and a non-zero exit is normal when a server is
+    // merely disconnected — the JSON is still the answer.
+    if (pathname === "/api/mcp" && req.method === "GET") {
+      // The project half of the MCP config lives in the session's workspace, so
+      // describe the workspace this tab's agent is actually running in. That
+      // cwd was already trusted enough to spawn pi in (see /api/open), so this
+      // grants nothing new; without a client the server's own cwd is used.
+      const client = clients.get(url.searchParams.get("client") || "");
+      const proc = client && client.key ? procs.get(client.key) : null;
+      const out = await runPiMcpList(proc?.cwd || CWD);
+      sendJson(res, 200, out);
       return;
     }
 

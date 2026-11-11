@@ -563,6 +563,135 @@ body.resizing iframe, body.resizing .tc-json, body.resizing .tc-text { pointer-e
 .pi-status.ok { color: var(--success); }
 .pi-status.bad { color: var(--danger); }
 
+/* status row: the pi state on the left, the resources button on the right */
+#sidebar-foot {
+  display: flex; align-items: center; gap: 4px;
+  border-top: 1px solid var(--border); padding-right: 8px;
+}
+#sidebar-foot .pi-status { flex: 1 1 auto; min-width: 0; border-top: 0; }
+#sidebar-foot .pi-status.bad { white-space: normal; } /* a failed start must stay readable */
+#btn-resources { flex: none; }
+
+/* resource inspector: a centered modal, not a popover anchored to the button.
+   The button lives in the sidebar, so an anchored panel could never be wider
+   than that column, and every row (provider/id, skill path, a full
+   description) ended up as an ellipsis. Being modal also lets it use most of
+   the window, which is what a list of this length wants. */
+#resources-overlay {
+  position: fixed; inset: 0; z-index: 75;
+  display: flex; align-items: center; justify-content: center;
+  padding: 2vh 2vw;
+  background: var(--overlay);
+  backdrop-filter: blur(6px);
+}
+#resources-dialog {
+  display: flex; flex-direction: column; overflow: hidden;
+  /* as large as the window allows: the skill list alone is often 70 rows, and
+     every row is only useful when its path and description fit on one line.
+     100% of the overlay's content box is the largest a centered dialog can be
+     without hiding part of itself off-screen. */
+  width: 100%; max-width: 1500px;
+  height: 100%; max-height: 1100px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+  font-family: var(--font-ui); font-size: 12px;
+}
+.res-head {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding: 12px 14px 12px 18px; border-bottom: 1px solid var(--border);
+  background: var(--grad-soft);
+}
+#res-title { font-size: 14px; font-weight: 700; }
+.res-head .dim { font-weight: 400; font-size: 12px; }
+#res-close { flex: none; padding: 2px 8px; }
+/* tab strip: same segmented-control language as the search dialog */
+#resources-dialog .res-tabs {
+  display: flex; gap: 3px; flex: none; padding: 2px;
+  background: var(--surface-base); border: 1px solid var(--border); border-radius: 999px;
+}
+#resources-dialog .res-tabs button {
+  padding: 2px 14px; border-radius: 999px;
+  background: transparent; border-color: transparent;
+  color: var(--text-secondary); font-size: 12px; font-weight: 400;
+}
+#resources-dialog .res-tabs button:hover {
+  background: var(--primary-soft); border-color: transparent; color: var(--primary-hover);
+}
+#resources-dialog .res-tabs button.active {
+  background: var(--grad-brand); border-color: transparent;
+  color: #fff; font-weight: 700; box-shadow: 0 2px 8px var(--accent-glow);
+}
+#resources-dialog .res-head #res-close {
+  background: transparent; border-color: transparent; color: var(--text-secondary);
+}
+#resources-dialog .res-head #res-close:hover {
+  background: transparent; border-color: var(--border); color: var(--text);
+}
+.res-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 14px; }
+.res-empty { padding: 28px 12px; text-align: center; color: var(--text-secondary); white-space: pre-wrap; }
+.res-item { padding: 9px 10px; border-radius: var(--radius-sm); }
+.res-item + .res-item { border-top: 1px solid var(--border); }
+.res-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.res-name {
+  flex: 1 1 auto; min-width: 0; font-weight: 700; color: var(--text); font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.res-sub {
+  margin-top: 3px; color: var(--text-secondary); font-family: var(--mono);
+  font-size: 11px; word-break: break-all;
+}
+.res-desc { margin-top: 4px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+/* key/value pairs under a row: the dialog is wide, so these sit side by side
+   instead of stacking into one long grey paragraph */
+.res-facts { display: flex; flex-wrap: wrap; gap: 2px 18px; margin-top: 5px; }
+.res-fact { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 11px; }
+.res-fact b {
+  flex: none; font-weight: 400; font-size: 10px; letter-spacing: 0.4px;
+  text-transform: uppercase; color: var(--text-secondary);
+}
+.res-fact span { font-family: var(--mono); color: var(--text); word-break: break-all; }
+.res-tag {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+  background: var(--surface-elev); color: var(--text-secondary);
+}
+.res-tag.ok { color: var(--success); border-color: var(--success-soft); background: var(--success-soft); }
+.res-tag.warn { color: var(--warning); border-color: var(--warning-soft); background: var(--warning-soft); }
+.res-tag.bad { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
+.res-tag.current { color: var(--primary-hover); border-color: var(--primary-soft-border); background: var(--primary-soft); }
+.res-error {
+  margin-top: 5px; padding: 5px 8px; border-radius: var(--radius-sm);
+  background: var(--danger-soft); color: var(--danger);
+  font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-word;
+}
+/* the tool names of a connected server: chips read faster than a comma list */
+.res-tools { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.res-tool {
+  font-family: var(--mono); font-size: 10px; padding: 1px 7px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-base); color: var(--text-secondary);
+}
+.res-foot {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding: 8px 14px; border-top: 1px solid var(--border);
+  color: var(--text-secondary); font-size: 11px;
+}
+.res-foot kbd {
+  font-family: var(--mono); font-size: 10px; padding: 1px 5px; margin-right: 3px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--surface-elev);
+}
+@media (max-width: 560px) {
+  /* the title is static; the tabs, the count and the close button all carry
+     more per pixel, so the title yields on a phone-sized window */
+  #res-title { display: none; }
+  #resources-overlay { padding: 0; }
+  /* 100%, not 100vw/100vh: the overlay is already inset to the viewport, and
+     the viewport units include the scrollbar, which would push the dialog
+     off-screen by its width */
+  #resources-dialog { width: 100%; height: 100%; border-radius: 0; border: 0; }
+  .res-foot .search-keys { display: none; }
+}
+
 /* ---------------- main ---------------- */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 

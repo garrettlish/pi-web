@@ -353,6 +353,15 @@ try {
   check("/api/config reports a cwd", typeof config.cwd === "string" && config.cwd.length > 0);
   check("/api/config reports the pi binary", typeof config.piBin === "string" && config.piBin.length > 0);
 
+  // The resources panel reads MCP state through `pi mcp list --json`, which pi
+  // can answer with no servers configured, with servers that fail to connect,
+  // or (when pi is missing) not at all. All three are 200s with a servers/errors
+  // pair: a disconnected server is a state to display, not a failed request.
+  const mcpRes = await fetch(`${BASE}/api/mcp`);
+  const mcp = await mcpRes.json().catch(() => ({}));
+  check("/api/mcp answers with a server list", mcpRes.status === 200 && Array.isArray(mcp.servers), `got ${mcpRes.status}`);
+  check("/api/mcp answers with an errors list", Array.isArray(mcp.errors), JSON.stringify(mcp).slice(0, 200));
+
   const sessions = await (await fetch(`${BASE}/api/sessions`)).json();
   check("/api/sessions returns a list", Array.isArray(sessions.sessions));
 
