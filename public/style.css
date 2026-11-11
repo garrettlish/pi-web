@@ -1463,6 +1463,29 @@ body.dropping #composer { background: var(--grad-soft); }
 }
 #search-count { font-weight: 400; font-size: 12px; }
 #search-close { flex: none; padding: 2px 8px; }
+/* scope tabs: "Everything" keeps the original corpus, "Prompts" narrows it.
+   Styled as a segmented control like the sidebar tabs, but sized for the wider
+   dialog so the two labels stay on one line. */
+.search-tabs {
+  display: flex; gap: 3px; flex: none;
+  margin-left: 6px; padding: 2px;
+  background: var(--surface-base);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.search-tabs button {
+  padding: 2px 12px; border-radius: 999px;
+  background: transparent; border-color: transparent;
+  color: var(--text-secondary); font-size: 12px; font-weight: 400;
+}
+.search-tabs button:hover {
+  background: var(--primary-soft); border-color: transparent; color: var(--primary-hover);
+}
+.search-tabs button.active {
+  background: var(--grad-brand); border-color: transparent;
+  color: #fff; font-weight: 700;
+  box-shadow: 0 2px 8px var(--accent-glow);
+}
 .search-input-row {
   display: flex; align-items: center; gap: 8px;
   padding: 10px 16px; border-bottom: 1px solid var(--border);
@@ -1533,6 +1556,10 @@ body.dropping #composer { background: var(--grad-soft); }
 }
 @media (max-width: 640px) {
   .search-keys { display: none; }
+  /* the dialog title and the scope tabs cannot share one narrow row; the tabs
+     carry more meaning than the static title, so the title yields */
+  #search-title { display: none; }
+  .search-tabs { margin-left: 0; }
 }
 
 /* scrollbars carry the brand ramp so long transcripts stay on-palette */
@@ -1551,6 +1578,7 @@ button:focus-visible,
 select:focus-visible,
 #session-filter:focus-visible,
 #input:focus-visible,
+.search-tabs button:focus-visible,
 #search-input:focus-visible,
 .session-item:focus-visible,
 .ws-item:focus-visible,

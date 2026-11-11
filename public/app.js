@@ -1360,7 +1360,7 @@ transcriptEl.addEventListener("click", (e) => {
   }).catch(() => toast("copy failed", "error"));
 });
 function renderTranscript({ follow = true } = {}) {
-  const nearBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 120;
+  const nearBottom = transcriptAtBottom();
   const nodes = [];
   for (const item of state.items) {
     if (!item.node || item.dirty) {
@@ -1406,9 +1406,12 @@ function scheduleRender() {
 function scrollBottom() {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
+/** within a screen of the bottom, i.e. the view is following the stream */
+function transcriptAtBottom() {
+  return transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 120;
+}
 function updateJumpButton() {
-  const nearBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 120;
-  $("#btn-jump").classList.toggle("hidden", nearBottom);
+  $("#btn-jump").classList.toggle("hidden", transcriptAtBottom());
 }
 transcriptEl.addEventListener("scroll", updateJumpButton);
 $("#btn-jump").addEventListener("click", scrollBottom);
@@ -2185,9 +2188,11 @@ async function loadSessions() {
 // ---------------------------------------------------------------------------
 // cross-session search
 // ---------------------------------------------------------------------------
-// The sidebar filter only matches a session's title (its first prompt). This
-// dialog queries the server's index, which covers every prompt, response, tool
-// request and tool result in every workspace, and jumps to the occurrence.
+// The search button beside the workspace button (or Cmd/Ctrl+K) opens this
+// dialog, which queries the server's index. Two tabs share it: "Everything"
+// covers every prompt, response, tool request and tool result in every
+// workspace; "Prompts" narrows the same index to what the user typed, so a
+// common word in tool output cannot bury the prompt that asked for it.
 const searchOverlay = $("#search-overlay");
 const searchInput = $("#search-input");
 const searchResultsEl = $("#search-results");
@@ -2198,6 +2203,18 @@ let searchIndex = 0;
 let searchTimer = null;
 let searchGen = 0; // guards against a slow earlier query overwriting a newer one
 let searchReturnFocus = null;
+// "all" | "prompts" — held in memory only, so a reload always starts from the
+// full corpus while switching tabs inside one tab of the app keeps the choice
+let searchScope = "all";
+
+const SEARCH_PLACEHOLDER = {
+  all: "Search prompts, responses and tool output in every workspace…",
+  prompts: "Search prompts in every workspace…",
+};
+const SEARCH_HINT = {
+  all: "Type to search every prompt, response and tool output",
+  prompts: "Type to search every prompt",
+};
 
 function searchRoleLabel(hit) {
   if (hit.role === "user") return "you";
@@ -2287,12 +2304,13 @@ async function runSearch(query) {
     searchHits = [];
     searchIndex = 0;
     searchCountEl.textContent = "";
-    renderSearchResults("Type to search every prompt, response and tool output");
+    renderSearchResults(SEARCH_HINT[searchScope]);
     return;
   }
   searchCountEl.textContent = "searching…";
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${SEARCH_LIMIT}`);
+    const scopeParam = searchScope === "prompts" ? "&scope=prompts" : "";
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${SEARCH_LIMIT}${scopeParam}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
     if (gen !== searchGen) return; // a newer query already took over
@@ -2395,6 +2413,27 @@ async function openSearchHit(hit) {
   await revealOccurrence(hit);
 }
 
+/** switch the search scope and re-run the current query under it; switching
+ *  without re-running would leave hits from the other scope on screen and make
+ *  a role pill ("result: grep") look like a bug in the Prompts tab */
+function setSearchScope(scope) {
+  if (searchScope === scope) return;
+  searchScope = scope;
+  const all = scope === "all";
+  $("#search-tab-all").classList.toggle("active", all);
+  $("#search-tab-all").setAttribute("aria-selected", String(all));
+  $("#search-tab-prompts").classList.toggle("active", !all);
+  $("#search-tab-prompts").setAttribute("aria-selected", String(!all));
+  searchInput.placeholder = SEARCH_PLACEHOLDER[scope];
+  searchIndex = 0;
+  if (searchTimer) clearTimeout(searchTimer); // the pending keystroke query would rerun the same text
+  searchTimer = null;
+  runSearch(searchInput.value);
+}
+
+$("#search-tab-all").addEventListener("click", () => setSearchScope("all"));
+$("#search-tab-prompts").addEventListener("click", () => setSearchScope("prompts"));
+
 searchInput.addEventListener("input", () => {
   searchIndex = 0;
   queueSearch();
@@ -2428,7 +2467,7 @@ document.addEventListener("keydown", (e) => {
     setSearchOpen(searchOverlay.classList.contains("hidden"));
   }
 });
-renderSearchResults("Type to search every prompt, response and tool output");
+renderSearchResults(SEARCH_HINT[searchScope]);
 
 // ---------------------------------------------------------------------------
 // actions
@@ -2621,10 +2660,37 @@ async function abort() {
 const viewCache = new Map(); // sessionFile -> { items, leafId }
 const VIEW_CACHE_MAX = 8;
 let switchGen = 0; // guards the optimistic switch against overlapping switches
+// Scroll position per session, keyed like viewCache but kept separately: the
+// offset stays meaningful even when the rendered view itself was not cached.
+const scrollCache = new Map(); // sessionFile -> { top, atBottom }
+const SCROLL_CACHE_MAX = 20;
 // Live events (message_start/message_end) append items without touching
 // state.leafId, so a stashed leafId would under-count the branch until the
 // next full refresh folds them in.
 let entriesDirty = false;
+
+/** Remember where this session's transcript was scrolled to. Called before
+ *  leaving a session, so returning to it lands on the same line. */
+function rememberScroll(file = state.sessionFile) {
+  if (!file) return;
+  scrollCache.set(file, { top: transcriptEl.scrollTop, atBottom: transcriptAtBottom() });
+  while (scrollCache.size > SCROLL_CACHE_MAX) scrollCache.delete(scrollCache.keys().next().value);
+}
+
+/** Put the transcript back where the session was left. A view that was
+ *  following the stream resumes following it, so messages that arrived while
+ *  the user was elsewhere are visible instead of leaving them mid-history. */
+function restoreScroll(file) {
+  const saved = file ? scrollCache.get(file) : null;
+  if (!saved) {
+    // never opened in this tab: start at the latest message, like a fresh load
+    scrollBottom();
+    return;
+  }
+  if (saved.atBottom) scrollBottom();
+  else transcriptEl.scrollTop = saved.top;
+  updateJumpButton();
+}
 
 /** Remember the current session's rendered transcript for fast switch-back. */
 function stashCurrentView() {
@@ -2664,7 +2730,7 @@ async function refreshCachedView(file) {
         await refreshMeta();
         renderHeader();
         renderStatus();
-        renderTranscript();
+        renderTranscript({ follow: false }); // the caller restores this session's offset
         return;
       }
     } catch {
@@ -2679,6 +2745,7 @@ async function switchSession(file, cwd) {
   const gen = ++switchGen;
   const prevFile = state.sessionFile;
   const prevView = { items: state.items, leafId: state.leafId };
+  rememberScroll(prevFile);
   stashCurrentView();
 
   // Optimistic switch: update highlight, hash and transcript area up front so
@@ -2689,17 +2756,19 @@ async function switchSession(file, cwd) {
   state.sessionFile = file;
   state.executions.clear();
   // queue chips belong to the previous session's process — leaving them set
-  // would keep showing the old session's queued messages after a switch
-  // (pi has no get_queue RPC, so this is the only source of truth)
+  // would keep showing the old session's queued messages after a switch. The
+  // server re-sends this session's queue once the tab re-attaches.
   state.queued = { steering: [], followUp: [] };
   state.isStreaming = false;
   state.isCompacting = false;
   currentAssistant = null;
   $("#composer-hint").textContent = "";
+  renderStatus(); // drop the previous session's queue chips now, not after the spawn
   const cached = viewCache.get(file);
   state.items = cached ? cached.items : [{ kind: "notice", text: "loading session…" }];
   state.leafId = cached ? cached.leafId : null;
   renderTranscript({ follow: false });
+  restoreScroll(file); // this session's own offset, not the previous session's
   renderFavoriteButton(); // the star reflects this session, not the previous one
   renderSidebar();
   syncHash();
@@ -2725,6 +2794,7 @@ async function switchSession(file, cwd) {
     await waitPiReady(file);
     if (gen !== switchGen) return;
     await refreshCachedView(file);
+    restoreScroll(file); // re-renders above may have moved the offset
     renderSidebar(); // re-render so the .active highlight follows the clicked row
   } catch (err) {
     if (gen !== switchGen) return;
@@ -2733,6 +2803,7 @@ async function switchSession(file, cwd) {
     state.items = prevView.items;
     state.leafId = prevView.leafId;
     renderTranscript({ follow: false });
+    restoreScroll(prevFile);
     renderFavoriteButton();
     renderSidebar();
     syncHash();
@@ -2748,6 +2819,7 @@ async function newSession() {
       return;
     }
     const cwd = state.workspace || state.cwd;
+    rememberScroll(); // the session being left keeps its offset
     stashCurrentView();
     const resp = await api("/api/open", {
       method: "POST",
@@ -2770,6 +2842,7 @@ async function newSession() {
     // fresh (empty) session, but this makes the reset visible without delay
     state.items = [];
     renderTranscript({ follow: false });
+    transcriptEl.scrollTop = 0;
     $("#composer-hint").textContent = "";
     await refresh({ sessions: true });
     syncHash();
@@ -2823,6 +2896,9 @@ function handleEvent(record) {
         $("#pi-status").className = "pi-status bad";
         $("#pi-status").onclick = restartPi;
         state.isStreaming = false;
+        // the queue died with the process; leaving the chips up would offer a
+        // per-item undo that cannot work
+        state.queued = { steering: [], followUp: [] };
         renderStatus();
       } else if (record.event === "pi_error") {
         $("#pi-status").textContent = `pi failed to start: ${record.error}`;

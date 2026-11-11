@@ -155,7 +155,7 @@ writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
     timestamp: "2026-02-02T00:00:03.000Z",
     message: {
       role: "assistant",
-      content: [{ type: "text", text: "the widgets are fine, and so is flibbertigibbet" }],
+      content: [{ type: "text", text: "the widgets are fine, and so is flibbertigibbet SEARCHRESPONSEONLY" }],
     },
   },
 ]);
@@ -174,6 +174,159 @@ server.stderr.on("data", (d) => (serverLog += d));
 
 function stopServer() {
   if (!server.killed) server.kill("SIGTERM");
+}
+
+/** Open an SSE stream and expose records as they arrive, so one stream can be
+ *  read across several assertions (a second reader on the same body throws). */
+async function sseClient(url) {
+  const ctl = new AbortController();
+  const res = await fetch(url, { signal: ctl.signal });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const queue = [];
+  const waiters = [];
+  let buffer = "";
+  let closed = false;
+  const wake = () => {
+    for (const w of waiters.splice(0)) w();
+  };
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const chunk = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          try {
+            queue.push(JSON.parse(line.slice(6)));
+          } catch {
+            continue; // keepalive or malformed frame
+          }
+          wake();
+        }
+      }
+    } catch {
+      // aborted by close()
+    }
+    closed = true;
+    wake();
+  })();
+  return {
+    /** Records up to and including the first one `predicate` accepts; empty
+     *  when the timeout expires or the stream ends first. */
+    async waitFor(predicate, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const i = queue.findIndex(predicate);
+        if (i >= 0) return queue.splice(0, i + 1);
+        const left = deadline - Date.now();
+        if (closed || left <= 0) return [];
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, left);
+          waiters.push(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    },
+    close() {
+      ctl.abort();
+    },
+  };
+}
+
+/** Queue snapshot on (re)attach, driven by test/fake-pi.js so it needs no
+ *  credentials. pi emits queue_update only when the queue changes, so without
+ *  the snapshot a tab that switches away and back keeps an empty dock while
+ *  the process still holds those messages. */
+async function queueSnapshotChecks() {
+  const port = PORT + 1;
+  const base = `http://127.0.0.1:${port}`;
+  const fakeBin = path.join(ROOT, "test", "fake-pi.js");
+  const child = spawn(
+    process.execPath,
+    [path.join(ROOT, "server.js"), "--port", String(port), "--session-dir", FIXTURE_DIR, "--pi", fakeBin],
+    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  let log = "";
+  child.stdout.on("data", (d) => (log += d));
+  child.stderr.on("data", (d) => (log += d));
+
+  const post = async (pathname, body) =>
+    (await fetch(`${base}${pathname}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).json();
+  const sessionA = path.join(FIXTURE_DIR, "--queue-ws-a--", "2026-03-01T00-00-00-000Z_qa.jsonl");
+  const sessionB = path.join(FIXTURE_DIR, "--queue-ws-b--", "2026-03-02T00-00-00-000Z_qb.jsonl");
+  // A session's process runs in the cwd its header records, so this fixture's
+  // cwd has to exist — otherwise the fake binary cannot be spawned at all.
+  writeFixture("--queue-ws-a--", path.basename(sessionA), [
+    { type: "session", version: 3, id: "qa", timestamp: "2026-03-01T00:00:00.000Z", cwd: FIXTURE_DIR },
+  ]);
+  writeFixture("--queue-ws-b--", path.basename(sessionB), [
+    { type: "session", version: 3, id: "qb", timestamp: "2026-03-02T00:00:00.000Z", cwd: FIXTURE_DIR },
+  ]);
+  const holdsQueued = (r) => Array.isArray(r?.steering) && r.steering.includes("QUEUED-ONE");
+
+  try {
+    for (let i = 0; i < 100; i++) {
+      try {
+        if ((await fetch(`${base}/api/health`)).ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    // One stream for the whole scenario: the server keeps a single live stream
+    // per client id, exactly like the app's one EventSource per tab.
+    const es = await sseClient(`${base}/api/events?client=q1`);
+    await es.waitFor((r) => r?.event === "hello", 3000);
+    await post("/api/open", { client: "q1", sessionFile: sessionA });
+    const steered = await post("/api/cmd", { client: "q1", type: "steer", message: "QUEUED-ONE" });
+    check("steer is accepted as queued", steered?.data?.disposition === "queued", JSON.stringify(steered).slice(0, 160));
+    const before = await es.waitFor(holdsQueued);
+    check("queue_update reaches the attached tab", before.some(holdsQueued), JSON.stringify(before).slice(0, 200));
+
+    // Switch to another session and back. The queue lives in session A's
+    // process; nothing in the switch produces a queue_update, so the re-attach
+    // has to replay the snapshot or the dock comes back empty.
+    await post("/api/open", { client: "q1", sessionFile: sessionB });
+    await post("/api/open", { client: "q1", sessionFile: sessionA });
+    const replay = await es.waitFor(holdsQueued);
+    check("re-attaching a session replays its pending queue", replay.some(holdsQueued), JSON.stringify(replay).slice(0, 200));
+
+    // An EventSource reconnect uses the same client id on a new stream; the
+    // tab missed nothing but must still be told what is pending.
+    es.close();
+    const reconnected = await sseClient(`${base}/api/events?client=q1`);
+    const afterReconnect = await reconnected.waitFor(holdsQueued, 3000);
+    check(
+      "a reconnected event stream replays the pending queue",
+      afterReconnect.some(holdsQueued),
+      JSON.stringify(afterReconnect).slice(0, 200)
+    );
+
+    await post("/api/cmd", { client: "q1", type: "clear_queue" });
+    const cleared = await reconnected.waitFor((r) => Array.isArray(r?.steering) && !r.steering.length, 5000);
+    check("clearing the queue is broadcast", cleared.length > 0, JSON.stringify(cleared).slice(0, 200));
+
+    // Nothing pending: a re-attach must stay silent rather than flash an
+    // empty dock back onto the screen.
+    reconnected.close();
+    const quiet = await sseClient(`${base}/api/events?client=q1`);
+    const snapshots = await quiet.waitFor((r) => Array.isArray(r?.steering), 800);
+    check("an empty queue sends no snapshot", snapshots.length === 0, JSON.stringify(snapshots).slice(0, 200));
+    quiet.close();
+  } finally {
+    child.kill("SIGTERM");
+    if (failures && log.trim()) console.error(`\nqueue-snapshot server log:\n${log.trim()}`);
+  }
 }
 
 try {
@@ -206,7 +359,7 @@ try {
   // Cross-session search: every channel (prompt, response, tool request, tool
   // result) is reachable, the system prompt and thinking blocks are not, and
   // the route sits behind the same localhost guards as everything else.
-  const search = async (q) => (await fetch(`${BASE}/api/search?q=${encodeURIComponent(q)}`)).json();
+  const search = async (q, extra = "") => (await fetch(`${BASE}/api/search?q=${encodeURIComponent(q)}${extra}`)).json();
   const both = await search("flibbertigibbet");
   check("/api/search returns a hits list", Array.isArray(both.hits));
   check("/api/search reports truncation state", typeof both.truncated === "boolean");
@@ -245,6 +398,36 @@ try {
   check("/api/search is case-insensitive", (await search("FLIBBERTIGIBBET")).hits.length === both.hits.length);
   const emptySearch = await search("");
   check("/api/search ignores an empty query", Array.isArray(emptySearch.hits) && emptySearch.hits.length === 0);
+
+  // scope=prompts narrows the same index to user prompts: agent-authored
+  // channels (responses, tool requests, tool results, subagent child output)
+  // must disappear, and prompts from every workspace must still be reachable.
+  const promptHits = await search("flibbertigibbet", "&scope=prompts");
+  check(
+    "/api/search scope=prompts returns only user prompts",
+    promptHits.hits.length > 0 && promptHits.hits.every((h) => h.role === "user"),
+    JSON.stringify(promptHits.hits.map((h) => h.role))
+  );
+  check(
+    "/api/search scope=prompts is narrower than the full corpus",
+    promptHits.hits.length < both.hits.length,
+    `${promptHits.hits.length} of ${both.hits.length}`
+  );
+  check(
+    "/api/search scope=prompts reaches prompts in every workspace",
+    new Set([...(await search("flibbertigibbet", "&scope=prompts")).hits, ...(await search("widgets", "&scope=prompts")).hits].map((h) => h.cwd))
+      .size === 2,
+    JSON.stringify(promptHits.hits.map((h) => h.cwd))
+  );
+  for (const [label, q] of [["tool-call arguments", "SEARCHTOOLARG"], ["tool results", "SEARCHTOOLOUT"], ["subagent child output", "SEARCHCHILDOUT"], ["responses", "SEARCHRESPONSEONLY"]]) {
+    check(`/api/search scope=prompts skips ${label}`, (await search(q, "&scope=prompts")).hits.length === 0);
+  }
+  check(
+    "/api/search scope=prompts finds a prompt in the other workspace",
+    (await search("widgets", "&scope=prompts")).hits.some((h) => h.cwd === "/tmp/ws-beta")
+  );
+  const unknownScope = await search("flibbertigibbet", "&scope=bogus");
+  check("/api/search treats an unknown scope as the full corpus", unknownScope.hits.length === both.hits.length);
   const searchCrossOrigin = await fetch(`${BASE}/api/search?q=flibbertigibbet`, {
     headers: { Origin: "https://evil.example.com" },
   });
@@ -347,6 +530,12 @@ try {
     healthAfter.clients <= 200,
     `clients=${healthAfter.clients} after 260 closed streams`
   );
+
+  // Queue snapshot on re-attach, driven by test/fake-pi.js so it needs no
+  // credentials: pi emits queue_update only when the queue changes, so a tab
+  // that switches away and back must be told what its process still holds —
+  // otherwise the dock looks empty while the messages are in fact pending.
+  await queueSnapshotChecks();
 } finally {
   stopServer();
   fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });

@@ -164,6 +164,24 @@ class PiProc {
     this.pending = new Map();
     this.isStreaming = false;
     this.lastActivity = Date.now();
+    /** Last queue snapshot from the event stream. pi emits queue_update only
+     *  when the queue changes and get_state carries no queue text, so without
+     *  this a tab that switches away and back would show an empty dock while
+     *  the process still holds those messages. */
+    this.queued = { steering: [], followUp: [] };
+  }
+
+  /** Hand a client that just (re)attached the queue as it stands now. Attaching
+   *  is the only moment the client cannot already know it: every change is
+   *  broadcast, so a stale dock only survives a detach. */
+  sendQueueSnapshot(res) {
+    const { steering, followUp } = this.queued;
+    if (!steering.length && !followUp.length) return;
+    try {
+      res.write(`data: ${JSON.stringify({ type: "queue_update", steering, followUp })}\n\n`);
+    } catch {
+      // the close handler on the SSE request cleans the entry up
+    }
   }
 
   broadcast(record) {
@@ -188,6 +206,11 @@ class PiProc {
     }
     if (record && record.type === "agent_start") this.isStreaming = true;
     else if (record && (record.type === "agent_settled" || record.type === "agent_end")) this.isStreaming = false;
+    // Remember the queue while broadcasting: pi sends it only on change, so
+    // this copy is the only way a re-attaching tab can learn what is pending.
+    if (record && record.type === "queue_update") {
+      this.queued = { steering: record.steering || [], followUp: record.followUp || [] };
+    }
     // Session events, extension UI requests, bash updates -> attached clients
     this.broadcast(record);
   }
@@ -271,6 +294,8 @@ class PiProc {
     }
     this.pending.clear();
     this.isStreaming = false;
+    // The queue lived in the process, so a restart must not replay it.
+    this.queued = { steering: [], followUp: [] };
     this.broadcast({ type: "server", event: "pi_exit", code, signal });
     procs.delete(this.key);
     for (const [file, key] of fileAlias) if (key === this.key) fileAlias.delete(file);
@@ -364,6 +389,7 @@ async function openSession({ client, sessionFile, cwd }) {
     try {
       c.res.write(`data: ${JSON.stringify({ type: "server", event: "hello" })}\n\n`);
     } catch {}
+    proc.sendQueueSnapshot(c.res);
   }
   return { ok: true, sessionFile: proc.sessionFile, cwd: proc.cwd };
 }
@@ -871,8 +897,13 @@ function snippetParts(text, index, matchLength) {
 /** Search every session for all whitespace-separated terms (case-insensitive
  *  substring, AND semantics). Files are walked newest-first and each file's
  *  records newest-first, so the most recent occurrences surface first. Scanning
- *  stops at `limit` hits and reports `truncated` rather than an invented count. */
-async function searchSessions(query, limit = SEARCH_MAX_HITS) {
+ *  stops at `limit` hits and reports `truncated` rather than an invented count.
+ *
+ *  `scope` narrows the channels scanned: "all" covers every record, "prompts"
+ *  only what the user typed. Only user messages qualify — tool requests, their
+ *  output and bash executions are agent traffic (a bash record also carries its
+ *  output, so it cannot stand in for a prompt). */
+async function searchSessions(query, limit = SEARCH_MAX_HITS, scope = "all") {
   const terms = String(query || "")
     .toLowerCase()
     .split(/\s+/)
@@ -883,6 +914,7 @@ async function searchSessions(query, limit = SEARCH_MAX_HITS) {
   if (!terms.length) return { hits: [], truncated: false, sessionsScanned: 0 };
 
   const patterns = terms.map((t) => new RegExp(escapeRegExp(t), "i"));
+  const promptsOnly = scope === "prompts";
   const hits = [];
   let truncated = false;
   let sessionsScanned = 0;
@@ -900,6 +932,7 @@ async function searchSessions(query, limit = SEARCH_MAX_HITS) {
     // newest occurrence first: appended entries are chronologically last
     for (let i = index.records.length - 1; i >= 0; i--) {
       const r = index.records[i];
+      if (promptsOnly && r.role !== "user") continue;
       let firstIndex = -1;
       let firstLength = 0;
       let ok = true;
@@ -1025,6 +1058,10 @@ const server = http.createServer(async (req, res) => {
       const c = clientEntry(url.searchParams.get("client") || "");
       c.res = res;
       c.detachedAt = 0;
+      // a reconnected stream (page reload) missed every queue_update since the
+      // process started holding messages — replay the current queue now
+      const attached = c.key ? procs.get(c.key) : null;
+      if (attached) attached.sendQueueSnapshot(res);
       req.on("close", () => {
         if (c.res !== res) return;
         c.res = null;
@@ -1105,12 +1142,14 @@ const server = http.createServer(async (req, res) => {
 
     // Cross-session full-text search: prompts, responses, tool requests and
     // tool results across every workspace. Read-only over the session
-    // directory — the same corpus /api/sessions lists.
+    // directory — the same corpus /api/sessions lists. `scope=prompts` narrows
+    // it to user prompts. Unknown scopes fall back to the full corpus.
     if (pathname === "/api/search" && req.method === "GET") {
       const q = url.searchParams.get("q") || "";
       const limitParam = Number(url.searchParams.get("limit"));
       const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : SEARCH_MAX_HITS;
-      sendJson(res, 200, await searchSessions(q, limit));
+      const scope = url.searchParams.get("scope") === "prompts" ? "prompts" : "all";
+      sendJson(res, 200, await searchSessions(q, limit, scope));
       return;
     }
 

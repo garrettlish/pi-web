@@ -201,6 +201,10 @@
     <div id="search-dialog" role="dialog" aria-modal="true" aria-labelledby="search-title">
       <div class="search-head">
         <span id="search-title">Search all sessions</span>
+        <div id="search-tabs" class="search-tabs" role="tablist" aria-label="Search scope">
+          <button id="search-tab-all" class="active" role="tab" aria-selected="true">Everything</button>
+          <button id="search-tab-prompts" role="tab" aria-selected="false">Prompts</button>
+        </div>
         <span class="spacer"></span>
         <span class="dim" id="search-count"></span>
         <button id="search-close" class="ghost" title="Close (Esc)">✕</button>

@@ -96,7 +96,9 @@ pi-web --cwd ~/code/my-project
 - Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
 - Queued steering / follow-up messages appear in a dock directly above the composer, next to the
   running indicator; each can be undone individually or the whole queue cleared. The queue belongs
-  to the attached session's agent process — switching sessions shows only that session's queue.
+  to the attached session's agent process — switching sessions shows only that session's queue,
+  and switching back restores it (the server re-sends the process's current queue when a tab
+  re-attaches).
 - `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** share one
   row in that same dock above the input — indicator on the left, **Stop** at its far right — so they
   are visible from where you are typing; if `pi` dies, the sidebar status line turns into a restart
@@ -114,7 +116,9 @@ pi-web --cwd ~/code/my-project
   a compaction, so you see the same conversation the terminal would. The switch is optimistic:
   the sidebar highlight and URL hash update immediately, sessions opened before in the same tab
   render from an in-memory cache and pull only entries appended since (via the `get_entries
-  since` cursor), and unseen sessions show a "loading session…" notice while `pi` boots.
+  since` cursor), and unseen sessions show a "loading session…" notice while `pi` boots. Each
+  session also remembers its scroll position: switching away and back returns you to the line you
+  left, and a session that was following the stream resumes following it.
 - Every open session runs in **its own `pi --mode rpc` process**. Switching sessions does not stop
   the previous one: it keeps running in the background (marked with a pulsing dot in the sidebar)
   and you can re-attach at any time. Each browser tab is bound to exactly one process, so parallel
@@ -123,9 +127,11 @@ pi-web --cwd ~/code/my-project
   bookmarked or shared between your own tabs.
 - Idle processes with no attached tab are reaped after 30 minutes.
 - The sidebar filter matches a session's title only. The search button beside the workspace button
-  (or `Cmd/Ctrl`+`K`) opens a dialog that searches **every prompt, response, tool request and tool
-  result in every workspace**: all typed terms must match (case-insensitive), newest occurrences
-  first, and each hit shows its role, workspace, session and a snippet around the match. A
+  (or `Cmd/Ctrl`+`K`) opens a dialog with two tabs. **Everything** searches **every prompt,
+  response, tool request and tool result in every workspace**: all typed terms must match
+  (case-insensitive), newest occurrences first, and each hit shows its role, workspace, session and
+  a snippet around the match. **Prompts** searches only what you typed, so a word that recurs in
+  tool output cannot bury the prompt that asked for it. A
   subagent's child output is indexed too and labelled by agent (`subagent/reviewer`), so a
   reviewer's own wording is findable even when the parent's summary paraphrases it. Clicking
   a hit switches to that session and jumps to the occurrence — scrolling to the message, or
@@ -204,7 +210,7 @@ localhost-only by default.
 | `POST /api/ui-response` | Answer an extension UI request |
 | `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
 | `GET /api/sessions` | List sessions with live active/streaming flags |
-| `GET /api/search?q=<terms>&limit=<n>` | Full-text search across every session's prompts, responses, tool requests and tool results; returns snippet hits plus a `truncated` flag |
+| `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
 
 ## Configuration
