@@ -725,6 +725,12 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   flex: 1 1 auto; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+#prompt-list-pop .pl-skill {
+  flex: none; padding: 0 6px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--accent-text); background: var(--accent-tint);
+  border-radius: var(--radius-pill);
+}
 #prompt-list-pop .pl-time {
   flex: none; color: var(--text-3); font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -868,6 +874,41 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   max-width: 320px; max-height: 240px; border-radius: var(--radius-sm);
   display: block; margin-top: 8px; cursor: zoom-in;
   border: 1px solid var(--border);
+}
+/* Skill invocation: pi expands a skill into a user message carrying the whole
+   SKILL.md, which used to fill the transcript with thousands of words the
+   reader never typed. The call itself is the event — a chip naming the skill
+   above the prompt they did write — and the definition sits behind a
+   disclosure. */
+.skill-invoke { display: block; }
+.skill-tag {
+  flex: none; padding: 0 7px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--accent-text); background: var(--accent-tint);
+  border-radius: var(--radius-pill);
+}
+.skill-name { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--text); }
+.skill-prompt {
+  margin-top: 6px; padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text);
+}
+.skill-def { margin-top: 6px; }
+details.skill-def > summary {
+  cursor: pointer; list-style: none;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.4px;
+  text-transform: uppercase; color: var(--text-3);
+}
+details.skill-def > summary::-webkit-details-marker { display: none; }
+details.skill-def > summary::before { content: "▸ "; }
+details.skill-def[open] > summary::before { content: "▾ "; }
+details.skill-def[open] > summary { margin-bottom: 6px; }
+.skill-def-body {
+  max-height: 40vh; overflow: auto;
+  padding: 9px 12px;
+  background: var(--code); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word; color: var(--text-2);
 }
 /* speaker labels: small, quiet and identical in weight for both sides, so the
    label is metadata and the message is the thing being read */

@@ -160,6 +160,39 @@ writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
   },
 ]);
 
+// A skill invocation is pi's expansion of a slash command: the whole SKILL.md
+// wrapped in pi's own <skill> block, then the prompt the user typed. Its body is
+// instruction text the agent reads, not something the user wrote, so the title
+// and the prompt index must show the invocation and the prompt only.
+writeFixture("--tmp-ws-gamma--", "2026-03-03T00-00-00-000Z_cccc.jsonl", [
+  { type: "session", version: 3, id: "cccc", timestamp: "2026-03-03T00:00:00.000Z", cwd: "/tmp/ws-gamma" },
+  {
+    type: "message",
+    id: "u3",
+    parentId: null,
+    timestamp: "2026-03-03T00:00:01.000Z",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: [
+            '<skill name="skill:review-helper" location="/tmp/skills/review-helper/SKILL.md">',
+            "References are relative to /tmp/skills/review-helper.",
+            "",
+            "# Review Helper",
+            "",
+            "SKILLBODYONLY follow these steps when reviewing.",
+            "</skill>",
+            "",
+            "SKILLPROMPTTERM please review the diff",
+          ].join("\n"),
+        },
+      ],
+    },
+  },
+]);
+
 const server = spawn(
   process.execPath,
   [path.join(ROOT, "server.js"), "--port", String(PORT), "--session-dir", FIXTURE_DIR],
@@ -434,6 +467,31 @@ try {
   check(
     "/api/search scope=prompts finds a prompt in the other workspace",
     (await search("widgets", "&scope=prompts")).hits.some((h) => h.cwd === "/tmp/ws-beta")
+  );
+
+  // A skill invocation is pi's expansion of a slash command: the whole SKILL.md
+  // inside pi's <skill> block, then the prompt. The body is instruction text the
+  // agent reads, not something the user wrote, so it must not join the prompt
+  // index — one definition would otherwise match every query, in every session
+  // that ever used that skill, and outrank the prompts that asked for anything.
+  const skillPrompt = await search("SKILLPROMPTTERM", "&scope=prompts");
+  check("/api/search scope=prompts finds the prompt after a skill block", skillPrompt.hits.length === 1);
+  check(
+    "/api/search skips a skill body in the prompt index",
+    (await search("SKILLBODYONLY", "&scope=prompts")).hits.length === 0
+  );
+  check(
+    "/api/search names the skill in a prompt snippet instead of the raw tag",
+    !skillPrompt.hits[0]?.before.includes("<skill name=") && skillPrompt.hits[0]?.before.includes("review-helper"),
+    JSON.stringify(skillPrompt.hits[0]?.before)
+  );
+  check(
+    "/api/sessions titles a skill session by the skill and the prompt",
+    (() => {
+      const title = sessions.sessions.find((s) => s.cwd === "/tmp/ws-gamma")?.title || "";
+      return title.includes("review-helper") && title.includes("SKILLPROMPTTERM") && !title.includes("SKILLBODYONLY");
+    })(),
+    JSON.stringify(sessions.sessions.find((s) => s.cwd === "/tmp/ws-gamma")?.title)
   );
   const unknownScope = await search("flibbertigibbet", "&scope=bogus");
   check("/api/search treats an unknown scope as the full corpus", unknownScope.hits.length === both.hits.length);

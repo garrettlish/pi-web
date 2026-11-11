@@ -183,6 +183,21 @@ function inlineMd(s) {
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
+/** pi expands a skill invocation into a user message whose text is its own
+ *  `<skill name="…" location="…">` block wrapping the whole SKILL.md, plus the
+ *  arguments the user typed after it. Rendering that raw turns a one-line
+ *  request into thousands of words of instruction text that is not part of the
+ *  conversation. Parse it so the transcript can show the invocation and the
+ *  prompt, and keep the body behind a disclosure. Format and the
+ *  close-then-blank-line-then-prompt shape are pi's own (see parseSkillBlock in
+ *  pi's agent-session.ts), so a change there fails loudly as a normal message
+ *  rather than mis-rendering. */
+function parseSkillBlock(text) {
+  const match = String(text || "").match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+  if (!match) return null;
+  return { name: match[1], location: match[2], content: match[3], userMessage: match[4] ? match[4].trim() : "" };
+}
+
 /** true for a markdown table separator row, e.g. "| --- | :---: |" */
 function isTableSep(line) {
   const t = line.trim();
@@ -1333,21 +1348,60 @@ function renderAssistantMeta(meta) {
   return line;
 }
 
+/** an inline prompt image in a user turn: a thumbnail that opens the popup,
+ *  then the full-window viewer */
+function promptImage(img) {
+  const src = `data:${img.mimeType};base64,${img.data}`;
+  return el("img", { src, alt: "prompt image", title: "Click to enlarge", onclick: () => openImagePopup(src, "prompt image") });
+}
+
+/** the visible part of a skill invocation: a chip naming the skill, the prompt
+ *  the user typed after it, and the expanded SKILL.md folded away. The chip is
+ *  the highlight — a skill call is an event in the run, and the definition it
+ *  pulled in is not conversation. */
+function renderSkillInvocation(skill) {
+  const name = skill.name.replace(/^skill:/, "");
+  const body = el(
+    "div",
+    { class: "skill-invoke" },
+    el("span", { class: "skill-tag", text: "skill" }),
+    el("span", { class: "skill-name", text: name, title: skill.location || "" })
+  );
+  if (skill.userMessage) {
+    const prompt = el("div", { class: "skill-prompt" });
+    prompt.style.whiteSpace = "pre-wrap";
+    prompt.textContent = skill.userMessage;
+    body.append(prompt);
+  }
+  const def = el("details", { class: "skill-def" });
+  def.append(
+    el("summary", { text: `definition · ${skill.content.split("\n").length} lines` }),
+    el("div", { class: "skill-def-body", text: skill.content })
+  );
+  body.append(def);
+  return body;
+}
+
 function renderItem(item) {
   switch (item.kind) {
     case "user": {
       const box = el("div", { class: "item item-user" });
       box.append(el("div", { class: "who", text: `you · ${fmtTime(item.ts)}` }));
+      // a skill invocation arrives as one user message: the whole SKILL.md in a
+      // <skill> block, then the prompt. Show the invocation as a chip and the
+      // prompt as the message; the body stays behind a disclosure, because a
+      // definition pi expanded itself is context, not something the reader wrote.
+      const skill = parseSkillBlock(item.text);
+      if (skill) {
+        box.append(renderSkillInvocation(skill));
+        for (const img of item.images || []) box.append(promptImage(img));
+        return box;
+      }
       const body = el("div");
       body.style.whiteSpace = "pre-wrap";
       body.textContent = item.text;
       box.append(body);
-      for (const img of item.images || []) {
-        const src = `data:${img.mimeType};base64,${img.data}`;
-        box.append(
-          el("img", { src, alt: "prompt image", title: "Click to enlarge", onclick: () => openImagePopup(src, "prompt image") })
-        );
-      }
+      for (const img of item.images || []) box.append(promptImage(img));
       return box;
     }
     case "assistant": {
@@ -1910,17 +1964,23 @@ function renderPromptList() {
   }
   const replies = buildReplyJumpMap();
   prompts.forEach((item, n) => {
-    const text = (item.text || "").replace(/\s+/g, " ").trim() || "(images only)";
+    // a skill invocation puts its chip first, then the prompt the user typed, so
+    // the outline matches the transcript instead of listing "<skill name=…"
+    const skill = parseSkillBlock(item.text);
+    const text = skill
+      ? [skill.name.replace(/^skill:/, ""), skill.userMessage].filter(Boolean).join(" · ")
+      : (item.text || "").replace(/\s+/g, " ").trim() || "(images only)";
     const group = el("div", { class: "pl-group" },
       el("div", {
         class: "pl-entry",
-        title: item.text || "",
+        title: skill ? `${skill.name}\n\n${skill.userMessage}` : item.text || "",
         onclick: () => {
           setPromptListOpen(false);
           scrollToUserPrompt(item);
         },
       },
         el("span", { class: "pl-num", text: String(n + 1) }),
+        skill ? el("span", { class: "pl-skill", text: "skill" }) : null,
         el("span", { class: "pl-text", text: text }),
         el("span", { class: "pl-time", text: item.ts ? fmtTime(item.ts) : "" })
       )

@@ -96,6 +96,13 @@ pi-web --cwd ~/code/my-project
   background launch explains that its children are reported when the run completes. Both live
   progress (`tool_execution_update` snapshots) and the persisted result render from one normalized
   view model, so an open inspector keeps updating while the run is still going.
+- **A skill invocation is shown as a call, not as its definition.** pi expands `/skill-name args`
+  into one user message holding the whole `SKILL.md` inside a `<skill>` block, followed by the args.
+  The transcript parses that apart and renders a `SKILL` chip with the skill's name, then the prompt
+  you actually typed, with the definition folded behind a `definition · N lines` disclosure — a
+  one-line request no longer scrolls for thousands of words you never wrote. The same parse feeds the
+  session title (skill name plus prompt) and the prompt index, so a skill body is neither the title
+  of every session that used it nor a match for every search.
 - Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
 - Queued steering / follow-up messages appear in a dock directly above the composer, next to the
   running indicator; each can be undone individually or the whole queue cleared. The queue belongs

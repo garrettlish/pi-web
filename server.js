@@ -629,6 +629,26 @@ function userText(content) {
   return "";
 }
 
+/** pi expands a skill invocation into a user message whose text is its whole
+ *  SKILL.md wrapped in a `<skill name="…" location="…">` block, followed by the
+ *  prompt the user typed. Format mirrors parseSkillBlock in pi's own session
+ *  code, so a change there degrades to the raw text instead of mis-parsing. */
+function parseSkillBlock(text) {
+  const match = String(text || "").match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+  if (!match) return null;
+  return { name: match[1], location: match[2], content: match[3], userMessage: match[4] ? match[4].trim() : "" };
+}
+
+/** A user message's own words. A skill body is instruction context pi injected
+ *  on the user's behalf — never something they typed — so titles and search
+ *  index the skill's name and the prompt that followed it. Indexing the body
+ *  made one skill definition match every query in every session that used it. */
+function promptText(content) {
+  const raw = userText(content);
+  const skill = parseSkillBlock(raw);
+  return skill ? [skill.name, skill.userMessage].filter(Boolean).join("\n") : raw;
+}
+
 /** Session files under the configured directory, newest first, with their stat.
  *  Shared by the sidebar listing and the search index so both see one corpus
  *  (and one directory walk) instead of drifting apart. */
@@ -687,7 +707,7 @@ function summarizeSessionText(text, st, f) {
     else if (e.type === "message") {
       messages++;
       lastTs = e.timestamp;
-      if (title === null && e.message?.role === "user") title = userText(e.message.content);
+      if (title === null && e.message?.role === "user") title = promptText(e.message.content);
       if (e.message?.role === "assistant" && e.message?.usage?.cost) cost += e.message.usage.cost.total || 0;
     } else if (e.type === "usage" && e.usage?.cost) {
       cost += e.usage.cost.total || 0;
@@ -809,7 +829,7 @@ function searchRecordsOf(entry) {
   const textBlocks = () => blocks.filter((b) => b.type === "text").map((b) => b.text || "").join("\n");
 
   if (m.role === "user") {
-    const text = typeof m.content === "string" ? m.content : textBlocks();
+    const text = promptText(typeof m.content === "string" ? m.content : textBlocks());
     if (text.trim()) out.push({ role: "user", text });
   } else if (m.role === "assistant") {
     for (const b of blocks) {
