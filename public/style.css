@@ -30,6 +30,10 @@
   --surface: #232326;
   --elevated: #2c2c2e;
   --code: #171719;
+  /* a table header band: one step darker than a card body, because the band has
+     to read as a band. --elevated is only 1.1:1 against a white or dark card,
+     which is why the header tint was invisible. */
+  --table-head: #37373f;
   /* the floating functional layer: toolbar, sidebar, composer */
   --glass: rgba(30, 30, 33, 0.72);
   --border: #34343a;
@@ -102,6 +106,7 @@
   --surface: #ffffff;
   --elevated: #f4f5f7;
   --code: #f7f8f9;
+  --table-head: #dadde2;
   --glass: rgba(255, 255, 255, 0.78);
   --border: #dcdde0;
   --border-strong: #c7c9cd;
@@ -141,6 +146,7 @@
   --surface: #ffffff;
   --elevated: #f0f5fb;
   --code: #f6faff;
+  --table-head: #cfe0f6;
   --glass: rgba(255, 255, 255, 0.78);
   --border: #d8e3f0;
   --border-strong: #bccbdd;
@@ -180,6 +186,7 @@
   --surface: #ffffff;
   --elevated: #f1f7f0;
   --code: #f7fbf6;
+  --table-head: #d5e5d1;
   --glass: rgba(255, 255, 255, 0.78);
   --border: #d7e5d5;
   --border-strong: #bdd2ba;
@@ -219,6 +226,7 @@
   --surface: #ffffff;
   --elevated: #fcf3ea;
   --code: #fffaf5;
+  --table-head: #f2dcc0;
   --glass: rgba(255, 255, 255, 0.8);
   --border: #eddfd0;
   --border-strong: #dfc6ae;
@@ -258,6 +266,7 @@
   --surface: #ffffff;
   --elevated: #f6f2fc;
   --code: #faf8fe;
+  --table-head: #e2d6f4;
   --glass: rgba(255, 255, 255, 0.78);
   --border: #e4dcf0;
   --border-strong: #cfc2e3;
@@ -926,8 +935,14 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   margin: 6px 0; padding-left: 12px;
   border-left: 3px solid var(--border-strong); color: var(--text-2);
 }
+/* markdown tables: a bordered card, a banded header, and zebra striping below.
+   The card carries its own opaque background: without it the table body showed
+   the page through the card, so the header band had nothing to sit against and
+   its tint vanished. */
 .assistant-text .md-table-wrap {
-  overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
 }
 .assistant-text table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 .assistant-text th,
@@ -935,9 +950,13 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   padding: 7px 12px; text-align: left; vertical-align: top;
   border-bottom: 1px solid var(--border);
 }
+/* Header: a band behind the row and a heavier weight than the cells. Weight alone
+   was not enough at 11.5px — a bolder face at a smaller size than the body reads
+   as a different style, not as a heading — so the header keeps the cells' size
+   and takes its emphasis from the band plus semibold. */
 .assistant-text thead th {
-  background: var(--elevated); color: var(--text-2);
-  font-weight: 600; font-size: 11.5px;
+  background: var(--table-head); color: var(--text);
+  font-weight: 600; font-size: 12.5px;
   white-space: nowrap;
 }
 .assistant-text tbody tr:last-child td { border-bottom: none; }
