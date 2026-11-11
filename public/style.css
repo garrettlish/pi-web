@@ -740,15 +740,24 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
    under the prompt text so the pair reads as one item with a subordinate action */
 #prompt-list-pop .pl-jump {
   display: flex; align-items: baseline; gap: 6px;
-  width: calc(100% - 50px);
-  margin: 0 9px 2px 39px; padding: 2px 6px; text-align: left;
+  /* the row lands under the prompt text (39px = pl-num's 20px + the entry's 9px
+     padding + its 10px gap) and stops where the entry's time does: the entry
+     insets its content 9px, so margin-right (3) + padding-right (6) must add up
+     to 9 or the two timestamps sit at different x. */
+  width: calc(100% - 42px);
+  margin: 0 3px 2px 39px; padding: 2px 6px; text-align: left;
   background: transparent; border: 0; border-radius: var(--radius-xs);
   color: var(--text-2); font-size: 11px;
 }
 #prompt-list-pop .pl-jump:hover { background: var(--elevated); color: var(--text); }
 #prompt-list-pop .pl-jump-arrow { flex: none; color: var(--text-3); }
 #prompt-list-pop .pl-jump-label { flex: 1 1 auto; min-width: 0; }
-#prompt-list-pop .pl-jump-time { flex: none; opacity: 0.7; }
+/* the two timestamps form one column, so the summary's must be the same ink and
+   weight as the prompt's rather than inheriting the link-ish row color */
+#prompt-list-pop .pl-jump-time {
+  flex: none; color: var(--text-3);
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
 
 /* a message a prompt outline or search hit jumped to: a ring that fades out,
    so the eye lands on it without the layout shifting */
