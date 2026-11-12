@@ -131,6 +131,19 @@ writeFixture("--tmp-ws-alpha--", "2026-01-01T00-00-00-000Z_aaaa.jsonl", [
       },
     },
   },
+  // The run's last turn, and the only one that settles: the answer text above
+  // (a1) was mid-loop, so the summary scope must not reach it.
+  {
+    type: "message",
+    id: "a4",
+    parentId: "r2",
+    timestamp: "2026-01-01T00:00:06.000Z",
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "SEARCHSUMMARYANSWER the module is unused, nothing to change" }],
+    },
+  },
 ]);
 writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
   { type: "session", version: 3, id: "bbbb", timestamp: "2026-02-02T00:00:00.000Z", cwd: "/tmp/ws-beta" },
@@ -155,7 +168,28 @@ writeFixture("--tmp-ws-beta--", "2026-02-02T00-00-00-000Z_bbbb.jsonl", [
     timestamp: "2026-02-02T00:00:03.000Z",
     message: {
       role: "assistant",
+      stopReason: "stop",
       content: [{ type: "text", text: "the widgets are fine, and so is flibbertigibbet SEARCHRESPONSEONLY" }],
+    },
+  },
+  // A run cut off by the user has an answer, but it is an interruption rather
+  // than a conclusion, so the summary scope must not reach it.
+  {
+    type: "message",
+    id: "u4",
+    parentId: "a2",
+    timestamp: "2026-02-02T00:00:04.000Z",
+    message: { role: "user", content: [{ type: "text", text: "now check the gadget" }] },
+  },
+  {
+    type: "message",
+    id: "a5",
+    parentId: "u4",
+    timestamp: "2026-02-02T00:00:05.000Z",
+    message: {
+      role: "assistant",
+      stopReason: "aborted",
+      content: [{ type: "text", text: "SEARCHABORTEDANSWER the gadget is" }],
     },
   },
 ]);
@@ -468,6 +502,34 @@ try {
     "/api/search scope=prompts finds a prompt in the other workspace",
     (await search("widgets", "&scope=prompts")).hits.some((h) => h.cwd === "/tmp/ws-beta")
   );
+
+  // scope=summary narrows the same index to the answer each run concluded with:
+  // the last turn of the run, and only when it settled. Answer text from a mid
+  // tool loop (a1), a prompt, a tool request/result and a run cut off by the
+  // user (a5) must all stay out.
+  const summaryHits = await search("SEARCHSUMMARYANSWER", "&scope=summary");
+  check(
+    "/api/search scope=summary finds a settled run's answer",
+    summaryHits.hits.length === 1 && summaryHits.hits[0].role === "assistant",
+    JSON.stringify(summaryHits.hits.map((h) => [h.role, h.before]))
+  );
+  check(
+    "/api/search scope=summary skips answer text from mid tool loop",
+    (await search("exports nothing useful", "&scope=summary")).hits.length === 0
+  );
+  check(
+    "/api/search scope=summary skips an aborted run",
+    (await search("SEARCHABORTEDANSWER", "&scope=summary")).hits.length === 0
+  );
+  check(
+    "/api/search scope=summary finds the summary in every workspace",
+    new Set([...summaryHits.hits, ...(await search("SEARCHRESPONSEONLY", "&scope=summary")).hits].map((h) => h.cwd)).size === 2,
+    JSON.stringify((await search("SEARCHRESPONSEONLY", "&scope=summary")).hits.map((h) => h.cwd))
+  );
+  for (const [label, q] of [["prompts", "unrelated request"], ["tool-call arguments", "SEARCHTOOLARG"], ["tool results", "SEARCHTOOLOUT"], ["subagent child output", "SEARCHCHILDOUT"]]) {
+    check(`/api/search scope=summary skips ${label}`, (await search(q, "&scope=summary")).hits.length === 0);
+  }
+  check("/api/search reports scope=summary truncation state", typeof summaryHits.truncated === "boolean");
 
   // A skill invocation is pi's expansion of a slash command: the whole SKILL.md
   // inside pi's <skill> block, then the prompt. The body is instruction text the

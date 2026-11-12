@@ -2665,11 +2665,13 @@ async function loadSessions() {
 // cross-session search
 // ---------------------------------------------------------------------------
 // The search button beside the workspace button (or Cmd/Ctrl+K) opens this
-// dialog, which queries the server's index. Two tabs share it: "Prompts"
+// dialog, which queries the server's index. Three tabs share it: "Prompts"
 // narrows the index to what the user typed, so a common word in tool output
-// cannot bury the prompt that asked for it, and it is the default; "Everything"
-// widens the same query to every prompt, response, tool request and tool result
-// in every workspace.
+// cannot bury the prompt that asked for it, and it is the default; "Summary"
+// narrows the same query to the answer each run concluded with — the same turn
+// the prompt outline offers a jump to, so the two features name one thing;
+// "Everything" widens it to every prompt, response, tool request and tool
+// result in every workspace.
 const searchOverlay = $("#search-overlay");
 const searchInput = $("#search-input");
 const searchResultsEl = $("#search-results");
@@ -2680,19 +2682,22 @@ let searchIndex = 0;
 let searchTimer = null;
 let searchGen = 0; // guards against a slow earlier query overwriting a newer one
 let searchReturnFocus = null;
-// "all" | "prompts" — held in memory only, so a reload always starts from the
-// same default scope while switching tabs inside one tab of the app keeps the
-// choice. Prompts is the default: the question "where did I already ask this"
-// is the common one, and a word that recurs in tool output cannot bury it.
+// "all" | "prompts" | "summary" — held in memory only, so a reload always
+// starts from the same default scope while switching tabs inside one tab of the
+// app keeps the choice. Prompts is the default: the question "where did I
+// already ask this" is the common one, and a word that recurs in tool output
+// cannot bury it.
 let searchScope = "prompts";
 
 const SEARCH_PLACEHOLDER = {
   all: "Search prompts, responses and tool output in every workspace…",
   prompts: "Search prompts in every workspace…",
+  summary: "Search what pi concluded in every workspace…",
 };
 const SEARCH_HINT = {
   all: "Type to search every prompt, response and tool output",
   prompts: "Type to search every prompt",
+  summary: "Type to search the summary of every run",
 };
 
 function searchRoleLabel(hit) {
@@ -2788,7 +2793,7 @@ async function runSearch(query) {
   }
   searchCountEl.textContent = "searching…";
   try {
-    const scopeParam = searchScope === "prompts" ? "&scope=prompts" : "";
+    const scopeParam = searchScope === "all" ? "" : `&scope=${searchScope}`;
     const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${SEARCH_LIMIT}${scopeParam}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
@@ -2902,11 +2907,11 @@ function setSearchScope(scope) {
   searchInput.focus();
   if (searchScope === scope) return;
   searchScope = scope;
-  const all = scope === "all";
-  $("#search-tab-all").classList.toggle("active", all);
-  $("#search-tab-all").setAttribute("aria-selected", String(all));
-  $("#search-tab-prompts").classList.toggle("active", !all);
-  $("#search-tab-prompts").setAttribute("aria-selected", String(!all));
+  for (const [id, name] of [["#search-tab-prompts", "prompts"], ["#search-tab-summary", "summary"], ["#search-tab-all", "all"]]) {
+    const active = scope === name;
+    $(id).classList.toggle("active", active);
+    $(id).setAttribute("aria-selected", String(active));
+  }
   searchInput.placeholder = SEARCH_PLACEHOLDER[scope];
   searchIndex = 0;
   if (searchTimer) clearTimeout(searchTimer); // the pending keystroke query would rerun the same text
@@ -2916,6 +2921,7 @@ function setSearchScope(scope) {
 
 $("#search-tab-all").addEventListener("click", () => setSearchScope("all"));
 $("#search-tab-prompts").addEventListener("click", () => setSearchScope("prompts"));
+$("#search-tab-summary").addEventListener("click", () => setSearchScope("summary"));
 
 searchInput.addEventListener("input", () => {
   searchIndex = 0;

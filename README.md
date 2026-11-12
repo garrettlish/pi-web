@@ -137,17 +137,21 @@ pi-web --cwd ~/code/my-project
   bookmarked or shared between your own tabs.
 - Idle processes with no attached tab are reaped after 30 minutes.
 - The sidebar filter matches a session's title only. The search button beside the workspace button
-  (or `Cmd/Ctrl`+`K`) opens a dialog with two tabs, **Prompts** first and selected by default:
+  (or `Cmd/Ctrl`+`K`) opens a dialog with three tabs, **Prompts** first and selected by default:
   it searches only what you typed, so a word that recurs in tool output cannot bury the prompt
-  that asked for it. **Everything** widens the same query to **every prompt, response, tool
-  request and tool result in every workspace**: all typed terms must match (case-insensitive),
-  newest occurrences first, and each hit shows its role, workspace, session and a snippet around
-  the match. Switching tabs re-runs the query and puts the caret back in the search field. A
-  subagent's child output is indexed too and labelled by agent (`subagent/reviewer`), so a
-  reviewer's own wording is findable even when the parent's summary paraphrases it. Clicking
-  a hit switches to that session and jumps to the occurrence — scrolling to the message, or
-  opening the tool call's request/response popup. The system prompt and thinking blocks are left
-  out of the index: identical in every session, they would bury every query under false hits.
+  that asked for it. **Summary** narrows the same query to **the answer each run concluded with** —
+  the last turn of the run, and only when it settled: a turn that was aborted, failed, cut off
+  mid tool loop or still streaming has no summary and contributes nothing, which is the same rule
+  the prompt outline uses for its summary jump. **Everything** widens the query to **every prompt,
+  response, tool request and tool result in every workspace**: all typed terms must match
+  (case-insensitive), newest occurrences first, and each hit shows its role, workspace, session and
+  a snippet around the match. Switching tabs re-runs the query and puts the caret back in the
+  search field. A subagent's child output is indexed too and labelled by agent
+  (`subagent/reviewer`), so a reviewer's own wording is findable even when the parent's summary
+  paraphrases it. Clicking a hit switches to that session and jumps to the occurrence — scrolling
+  to the message, or opening the tool call's request/response popup. The system prompt and thinking
+  blocks are left out of the index: identical in every session, they would bury every query under
+  false hits.
 
 **Controls**
 
@@ -237,7 +241,7 @@ localhost-only by default.
 | `POST /api/ui-response` | Answer an extension UI request |
 | `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
 | `GET /api/sessions` | List sessions with live active/streaming flags |
-| `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts; returns snippet hits plus a `truncated` flag |
+| `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts\|summary>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts, `scope=summary` to the answer each run concluded with; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
 | `GET /api/mcp?client=<id>` | MCP server state as `pi mcp list --json` reports it, run in that client's session workspace; `{ servers, errors }`, where a disconnected server still returns 200 with its state and error |
 
@@ -310,11 +314,13 @@ npm test           # end-to-end smoke test (starts a throwaway server)
 
 `npm test` boots the server on a random port and verifies what has actually broken before: the page
 and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
-skips the system prompt and thinking blocks, foreign `Host`/`Origin` requests are rejected, path
-traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also pins the
-static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event streams from
-accumulating. It runs against a throwaway session directory, needs no agent credentials, and — when
-`pi` happens to be installed — also checks the agent round-trip, otherwise it skips that check.
+skips the system prompt and thinking blocks, each scope stops where it should (a prompt, a mid-loop
+answer and an aborted run stay out of the summary scope), foreign `Host`/`Origin` requests are
+rejected, path traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also
+pins the static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event
+streams from accumulating. It runs against a throwaway session directory, needs no agent
+credentials, and — when `pi` happens to be installed — also checks the agent round-trip, otherwise it
+skips that check.
 
 Frontend changes apply on reload (static files are served with `Cache-Control: no-cache` plus an
 `ETag`, so an unchanged asset revalidates as a bodyless `304` instead of being re-sent). Server

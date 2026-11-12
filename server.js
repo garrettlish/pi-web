@@ -909,6 +909,22 @@ async function readSearchIndex(file) {
   const records = [];
   let header = null;
   let bytes = 0;
+  // A run is everything between two user prompts, and its summary is the answer
+  // text of the run's last assistant turn — the same turn the prompt outline
+  // offers a "summary" jump to. Only a turn that settled (stop/length) and
+  // carries answer text qualifies, so a run still streaming, aborted, failed or
+  // cut off mid tool loop contributes nothing. Records already sit in `records`
+  // in file order, so the flag is applied to those objects in place rather than
+  // re-appending the turn at the end of the run.
+  let runOpen = false; // a prompt has opened a run
+  let runTexts = null; // assistant text records of that run's latest turn
+  let runSettled = false;
+  const closeRun = () => {
+    if (runSettled && runTexts) for (const r of runTexts) r.summary = true;
+    runOpen = false;
+    runTexts = null;
+    runSettled = false;
+  };
   const stream = createReadStream(file, { encoding: "utf8" });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
   try {
@@ -924,15 +940,26 @@ async function readSearchIndex(file) {
         header = e;
         continue;
       }
-      for (const r of searchRecordsOf(e)) {
+      const entryRecords = searchRecordsOf(e);
+      for (const r of entryRecords) {
         bytes += Buffer.byteLength(r.text, "utf8");
         records.push(r);
+      }
+      if (e.type !== "message") continue;
+      const m = e.message;
+      if (m?.role === "user") {
+        closeRun();
+        runOpen = true;
+      } else if (runOpen && m?.role === "assistant") {
+        runTexts = entryRecords.filter((r) => r.role === "assistant");
+        runSettled = (m.stopReason === "stop" || m.stopReason === "length") && runTexts.length > 0;
       }
     }
   } finally {
     rl.close();
     stream.destroy();
   }
+  closeRun();
   return { records, header, bytes };
 }
 
@@ -976,15 +1003,23 @@ function snippetParts(text, index, matchLength) {
   };
 }
 
+/** Which records a scope scans. "prompts" is only what the user typed — tool
+ *  requests, their output and bash executions are agent traffic (a bash record
+ *  also carries its output, so it cannot stand in for a prompt). "summary" is
+ *  the answer text each run concluded with, as tagged while indexing. */
+const SCOPES = {
+  all: () => true,
+  prompts: (r) => r.role === "user",
+  summary: (r) => r.summary === true,
+};
+
 /** Search every session for all whitespace-separated terms (case-insensitive
  *  substring, AND semantics). Files are walked newest-first and each file's
  *  records newest-first, so the most recent occurrences surface first. Scanning
  *  stops at `limit` hits and reports `truncated` rather than an invented count.
  *
  *  `scope` narrows the channels scanned: "all" covers every record, "prompts"
- *  only what the user typed. Only user messages qualify — tool requests, their
- *  output and bash executions are agent traffic (a bash record also carries its
- *  output, so it cannot stand in for a prompt). */
+ *  only what the user typed, "summary" only the run summaries. */
 async function searchSessions(query, limit = SEARCH_MAX_HITS, scope = "all") {
   const terms = String(query || "")
     .toLowerCase()
@@ -996,7 +1031,9 @@ async function searchSessions(query, limit = SEARCH_MAX_HITS, scope = "all") {
   if (!terms.length) return { hits: [], truncated: false, sessionsScanned: 0 };
 
   const patterns = terms.map((t) => new RegExp(escapeRegExp(t), "i"));
-  const promptsOnly = scope === "prompts";
+  // "prompts" narrows to what the user typed; "summary" narrows to the answer
+  // each run concluded with (see readSearchIndex); "all" keeps every record.
+  const keep = SCOPES[scope] || SCOPES.all;
   const hits = [];
   let truncated = false;
   let sessionsScanned = 0;
@@ -1014,7 +1051,7 @@ async function searchSessions(query, limit = SEARCH_MAX_HITS, scope = "all") {
     // newest occurrence first: appended entries are chronologically last
     for (let i = index.records.length - 1; i >= 0; i--) {
       const r = index.records[i];
-      if (promptsOnly && r.role !== "user") continue;
+      if (!keep(r)) continue;
       let firstIndex = -1;
       let firstLength = 0;
       let ok = true;
@@ -1225,12 +1262,14 @@ const server = http.createServer(async (req, res) => {
     // Cross-session full-text search: prompts, responses, tool requests and
     // tool results across every workspace. Read-only over the session
     // directory — the same corpus /api/sessions lists. `scope=prompts` narrows
-    // it to user prompts. Unknown scopes fall back to the full corpus.
+    // it to user prompts, `scope=summary` to the answer each run concluded
+    // with. Unknown scopes fall back to the full corpus.
     if (pathname === "/api/search" && req.method === "GET") {
       const q = url.searchParams.get("q") || "";
       const limitParam = Number(url.searchParams.get("limit"));
       const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : SEARCH_MAX_HITS;
-      const scope = url.searchParams.get("scope") === "prompts" ? "prompts" : "all";
+      const requested = url.searchParams.get("scope");
+      const scope = Object.hasOwn(SCOPES, requested) ? requested : "all";
       sendJson(res, 200, await searchSessions(q, limit, scope));
       return;
     }
