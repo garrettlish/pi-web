@@ -1058,6 +1058,20 @@ details.item-thinking[open] > summary { margin-bottom: 4px; }
 }
 .item-notice .notice-chip .n-title { font-weight: 600; color: var(--text); }
 .item-notice .notice-chip .n-body { white-space: pre-wrap; text-align: left; }
+/* A notice with a title and a long body is a block, not a pill. Multi-line
+   errors carry paths and URLs with no break opportunities, so the pill shape
+   ballooned into an oval that spilled past the transcript padding. A card
+   radius, a hard width cap and `break-word` keep it inside the column. */
+.item-notice .notice-chip-block {
+  display: block; max-width: 100%; box-sizing: border-box;
+  padding: 9px 14px; border-radius: var(--radius);
+  text-align: left;
+}
+.item-notice .notice-chip-block .n-title { margin-bottom: 4px; }
+.item-notice .notice-chip-block .n-body {
+  overflow-wrap: anywhere; word-break: break-word;
+  max-height: 16em; overflow-y: auto;
+}
 
 .item-bash .bash-cmd {
   font-family: var(--mono); font-size: 12.5px;

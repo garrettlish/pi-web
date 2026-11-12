@@ -1654,7 +1654,15 @@ function renderItem(item) {
       return box;
     }
     case "summary": {
-      const chip = el("div", { class: "notice-chip" }, el("div", { class: "n-title", text: item.title }), el("div", { class: "n-body", text: (item.text || "").slice(0, 2000) }));
+      // A titled block, not a pill: an error or summary body runs to many lines
+      // with unbreakable paths, which a 999px radius turned into a giant oval
+      // that spilled past the transcript's padding.
+      const chip = el(
+        "div",
+        { class: "notice-chip notice-chip-block" },
+        el("div", { class: "n-title", text: item.title }),
+        el("div", { class: "n-body", text: (item.text || "").slice(0, 2000) })
+      );
       chip.addEventListener("click", () => openJson(item.title, { title: item.title, text: item.text, data: item.data }));
       return el("div", { class: "item item-notice" }, chip);
     }
