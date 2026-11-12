@@ -878,6 +878,16 @@ async function readFollowup(id) {
   return rec;
 }
 
+/** write-then-rename: a half-written file must never be listed as a follow-up,
+ *  and a rename is atomic within the directory */
+async function writeFollowup(rec) {
+  await fsp.mkdir(FOLLOWUP_DIR, { recursive: true });
+  const target = followupPath(rec.id);
+  const temp = `${target}.${process.pid}.tmp`;
+  await fsp.writeFile(temp, `${JSON.stringify(rec, null, 2)}\n`, "utf8");
+  await fsp.rename(temp, target);
+}
+
 // ---------------------------------------------------------------------------
 // Cross-session search
 // ---------------------------------------------------------------------------
@@ -1377,10 +1387,7 @@ const server = http.createServer(async (req, res) => {
       await fsp.mkdir(FOLLOWUP_DIR, { recursive: true });
       // write-then-rename: a half-written file must never be listed as a
       // follow-up, and a rename is atomic within the directory
-      const target = followupPath(record.id);
-      const temp = `${target}.${process.pid}.tmp`;
-      await fsp.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-      await fsp.rename(temp, target);
+      await writeFollowup(record);
       sendJson(res, 200, { followup: followupMeta(record) });
       return;
     }
@@ -1398,6 +1405,38 @@ const server = http.createServer(async (req, res) => {
       } catch {
         sendJson(res, 404, { error: "no such follow-up" });
       }
+      return;
+    }
+    // Editing a kept summary: title and body only. Everything that places the
+    // follow-up (id, createdAt, cwd, session link) stays as saved, so an edit
+    // never reorders the list or detaches it from its session.
+    if (followupMatch && req.method === "PATCH") {
+      let rec;
+      try {
+        rec = await readFollowup(followupMatch[1]);
+      } catch {
+        sendJson(res, 404, { error: "no such follow-up" });
+        return;
+      }
+      const body = JSON.parse((await readBody(req)) || "{}");
+      if (body.title !== undefined) {
+        const title = stringField(body.title, 300);
+        if (title === null) {
+          sendJson(res, 400, { error: "title must be a string" });
+          return;
+        }
+        rec.title = title.trim();
+      }
+      if (body.text !== undefined) {
+        const text = stringField(body.text, FOLLOWUP_TEXT_MAX);
+        if (!text || !text.trim()) {
+          sendJson(res, 400, { error: "a follow-up needs the summary text" });
+          return;
+        }
+        rec.text = text;
+      }
+      await writeFollowup(rec);
+      sendJson(res, 200, { followup: { ...followupMeta(rec), text: rec.text } });
       return;
     }
     if (followupMatch && req.method === "DELETE") {

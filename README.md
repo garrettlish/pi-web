@@ -167,10 +167,14 @@ pi-web --cwd ~/code/my-project
   to and the search's summary scope covers — and saves that answer to a JSON file under
   `~/.pi/followups`. The **Follow-ups** sidebar tab lists what you kept, newest first; clicking a row
   opens the summary as a document in the main column, laid out like the transcript (full width, same
-  gutter, no centered reading column), with a **Back** control, **Copy**, **Open
+  gutter, no centered reading column), with a **Back** control, **Copy**, **Edit**, **Open
   session** and **Delete**. Opening one reads only that file: no `pi` process is spawned and no
   session is replayed, so it is immediate even when the original session has been deleted. The tab
   filter matches a follow-up's title and its session title.
+- **Edit** turns the open follow-up into an in-place editor: the title becomes a single-line input
+  and the body becomes a Markdown source textarea. **Save** (or Cmd/Ctrl+Enter) writes the file back
+  under the same id, keeping its creation time, workspace and session link, so the row does not jump
+  in the list; **Cancel** or Esc discards the change, and the title may be cleared — the body may not.
 - A run that was aborted, failed, is still streaming or ended mid tool loop has no summary, so it
   offers **Copy** only.
 
@@ -265,6 +269,7 @@ localhost-only by default.
 | `GET /api/followups` | List saved follow-ups: `{ followups: [{ id, title, createdAt, ts, cwd, sessionFile, sessionTitle, chars }] }` — metadata only, no bodies |
 | `POST /api/followups` | `{ title, text, ts?, cwd?, sessionFile?, sessionTitle? }` — save one summary under the follow-up directory; returns its metadata |
 | `GET /api/followups/<id>` | One saved follow-up, including its stored Markdown `text` |
+| `PATCH /api/followups/<id>` | `{ title?, text? }` — rewrite a saved follow-up's title and Markdown body; `id`, `createdAt`, `cwd` and the session link are kept; returns the updated record with its `text` |
 | `DELETE /api/followups/<id>` | Delete a saved follow-up |
 | `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts\|summary>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts, `scope=summary` to the answer each run concluded with; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
@@ -326,8 +331,9 @@ Either way, put authentication in front of the port before it is reachable by an
   re-parses only the sessions that changed instead of re-reading the whole corpus.
 - Follow-ups are read from and written to the configured follow-up directory only, by UUID-derived
   file name; the id in the URL must match `[A-Za-z0-9_-]{1,80}`, so a request cannot address any
-  other path. Saving writes a temporary file and renames it, so a half-written summary is never
-  listed. The list endpoint returns metadata only; a body is read only when a follow-up is opened.
+  other path. Saving and editing write a temporary file and rename it, so a half-written summary is
+  never listed; an edit rewrites the body under the same id and cannot change where the record
+  lives. The list endpoint returns metadata only; a body is read only when a follow-up is opened.
 - No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
   `textContent`, and the Markdown subset escapes before formatting.
 - Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
@@ -346,8 +352,8 @@ npm test           # end-to-end smoke test (starts a throwaway server)
 and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
 skips the system prompt and thinking blocks, each scope stops where it should (a prompt, a mid-loop
 answer and an aborted run stay out of the summary scope), follow-ups round-trip through their own
-directory (save, list without bodies, read, delete, and an id that cannot escape it), foreign
-`Host`/`Origin` requests are
+directory (save, list without bodies, read, edit in place, delete, and an id that cannot escape it),
+foreign `Host`/`Origin` requests are
 rejected, path traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also
 pins the static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event
 streams from accumulating. It runs against a throwaway session directory, needs no agent

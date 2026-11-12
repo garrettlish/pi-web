@@ -467,6 +467,53 @@ try {
     JSON.stringify(opened).slice(0, 200)
   );
   check("/api/followups 404s an unknown id", (await fetch(`${BASE}/api/followups/${"-".repeat(10)}`)).status === 404);
+  // Editing rewrites the same file and leaves everything that places the
+  // follow-up alone, so an edit never reorders the list or loses its session.
+  const editedText = "## Edited\n\nRewritten by hand.\n";
+  const edited = await fetch(`${BASE}/api/followups/${followupId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "EditedTitle", text: editedText }),
+  });
+  const editedBody = await edited.json().catch(() => ({}));
+  check("/api/followups PATCH updates title and text", edited.ok && editedBody.followup?.title === "EditedTitle", JSON.stringify(editedBody).slice(0, 200));
+  const reread = await (await fetch(`${BASE}/api/followups/${followupId}`)).json();
+  check(
+    "/api/followups PATCH persists the new body under the same id",
+    reread.followup?.id === followupId &&
+      reread.followup?.text === editedText &&
+      reread.followup?.cwd === "/tmp/ws-alpha" &&
+      reread.followup?.createdAt === opened.followup?.createdAt,
+    JSON.stringify(reread).slice(0, 200)
+  );
+  const relisted = await (await fetch(`${BASE}/api/followups`)).json();
+  check(
+    "/api/followups lists an edit with its new title and size",
+    relisted.followups.length === 1 && relisted.followups[0].title === "EditedTitle" && relisted.followups[0].chars === editedText.length,
+    JSON.stringify(relisted).slice(0, 200)
+  );
+  check(
+    "/api/followups PATCH rejects an empty body",
+    (await fetch(`${BASE}/api/followups/${followupId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "   " }),
+    })).status === 400
+  );
+  check(
+    "/api/followups PATCH 404s an unknown id",
+    (await fetch(`${BASE}/api/followups/${"-".repeat(10)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "x" }),
+    })).status === 404
+  );
+  const editTraversal = (await fetch(`${BASE}/api/followups/${encodeURIComponent("..%2F..%2Fetc%2Fpasswd")}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "x" }),
+  })).status;
+  check("a follow-up id cannot escape the directory when editing", editTraversal === 404 || editTraversal === 400, `got ${editTraversal}`);
   check("/api/followups rejects an empty body", (await fetch(`${BASE}/api/followups`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

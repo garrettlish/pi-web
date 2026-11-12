@@ -1139,6 +1139,29 @@ details.item-thinking[open] > summary { margin-bottom: 4px; }
 }
 .fu-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .fu-body { font-size: 13.5px; line-height: 1.55; }
+/* In-place editing: the title keeps the document's own type size so the header
+   does not jump when the text becomes an input, and the body edits the Markdown
+   source in a mono face — that is the text a later open re-renders. */
+.fu-title-input {
+  display: block; width: 100%; padding: 1px 8px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: var(--font-ui); font-size: 19px; font-weight: 600;
+  letter-spacing: -0.2px; line-height: 1.35;
+  outline: none;
+}
+.fu-body-input {
+  display: block; width: 100%; min-height: 320px; resize: vertical;
+  padding: 10px 12px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  outline: none;
+}
+.fu-title-input:focus,
+.fu-body-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); }
+.turn-action.primary { color: var(--accent); border-color: var(--accent); }
+.turn-action.primary:hover { background: var(--accent-tint); color: var(--accent); }
 @media (max-width: 720px) {
   #followup-view { padding: 12px 12px 24px; }
 }

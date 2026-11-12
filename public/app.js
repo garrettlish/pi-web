@@ -118,6 +118,8 @@ const state = {
   /** open follow-up in the main column, or null; while set, the transcript is
    *  not shown and no pi process is involved */
   openFollowup: null,
+  /** true while the open follow-up is being edited in place (title + body) */
+  followupEditing: false,
   cwd: null,
   /** selected workspace cwd; null = workspace list view; undefined = not yet initialized */
   workspace: undefined,
@@ -2546,6 +2548,7 @@ const STAR_OUTLINE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentC
 /** a bookmark: keeping a summary is a save, not a star */
 const FOLLOWUP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4h11a1 1 0 0 1 1 1v15l-6.5-4-6.5 4V5a1 1 0 0 1 1-1z"/></svg>`;
 const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5.5A1.5 1.5 0 0 0 13.5 4H5.5A1.5 1.5 0 0 0 4 5.5v8A1.5 1.5 0 0 0 5.5 15"/></svg>`;
+const EDIT_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4l10-10a2.5 2.5 0 0 0-3.5-3.5L4.5 16.5 4 20z"/></svg>`;
 
 /** two-level display name, e.g. /home/me/work/pi-web -> "work/pi-web" */
 function wsLabel(p) {
@@ -2932,6 +2935,7 @@ function renderSidebar() {
 // Nothing about it needs pi — that is the point, a follow-up opens instantly.
 function renderFollowup(rec) {
   const view = $("#followup-view");
+  const editing = state.followupEditing;
   const head = el(
     "div",
     { class: "fu-head" },
@@ -2939,47 +2943,160 @@ function renderFollowup(rec) {
       "button",
       {
         class: "fu-back",
-        title: "Back to the session (Esc)",
-        onclick: () => closeFollowup(),
+        // while editing, leaving would silently drop the typed title and body,
+        // so Back discards the edit first and a second press leaves
+        title: editing ? "Discard the edit (Esc)" : "Back to the session (Esc)",
+        onclick: () => (editing ? cancelFollowupEdit() : closeFollowup()),
       },
       el("span", { class: "fu-back-arrow", text: "←" }),
       el("span", { text: "Back" })
     ),
-    el("div", { class: "fu-title", text: rec.title || "(untitled follow-up)" }),
+    editing
+      ? el("input", {
+          class: "fu-title-input",
+          id: "fu-title-input",
+          value: rec.title || "",
+          placeholder: "(untitled follow-up)",
+          "aria-label": "Follow-up title",
+          maxlength: "300",
+          onkeydown: (e) => onFollowupEditKey(e, rec),
+        })
+      : el("div", { class: "fu-title", text: rec.title || "(untitled follow-up)" }),
     el(
       "div",
       { class: "fu-meta" },
       el("span", { text: fmtDate(rec.createdAt) }),
-      rec.cwd ? el("span", { text: wsLabel(rec.cwd), title: rec.cwd }) : null,
-      rec.sessionTitle ? el("span", { text: `from ${truncate(rec.sessionTitle, 60)}`, title: rec.sessionTitle }) : null
+      rec.cwd ? el("span", { text: wsLabel(rec.cwd), title: rec.cwd }) : null
     ),
-    el(
-      "div",
-      { class: "fu-actions" },
-      el("button", {
-        class: "turn-action",
-        title: "Copy as rich text (Markdown on the clipboard too)",
-        onclick: async () => {
-          toast((await copyRichText(rec.text)) ? "copied as rich text" : "copy failed", "info");
-        },
-      }, el("span", { class: "turn-action-icon", html: COPY_ICON }), el("span", { text: "Copy" })),
-      el("button", {
-        class: "turn-action",
-        title: "Open the session this summary came from",
-        onclick: () => openFollowupSession(rec),
-      }, el("span", { text: "Open session" })),
-      el("button", {
-        class: "turn-action danger",
-        title: "Delete this follow-up",
-        onclick: () => deleteFollowup(rec.id),
-      }, el("span", { text: "Delete" }))
-    )
+    editing
+      ? el(
+          "div",
+          { class: "fu-actions" },
+          el("button", {
+            class: "turn-action primary",
+            title: "Save title and body (Cmd/Ctrl+Enter)",
+            onclick: () => commitFollowupEdit(rec),
+          }, el("span", { text: "Save" })),
+          el("button", {
+            class: "turn-action",
+            title: "Discard changes (Esc)",
+            onclick: () => cancelFollowupEdit(),
+          }, el("span", { text: "Cancel" }))
+        )
+      : el(
+          "div",
+          { class: "fu-actions" },
+          el("button", {
+            class: "turn-action",
+            title: "Copy as rich text (Markdown on the clipboard too)",
+            onclick: async () => {
+              toast((await copyRichText(rec.text)) ? "copied as rich text" : "copy failed", "info");
+            },
+          }, el("span", { class: "turn-action-icon", html: COPY_ICON }), el("span", { text: "Copy" })),
+          el("button", {
+            class: "turn-action",
+            title: "Edit the title and the summary text",
+            onclick: () => startFollowupEdit(rec),
+          }, el("span", { class: "turn-action-icon", html: EDIT_ICON }), el("span", { text: "Edit" })),
+          el("button", {
+            class: "turn-action",
+            title: "Open the session this summary came from",
+            onclick: () => openFollowupSession(rec),
+          }, el("span", { text: "Open session" })),
+          el("button", {
+            class: "turn-action danger",
+            title: "Delete this follow-up",
+            onclick: () => deleteFollowup(rec.id),
+          }, el("span", { text: "Delete" }))
+        )
   );
-  const body = el("div", { class: "assistant-text fu-body" });
-  // renderMarkdown escapes the source text up front; htmlFragment keeps the
-  // result off innerHTML, exactly as the transcript does
-  body.replaceChildren(...htmlFragment(renderMarkdown(rec.text || "")));
-  view.replaceChildren(head, body);
+  if (editing) {
+    // Markdown source, not rendered output: the stored text is what a later
+    // open re-renders, so editing the source is the only edit that survives
+    const area = el("textarea", {
+      class: "fu-body-input",
+      id: "fu-body-input",
+      "aria-label": "Follow-up text (Markdown)",
+      spellcheck: "false",
+    });
+    area.value = rec.text || "";
+    area.addEventListener("keydown", (e) => onFollowupEditKey(e, rec));
+    view.replaceChildren(head, area);
+    setTimeout(() => {
+      area.focus();
+      area.setSelectionRange(area.value.length, area.value.length);
+      area.scrollTop = 0;
+    }, 0);
+  } else {
+    const body = el("div", { class: "assistant-text fu-body" });
+    // renderMarkdown escapes the source text up front; htmlFragment keeps the
+    // result off innerHTML, exactly as the transcript does
+    body.replaceChildren(...htmlFragment(renderMarkdown(rec.text || "")));
+    view.replaceChildren(head, body);
+  }
+}
+
+/** Edit in place rather than in a dialog: the summary is the thing being
+ *  changed, so it has to stay on screen while the title and body are typed. */
+function startFollowupEdit(rec) {
+  state.followupEditing = true;
+  renderFollowup(rec);
+}
+
+function cancelFollowupEdit() {
+  if (!state.followupEditing) return;
+  state.followupEditing = false;
+  if (state.openFollowup) renderFollowup(state.openFollowup);
+}
+
+/** Esc cancels the edit rather than leaving the follow-up, and Cmd/Ctrl+Enter
+ *  saves. Escape is stopped here so the document-level handler — which closes
+ *  the follow-up — never sees it. */
+function onFollowupEditKey(e, rec) {
+  if (e.isComposing || e.keyCode === 229) return; // IME candidate confirmation
+  if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    cancelFollowupEdit();
+    return;
+  }
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    e.stopPropagation();
+    commitFollowupEdit(rec);
+  }
+}
+
+/** Persist the title and Markdown body, then re-render the document and the
+ *  sidebar row from what the server stored. */
+async function commitFollowupEdit(rec) {
+  const titleEl = $("#fu-title-input");
+  const bodyEl = $("#fu-body-input");
+  const title = (titleEl?.value || "").trim();
+  const text = bodyEl?.value ?? "";
+  if (!text.trim()) {
+    toast("a follow-up needs some text", "error");
+    bodyEl?.focus();
+    return;
+  }
+  let saved;
+  try {
+    const data = await api(`/api/followups/${encodeURIComponent(rec.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, text }),
+    });
+    saved = data.followup;
+  } catch (err) {
+    toast(`could not save follow-up: ${err.message}`, "error");
+    return;
+  }
+  state.followupEditing = false;
+  state.openFollowup = saved;
+  renderFollowup(saved);
+  renderHeader();
+  await loadFollowups();
+  toast("follow-up updated");
 }
 
 /** Show one saved follow-up in the main column. The transcript is hidden, not
@@ -2996,6 +3113,7 @@ async function openFollowup(id) {
   }
   if (!rec) return;
   state.openFollowup = rec;
+  state.followupEditing = false;
   renderFollowup(rec);
   $("#followup-view").classList.remove("hidden");
   $("#transcript-wrap").classList.add("hidden");
@@ -3009,6 +3127,7 @@ async function openFollowup(id) {
 function closeFollowup() {
   if (!state.openFollowup) return;
   state.openFollowup = null;
+  state.followupEditing = false;
   $("#followup-view").classList.add("hidden");
   $("#transcript-wrap").classList.remove("hidden");
   $("#composer-dock").classList.remove("hidden");
@@ -4847,7 +4966,10 @@ document.addEventListener("keydown", (e) => {
     } else if (!searchOverlay.classList.contains("hidden")) {
       setSearchOpen(false);
     } else if (!$("#followup-view").classList.contains("hidden")) {
-      closeFollowup();
+      // an in-place edit takes Escape first: cancelling the edit must not also
+      // close the document being edited
+      if (state.followupEditing) cancelFollowupEdit();
+      else closeFollowup();
     } else if (!$("#ws-overlay").classList.contains("hidden")) {
       closeWsPicker();
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
