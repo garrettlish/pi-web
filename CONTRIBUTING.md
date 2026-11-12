@@ -39,7 +39,9 @@ Please do not open a public issue. See [SECURITY.md](SECURITY.md).
 | --- | --- |
 | Process pool, client routing, HTTP endpoints | `server.js` |
 | Session listing and JSONL parsing | `server.js` (`listSessions`, `sessionCwd`) |
+| Follow-up store (one JSON file per saved summary) | `server.js` (`listFollowups`, `readFollowup`) |
 | Transcript item model (entries → renderable items) | `public/app.js` (`buildItemsFromEntries`) |
+| Turn copy (rich clipboard) and follow-up save | `public/app.js` (`copyRichText`, `emailHtml`, `saveFollowup`) |
 | Live event handling | `public/app.js` (`handleEvent`) |
 | Transcript reconciliation (no full re-render) | `public/app.js` (`renderTranscript`) |
 | Design tokens and themes | `public/style.css` (`:root`, `[data-theme="<palette>"]`) |

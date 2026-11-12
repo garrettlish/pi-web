@@ -117,8 +117,12 @@ pi-web --cwd ~/code/my-project
 **Sessions**
 
 - The sidebar lists every session under the pi session directory with title, message count, cost
-  and last activity. **Recent** is a flat, cross-project list; **Workspaces** is a two-level
-  project → session view; **Favorites** is a flat list of the sessions you starred. The star beside
+  and last activity. Each row shows the title on up to two lines (so long prompts stay readable),
+  then the repository, then the date and message count. **Recent** is a flat, cross-project list;
+  **Workspaces** is a two-level
+  project → session view; **Favorites** is a flat list of the sessions you starred; **Follow-ups**
+  lists the summaries you kept (next section). The four view tabs share one row at every sidebar
+  width; below about 240px the labels ellipsize rather than wrap. The star beside
   the session details button in the header adds or removes the open session, and each row in the
   Favorites tab carries a star that removes it. Stars live in the browser's local storage, so they
   are per-browser and survive reloads; a starred session that no longer exists is skipped.
@@ -133,8 +137,8 @@ pi-web --cwd ~/code/my-project
   the previous one: it keeps running in the background (marked with a pulsing dot in the sidebar)
   and you can re-attach at any time. Each browser tab is bound to exactly one process, so parallel
   tabs never interleave each other's output.
-- Sessions are addressable: the URL hash (`#ws=…&session=…`) survives a reload and can be
-  bookmarked or shared between your own tabs.
+- Sessions are addressable: the URL hash (`#ws=…&session=…&followup=…`) survives a reload and can be
+  bookmarked or shared between your own tabs; with a follow-up open, `&followup=<id>` reopens it.
 - Idle processes with no attached tab are reaped after 30 minutes.
 - The sidebar filter matches a session's title only. The search button beside the workspace button
   (or `Cmd/Ctrl`+`K`) opens a dialog with three tabs, **Prompts** first and selected by default:
@@ -152,6 +156,23 @@ pi-web --cwd ~/code/my-project
   to the message, or opening the tool call's request/response popup. The system prompt and thinking
   blocks are left out of the index: identical in every session, they would bury every query under
   false hits.
+
+**Follow-ups and copying a summary**
+
+- Each assistant turn carries two quiet controls at its foot. **Copy** puts the answer on the
+  clipboard as **rich text plus Markdown** at once: headings, lists, tables and code are rewritten
+  with inline styles (email clients drop class-based CSS, which is why a pasted summary used to lose
+  its structure), while anything that only accepts plain text gets the Markdown source.
+- **Follow-up** appears on the turn that concludes a run — the same turn the prompt outline jumps
+  to and the search's summary scope covers — and saves that answer to a JSON file under
+  `~/.pi/followups`. The **Follow-ups** sidebar tab lists what you kept, newest first; clicking a row
+  opens the summary as a document in the main column, laid out like the transcript (full width, same
+  gutter, no centered reading column), with a **Back** control, **Copy**, **Open
+  session** and **Delete**. Opening one reads only that file: no `pi` process is spawned and no
+  session is replayed, so it is immediate even when the original session has been deleted. The tab
+  filter matches a follow-up's title and its session title.
+- A run that was aborted, failed, is still streaming or ended mid tool loop has no summary, so it
+  offers **Copy** only.
 
 **Controls**
 
@@ -212,7 +233,7 @@ pi-web --cwd ~/code/my-project
 
 | File | Role |
 | --- | --- |
-| `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, static files |
+| `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, follow-up store, static files |
 | `public/index.html` | Application shell |
 | `public/app.js` | State, transcript reconciliation, event handling — no framework |
 | `public/style.css` | Design tokens, the six palettes, layout |
@@ -241,6 +262,10 @@ localhost-only by default.
 | `POST /api/ui-response` | Answer an extension UI request |
 | `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
 | `GET /api/sessions` | List sessions with live active/streaming flags |
+| `GET /api/followups` | List saved follow-ups: `{ followups: [{ id, title, createdAt, ts, cwd, sessionFile, sessionTitle, chars }] }` — metadata only, no bodies |
+| `POST /api/followups` | `{ title, text, ts?, cwd?, sessionFile?, sessionTitle? }` — save one summary under the follow-up directory; returns its metadata |
+| `GET /api/followups/<id>` | One saved follow-up, including its stored Markdown `text` |
+| `DELETE /api/followups/<id>` | Delete a saved follow-up |
 | `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts\|summary>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts, `scope=summary` to the answer each run concluded with; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
 | `GET /api/mcp?client=<id>` | MCP server state as `pi mcp list --json` reports it, run in that client's session workspace; `{ servers, errors }`, where a disconnected server still returns 200 with its state and error |
@@ -255,6 +280,7 @@ Command-line flags (each has an environment-variable equivalent):
 | `--host <addr>` | `PI_WEB_HOST` | `127.0.0.1` | Bind address; a non-loopback value enables remote access |
 | `--cwd <dir>` | `PI_WEB_CWD` | current directory | Directory the agent works in |
 | `--session-dir <dir>` | `PI_CODING_AGENT_SESSION_DIR` | `~/.pi/agent/sessions` | Where pi stores sessions |
+| `--followup-dir <dir>` | `PI_WEB_FOLLOWUP_DIR` | `~/.pi/followups` | Where Follow-ups are saved (one JSON file each) |
 | `--pi <path>` | `PI_BIN` | `pi` on `PATH` | pi executable to spawn |
 | `--allow-remote` | `PI_WEB_ALLOW_REMOTE=1` | off | Drop the loopback request guards (reverse proxies) |
 
@@ -298,6 +324,10 @@ Either way, put authentication in front of the port before it is reachable by an
   Parsed indexes live in a byte-capped in-memory cache and are keyed by each file's mtime and size.
 - Session summaries for the sidebar are cached per file under the same mtime+size key, so polling
   re-parses only the sessions that changed instead of re-reading the whole corpus.
+- Follow-ups are read from and written to the configured follow-up directory only, by UUID-derived
+  file name; the id in the URL must match `[A-Za-z0-9_-]{1,80}`, so a request cannot address any
+  other path. Saving writes a temporary file and renames it, so a half-written summary is never
+  listed. The list endpoint returns metadata only; a body is read only when a follow-up is opened.
 - No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
   `textContent`, and the Markdown subset escapes before formatting.
 - Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
@@ -315,7 +345,9 @@ npm test           # end-to-end smoke test (starts a throwaway server)
 `npm test` boots the server on a random port and verifies what has actually broken before: the page
 and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
 skips the system prompt and thinking blocks, each scope stops where it should (a prompt, a mid-loop
-answer and an aborted run stay out of the summary scope), foreign `Host`/`Origin` requests are
+answer and an aborted run stay out of the summary scope), follow-ups round-trip through their own
+directory (save, list without bodies, read, delete, and an id that cannot escape it), foreign
+`Host`/`Origin` requests are
 rejected, path traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also
 pins the static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event
 streams from accumulating. It runs against a throwaway session directory, needs no agent
@@ -336,6 +368,8 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - The RPC `bash` command is intentionally unused — send prompts instead.
 - No authentication. See [Remote access](#remote-access).
 - No multi-user support: one person, one machine, many tabs.
+- A follow-up keeps the summary's Markdown text only. Images in it are not copied, and it is not
+  updated when the session it came from changes — save it again for a newer answer.
 - Cross-session search indexes the text of every message in every session file, not only the active
   branch. History from before a compaction is reachable (and rendered), but a message on a branch
   that was branched away from has no transcript row: clicking such a hit reports that it is not on

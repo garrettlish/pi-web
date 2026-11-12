@@ -4,7 +4,8 @@
  *
  * Usage:
  *   node server.js [--port 3210] [--host 127.0.0.1] [--cwd <project-dir>]
- *                  [--session-dir <dir>] [--pi <pi-bin>] [--allow-remote]
+ *                  [--session-dir <dir>] [--followup-dir <dir>]
+ *                  [--pi <pi-bin>] [--allow-remote]
  *
  * Security model: this process can start the agent, which can run shell
  * commands as you. It binds to loopback and rejects requests whose Host or
@@ -45,6 +46,9 @@ Options:
   --cwd <dir>         Directory the agent works in (default: current directory)
   --session-dir <dir> Where pi stores session files
                       (default: ~/.pi/agent/sessions, env PI_CODING_AGENT_SESSION_DIR)
+  --followup-dir <dir>
+                      Where Follow-ups are saved (default: ~/.pi/followups,
+                      env PI_WEB_FOLLOWUP_DIR)
   --pi <path>         pi executable to spawn (default: "pi" on PATH, env PI_BIN)
   --allow-remote      Disable the localhost-only request guards while still
                       binding to 127.0.0.1 (for reverse proxies; see README)
@@ -53,7 +57,7 @@ Options:
 
 Environment:
   PI_WEB_PORT, PI_WEB_HOST, PI_WEB_CWD, PI_BIN,
-  PI_CODING_AGENT_SESSION_DIR, PI_WEB_ALLOW_REMOTE
+  PI_CODING_AGENT_SESSION_DIR, PI_WEB_FOLLOWUP_DIR, PI_WEB_ALLOW_REMOTE
 `;
 
 if (process.argv.includes("-h") || process.argv.includes("--help")) {
@@ -790,6 +794,91 @@ async function sessionsWithStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Follow-ups
+// ---------------------------------------------------------------------------
+// A follow-up is a run's summary the user kept, stored as one plain JSON file
+// under FOLLOWUP_DIR. It is deliberately independent of the session it came
+// from: reading a follow-up must not spawn pi, replay a transcript, or even
+// need the session file to still exist — the answer is already here. The id is
+// a UUID, so it is also the file name and the only thing a client may address.
+const FOLLOWUP_DIR = path.resolve(
+  argValue("--followup-dir", process.env.PI_WEB_FOLLOWUP_DIR || path.join(os.homedir(), ".pi", "followups"))
+);
+const FOLLOWUP_ID = /^[A-Za-z0-9_-]{1,80}$/;
+const FOLLOWUP_TEXT_MAX = 2 * 1024 * 1024;
+const FOLLOWUP_LIST_MAX = 500;
+/** per-file metadata, keyed by path and validated by mtime+size: listing reads
+ *  every follow-up once, then only the ones that changed */
+const followupCache = new Map();
+
+function followupPath(id) {
+  return path.join(FOLLOWUP_DIR, `${id}.json`);
+}
+
+function followupMeta(rec) {
+  return {
+    id: rec.id,
+    title: rec.title || "",
+    createdAt: rec.createdAt || 0,
+    ts: rec.ts ?? null,
+    cwd: rec.cwd || null,
+    sessionFile: rec.sessionFile || null,
+    sessionTitle: rec.sessionTitle || null,
+    chars: typeof rec.text === "string" ? rec.text.length : 0,
+  };
+}
+
+function stringField(value, max) {
+  return typeof value === "string" ? value.slice(0, max) : null;
+}
+
+async function listFollowups() {
+  let names;
+  try {
+    names = await fsp.readdir(FOLLOWUP_DIR);
+  } catch {
+    return []; // the directory only appears once something is saved
+  }
+  const list = [];
+  const live = new Set();
+  for (const name of names) {
+    const match = name.match(/^([A-Za-z0-9_-]{1,80})\.json$/);
+    if (!match) continue;
+    const file = followupPath(match[1]);
+    live.add(file);
+    let st;
+    try {
+      st = await fsp.stat(file);
+    } catch {
+      continue;
+    }
+    const key = `${st.mtimeMs}:${st.size}`;
+    const cached = followupCache.get(file);
+    if (cached && cached.key === key) {
+      list.push(cached.meta);
+      continue;
+    }
+    try {
+      const rec = JSON.parse(await fsp.readFile(file, "utf8"));
+      if (!rec || rec.id !== match[1]) continue; // a file that is not ours
+      const meta = followupMeta(rec);
+      followupCache.set(file, { key, meta });
+      list.push(meta);
+    } catch {
+      followupCache.delete(file); // a truncated write is not a follow-up
+    }
+  }
+  for (const file of followupCache.keys()) if (!live.has(file)) followupCache.delete(file);
+  return list.sort((a, b) => b.createdAt - a.createdAt).slice(0, FOLLOWUP_LIST_MAX);
+}
+
+async function readFollowup(id) {
+  const rec = JSON.parse(await fsp.readFile(followupPath(id), "utf8"));
+  if (!rec || rec.id !== id) throw new Error("not a follow-up");
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
 // Cross-session search
 // ---------------------------------------------------------------------------
 // The sidebar filter only sees each session's title (its first user prompt).
@@ -1256,6 +1345,68 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/sessions" && req.method === "GET") {
       sendJson(res, 200, { sessions: await sessionsWithStatus() });
+      return;
+    }
+
+    // Follow-ups: the summaries the user kept. The list carries metadata only,
+    // so the sidebar never downloads full answers; one follow-up is fetched when
+    // it is opened, and that read never touches pi or the session directory.
+    if (pathname === "/api/followups" && req.method === "GET") {
+      sendJson(res, 200, { followups: await listFollowups() });
+      return;
+    }
+
+    if (pathname === "/api/followups" && req.method === "POST") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const text = stringField(body.text, FOLLOWUP_TEXT_MAX);
+      if (!text || !text.trim()) {
+        sendJson(res, 400, { error: "a follow-up needs the summary text" });
+        return;
+      }
+      const record = {
+        id: randomUUID(),
+        version: 1,
+        createdAt: Date.now(),
+        title: stringField(body.title, 300) || text.trim().split("\n")[0].slice(0, 120),
+        text,
+        ts: Number.isFinite(Number(body.ts)) && body.ts ? Number(body.ts) : null,
+        cwd: stringField(body.cwd, 4096),
+        sessionFile: stringField(body.sessionFile, 4096),
+        sessionTitle: stringField(body.sessionTitle, 300),
+      };
+      await fsp.mkdir(FOLLOWUP_DIR, { recursive: true });
+      // write-then-rename: a half-written file must never be listed as a
+      // follow-up, and a rename is atomic within the directory
+      const target = followupPath(record.id);
+      const temp = `${target}.${process.pid}.tmp`;
+      await fsp.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+      await fsp.rename(temp, target);
+      sendJson(res, 200, { followup: followupMeta(record) });
+      return;
+    }
+
+    const followupMatch = pathname.match(/^\/api\/followups\/([A-Za-z0-9_-]+)$/);
+    if (followupMatch && !FOLLOWUP_ID.test(followupMatch[1])) {
+      // the capture group is already narrow; keep the check so a future regex
+      // change cannot turn this into a path traversal
+      sendJson(res, 400, { error: "bad follow-up id" });
+      return;
+    }
+    if (followupMatch && req.method === "GET") {
+      try {
+        sendJson(res, 200, { followup: await readFollowup(followupMatch[1]) });
+      } catch {
+        sendJson(res, 404, { error: "no such follow-up" });
+      }
+      return;
+    }
+    if (followupMatch && req.method === "DELETE") {
+      try {
+        await fsp.unlink(followupPath(followupMatch[1]));
+      } catch (err) {
+        if (err.code !== "ENOENT") throw err;
+      }
+      sendJson(res, 200, { ok: true });
       return;
     }
 

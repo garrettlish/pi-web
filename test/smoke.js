@@ -27,6 +27,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 // A throwaway session directory keeps /api/sessions and /api/search
 // deterministic and independent of whatever real sessions this machine has.
 const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-smoke-"));
+// Follow-ups live in their own directory, so the smoke test exercises the real
+// save/list/read/delete path without touching ~/.pi/followups.
+const FOLLOWUP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-followups-"));
 function writeFixture(dirName, file, lines) {
   const dir = path.join(FIXTURE_DIR, dirName);
   fs.mkdirSync(dir, { recursive: true });
@@ -229,7 +232,7 @@ writeFixture("--tmp-ws-gamma--", "2026-03-03T00-00-00-000Z_cccc.jsonl", [
 
 const server = spawn(
   process.execPath,
-  [path.join(ROOT, "server.js"), "--port", String(PORT), "--session-dir", FIXTURE_DIR],
+  [path.join(ROOT, "server.js"), "--port", String(PORT), "--session-dir", FIXTURE_DIR, "--followup-dir", FOLLOWUP_DIR],
   {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "pipe"],
@@ -428,6 +431,52 @@ try {
   const mcp = await mcpRes.json().catch(() => ({}));
   check("/api/mcp answers with a server list", mcpRes.status === 200 && Array.isArray(mcp.servers), `got ${mcpRes.status}`);
   check("/api/mcp answers with an errors list", Array.isArray(mcp.errors), JSON.stringify(mcp).slice(0, 200));
+
+  // Follow-ups: a summary the user kept, stored under the configured directory
+  // and readable without pi or the session it came from. The write is the real
+  // one — there is no separate fixture path — and the read must not need the
+  // session file to exist.
+  const emptyFollowups = await (await fetch(`${BASE}/api/followups`)).json();
+  check("/api/followups starts empty", Array.isArray(emptyFollowups.followups) && emptyFollowups.followups.length === 0);
+  const followupText = "## Findings\n\nThe module is unused.\n\n| file | note |\n| --- | --- |\n| a.js | dead |\n";
+  const saved = await fetch(`${BASE}/api/followups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "FollowupTitle", text: followupText, cwd: "/tmp/ws-alpha" }),
+  });
+  const savedBody = await saved.json().catch(() => ({}));
+  check("/api/followups saves a summary", saved.ok && typeof savedBody.followup?.id === "string", JSON.stringify(savedBody).slice(0, 200));
+  const followupId = savedBody.followup?.id;
+  const savedFile = path.join(FOLLOWUP_DIR, `${followupId}.json`);
+  check("a follow-up is one JSON file on disk", fs.existsSync(savedFile), savedFile);
+  const listed = await (await fetch(`${BASE}/api/followups`)).json();
+  check(
+    "/api/followups lists the saved summary with metadata",
+    listed.followups.length === 1 && listed.followups[0].title === "FollowupTitle" && listed.followups[0].chars === followupText.length,
+    JSON.stringify(listed).slice(0, 200)
+  );
+  check(
+    "/api/followups lists metadata without the body",
+    listed.followups[0]?.text === undefined,
+    JSON.stringify(listed.followups[0]).slice(0, 200)
+  );
+  const opened = await (await fetch(`${BASE}/api/followups/${followupId}`)).json();
+  check(
+    "/api/followups returns the stored Markdown",
+    opened.followup?.text === followupText,
+    JSON.stringify(opened).slice(0, 200)
+  );
+  check("/api/followups 404s an unknown id", (await fetch(`${BASE}/api/followups/${"-".repeat(10)}`)).status === 404);
+  check("/api/followups rejects an empty body", (await fetch(`${BASE}/api/followups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "x", text: "   " }),
+  })).status === 400);
+  const traversal = await fetch(`${BASE}/api/followups/${encodeURIComponent("..%2F..%2Fetc%2Fpasswd")}`);
+  check("a follow-up id cannot escape the follow-up directory", traversal.status === 404 || traversal.status === 400, `got ${traversal.status}`);
+  const removed = await fetch(`${BASE}/api/followups/${followupId}`, { method: "DELETE" });
+  check("/api/followups deletes a summary", removed.ok && !fs.existsSync(savedFile), `got ${removed.status}`);
+  check("deleting a follow-up twice is not an error", (await fetch(`${BASE}/api/followups/${followupId}`, { method: "DELETE" })).ok);
 
   const sessions = await (await fetch(`${BASE}/api/sessions`)).json();
   check("/api/sessions returns a list", Array.isArray(sessions.sessions));
@@ -668,6 +717,7 @@ try {
 } finally {
   stopServer();
   fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });
+  fs.rmSync(FOLLOWUP_DIR, { recursive: true, force: true });
 }
 
 if (failures) {

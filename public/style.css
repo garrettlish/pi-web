@@ -447,8 +447,15 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   border-color: var(--accent-tint-border);
 }
 .session-item .s-title {
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: flex-start; gap: 6px;
   font-size: 12.5px; font-weight: 500;
+}
+/* two lines of subject: one ellipsized line hid most titles' meaning */
+.session-item .s-title-text {
+  flex: 1; min-width: 0;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 .session-item.active .s-title { font-weight: 600; }
 /* the workspace a session belongs to, as a quiet chip under its title */
@@ -471,6 +478,8 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
 .session-item .s-dot {
   flex: none; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: var(--success);
+  /* center on the first title line, not on the two-line block */
+  margin-top: 5px;
 }
 .session-item .s-dot.streaming {
   background: var(--warning);
@@ -493,7 +502,11 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
 #btn-resources { flex: none; }
 
 /* sidebar view tabs: a segmented control (Apple's segmented pattern), with the
-   selected segment raised on a surface instead of filled with accent */
+   selected segment raised on a surface instead of filled with accent. One row,
+   always — a second row costs the session list its first item. Equal segments
+   do not work: four equal cells at 280px clip both "Workspaces" and
+   "Follow-ups", so each segment takes the width its label needs and shares the
+   slack. Below ~240px the labels ellipsize rather than wrap. */
 .sidebar-tabs {
   display: flex; gap: 1px;
   margin: 0 12px 10px; padding: 2px;
@@ -502,10 +515,11 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
   border-radius: var(--radius-sm);
 }
 #sidebar .sidebar-tabs button {
-  flex: 1 1 0; min-width: 0; min-height: 22px;
-  padding: 2px 4px;
+  flex: 1 1 auto; min-width: 0; min-height: 22px;
+  padding: 2px 2px;
   background: transparent; border-color: transparent; color: var(--text-2);
-  font-size: 11.5px; font-weight: 500;
+  font-size: 11px; font-weight: 500; letter-spacing: -0.1px;
+  border-radius: var(--radius-xs);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #sidebar .sidebar-tabs button:hover { background: transparent; color: var(--text); }
@@ -569,6 +583,14 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
 #sidebar .session-item .s-unstar:hover {
   background: transparent; border-color: transparent; color: var(--accent-text);
 }
+/* a follow-up row's delete control is a plain glyph, not the star: it is not
+   the row's primary action, so it stays quiet until hovered */
+#sidebar .session-item .s-delete {
+  margin-left: auto; flex: none; width: 20px; height: 20px; min-height: 20px; padding: 0;
+  background: transparent; border-color: transparent;
+  color: var(--text-3); font-size: 11px; line-height: 1;
+}
+#sidebar .session-item .s-delete:hover { background: transparent; border-color: transparent; color: var(--danger); }
 
 /* ---------------------------------------------------------------------------
    Main column
@@ -1059,6 +1081,67 @@ details.item-thinking[open] > summary { margin-bottom: 4px; }
 }
 .assistant-meta:hover { color: var(--text-2); }
 .assistant-meta .stop-error { color: var(--danger); }
+
+/* actions on a run's summary: keep it as a follow-up, copy it as rich text.
+   Quiet (tertiary ink on a hairline) rather than dimmed: opacity would drop the
+   label under 4.5:1 in the dark palettes, and these are real controls. */
+.turn-actions {
+  display: flex; gap: 6px; margin-top: 8px;
+}
+.turn-action {
+  display: inline-flex; align-items: center; gap: 5px;
+  min-height: 24px; padding: 1px 9px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-2); font-size: 11.5px; font-weight: 500;
+}
+.turn-action:hover { background: var(--elevated); border-color: var(--border-strong); color: var(--text); }
+.turn-action.danger { color: var(--danger); }
+.turn-action.danger:hover { background: var(--danger-tint); border-color: var(--danger); color: var(--danger); }
+.turn-action-icon { display: inline-flex; }
+.turn-action-icon svg { width: 13px; height: 13px; display: block; }
+
+/* ---------------------------------------------------------------------------
+   Follow-up view
+
+   A saved summary is a document, not a transcript: it takes the transcript's
+   place in the main column, the composer goes away, and reading it touches no
+   agent process. It uses the transcript's own box — same padding, no capped
+   column — because a summary is read the same way an answer is, and a centered
+   820px column left half the window as dead gutter on a wide screen.
+--------------------------------------------------------------------------- */
+#followup-view {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 18px 20px 32px;
+}
+.fu-head {
+  margin-bottom: 18px;
+  padding-bottom: 14px; border-bottom: 1px solid var(--border);
+}
+/* the only way back that does not depend on the sidebar row staying visible */
+.fu-back {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-bottom: 10px; padding: 1px 9px 1px 6px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  color: var(--text-2); font-size: 12px; font-weight: 500;
+}
+.fu-back:hover { background: var(--elevated); border-color: var(--border); color: var(--text); }
+.fu-back-arrow { font-size: 13px; line-height: 1; }
+.fu-title {
+  font-size: 19px; font-weight: 600; letter-spacing: -0.2px; line-height: 1.35;
+  color: var(--text);
+}
+.fu-meta {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-top: 7px;
+  font-size: 11.5px; color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.fu-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.fu-body { font-size: 13.5px; line-height: 1.55; }
+@media (max-width: 720px) {
+  #followup-view { padding: 12px 12px 24px; }
+}
 
 /* ---------------------------------------------------------------------------
    Tool call rows

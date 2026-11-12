@@ -55,9 +55,10 @@
         </span>
       </div>
       <div id="sidebar-tabs" class="sidebar-tabs" role="tablist" aria-label="Session views">
-        <button id="tab-workspaces" role="tab" aria-selected="false">Workspaces</button>
-        <button id="tab-recent" role="tab" aria-selected="true">Recent</button>
-        <button id="tab-favorites" role="tab" aria-selected="false">Favorites</button>
+        <button id="tab-workspaces" role="tab" aria-selected="false" title="Workspaces">Workspaces</button>
+        <button id="tab-recent" role="tab" aria-selected="true" title="Recent">Recent</button>
+        <button id="tab-favorites" role="tab" aria-selected="false" title="Favorites">Favorites</button>
+        <button id="tab-followups" role="tab" aria-selected="false" title="Follow-ups">Follow-ups</button>
       </div>
       <div id="sidebar-crumb" class="sidebar-crumb hidden">
         <button id="btn-back-workspaces" class="icon-btn" title="All workspaces" aria-label="All workspaces">
@@ -124,6 +125,10 @@
         <div id="transcript" tabindex="0"></div>
         <button id="btn-jump" class="hidden" title="Jump to latest">↓ latest</button>
       </div>
+
+      <!-- a saved follow-up: rendered from its own JSON file, with no pi
+           process and no session replay behind it -->
+      <section id="followup-view" class="hidden" aria-label="Follow-up"></section>
 
       <!-- status and queued messages live directly above the input, where the
            eye already is; in the header they were easy to miss -->

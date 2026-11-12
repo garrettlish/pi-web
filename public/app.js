@@ -86,7 +86,7 @@ function onActivate(fn) {
 // state
 // ---------------------------------------------------------------------------
 const TAB_KEY = "piweb-sidebar-tab";
-const SIDEBAR_TABS = ["recent", "workspaces", "favorites"];
+const SIDEBAR_TABS = ["recent", "workspaces", "favorites", "followups"];
 const SIDEBAR_COLLAPSED_KEY = "piweb-sidebar-collapsed";
 const PROMPT_HISTORY_KEY = "piweb-prompt-history";
 const PROMPT_HISTORY_MAX = 200;
@@ -113,11 +113,16 @@ const state = {
   stats: null,
   queued: { steering: [], followUp: [] },
   sessions: [],
+  /** saved follow-ups (summaries kept out of their session), newest first */
+  followups: [],
+  /** open follow-up in the main column, or null; while set, the transcript is
+   *  not shown and no pi process is involved */
+  openFollowup: null,
   cwd: null,
   /** selected workspace cwd; null = workspace list view; undefined = not yet initialized */
   workspace: undefined,
   /** sidebar view: "recent" = flat list across all workspaces, "workspaces" = two-level,
-   *  "favorites" = flat list of sessions starred by the user */
+   *  "favorites" = flat list of sessions starred by the user, "followups" = saved summaries */
   sidebarTab: SIDEBAR_TABS.includes(localStorage.getItem(TAB_KEY)) ? localStorage.getItem(TAB_KEY) : "recent",
 };
 
@@ -298,6 +303,94 @@ function renderMarkdown(text) {
     out.push(`<p>${buf.join("<br>")}</p>`);
   }
   return out.join("");
+}
+
+/** Inline styles for the clipboard HTML. Pasting a summary into an email client
+ *  or a document only keeps what the HTML carries: classes and external CSS are
+ *  dropped, so headings collapse into paragraphs, tables lose their borders and
+ *  every cell runs together. These are the same rules as the transcript, written
+ *  inline and in plain pixels so no editor has to understand a stylesheet. */
+const EMAIL_INLINE = {
+  p: "margin:0 0 10px",
+  h2: "margin:18px 0 8px;font-size:20px;font-weight:600;line-height:1.3",
+  h3: "margin:16px 0 8px;font-size:17px;font-weight:600;line-height:1.3",
+  h4: "margin:14px 0 6px;font-size:15px;font-weight:600;line-height:1.3",
+  ul: "margin:0 0 10px;padding-left:24px",
+  ol: "margin:0 0 10px;padding-left:24px",
+  li: "margin:3px 0",
+  blockquote: "margin:10px 0;padding-left:12px;border-left:3px solid #c8c8cd;color:#55555c",
+  a: "color:#1a6fd4",
+  table: "border-collapse:collapse;width:100%;margin:0 0 12px;font-size:13px",
+  th: "padding:7px 12px;text-align:left;vertical-align:top;border:1px solid #d6d6db;background:#f0f0f3;font-weight:600",
+  td: "padding:7px 12px;text-align:left;vertical-align:top;border:1px solid #d6d6db",
+  pre: "margin:0 0 12px;padding:10px 14px;background:#f5f5f7;border:1px solid #d6d6db;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word",
+  code: "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#f0f0f3;padding:1px 4px;border-radius:3px",
+};
+
+/** The transcript's Markdown, as one self-contained HTML block for the
+ *  clipboard. It reuses renderMarkdown — the single parser — then rewrites the
+ *  few wrapper elements (code cards, table cards, copy buttons) that mean
+ *  nothing outside this page. */
+function emailHtml(text) {
+  const holder = el("div", { class: "assistant-text" });
+  holder.replaceChildren(...htmlFragment(renderMarkdown(text || "")));
+  for (const btn of holder.querySelectorAll("button")) btn.remove();
+  for (const card of [...holder.querySelectorAll(".code-block")]) {
+    const code = card.querySelector("code");
+    const pre = el("pre", { text: code ? code.textContent : "" });
+    card.replaceWith(pre);
+  }
+  for (const wrap of [...holder.querySelectorAll(".md-table-wrap")]) {
+    const table = wrap.querySelector("table");
+    if (table) wrap.replaceWith(table);
+    else wrap.remove();
+  }
+  const apply = (node) => {
+    const style = EMAIL_INLINE[node.tagName.toLowerCase()];
+    if (!style) return;
+    // a cell may already carry an alignment from the Markdown separator row;
+    // that one must survive, and must not be duplicated
+    const align = node.style.textAlign;
+    node.setAttribute("style", align ? `${style};text-align:${align}` : style);
+  };
+  apply(holder);
+  for (const node of holder.querySelectorAll(Object.keys(EMAIL_INLINE).join(","))) apply(node);
+  // a code sample inside a <pre> already sits on the block's own fill; the
+  // inline chip style there would double it up
+  for (const code of holder.querySelectorAll("pre code")) {
+    code.setAttribute("style", "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:none;padding:0");
+  }
+  holder.setAttribute(
+    "style",
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;color:#1c1c1e"
+  );
+  return holder.outerHTML;
+}
+
+/** Copy Markdown as both flavours: rich HTML so a mail client keeps headings,
+ *  lists, tables and code, and the Markdown source for anything that only takes
+ *  plain text. Falls back to plain text where the async clipboard is missing. */
+async function copyRichText(source) {
+  const plain = String(source ?? "");
+  try {
+    if (navigator.clipboard?.write && window.ClipboardItem) {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([emailHtml(plain)], { type: "text/html" }),
+          "text/plain": new Blob([plain], { type: "text/plain" }),
+        }),
+      ]);
+      return true;
+    }
+    throw new Error("rich clipboard unavailable");
+  } catch {
+    try {
+      await navigator.clipboard.writeText(plain);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,6 +1475,79 @@ function renderSkillInvocation(skill) {
   return body;
 }
 
+/** The answer text of one assistant turn: its text blocks, joined. This is what
+ *  the turn actions copy and what a saved follow-up keeps — thinking and tool
+ *  cards are not the answer. */
+function answerTextOf(item) {
+  return (item.blocks || [])
+    .filter((b) => b.type === "text" && (b.text || "").trim())
+    .map((b) => b.text.trim())
+    .join("\n\n");
+}
+
+/** True when this turn is the summary of its run: the last assistant turn of
+ *  the current run, settled and carrying answer text. The prompt outline's
+ *  summary jump and the search's summary scope name the same turn, so a
+ *  mid-loop answer is never offered as a summary to keep. */
+function isRunSummaryItem(item) {
+  if (item.kind !== "assistant" || item.streaming || !answerTextOf(item)) return false;
+  if (!isRunSettled(item)) return false;
+  const at = state.items.indexOf(item);
+  if (at < 0) return false;
+  for (let i = at + 1; i < state.items.length; i++) {
+    const it = state.items[i];
+    if (it.kind === "user") return true;
+    if (it.kind === "assistant") return false;
+  }
+  return true;
+}
+
+/** The user prompt that opened this run, for a follow-up's title. */
+function promptOfRun(item) {
+  const at = state.items.indexOf(item);
+  for (let i = at - 1; i >= 0; i--) {
+    if (state.items[i].kind === "user") return state.items[i];
+  }
+  return null;
+}
+
+/** The actions a reader wants on an assistant turn: copy its answer as rich
+ *  text always, and keep it as a follow-up when the turn is the run's summary —
+ *  a mid-loop answer is not what "the summary" names. */
+function renderTurnActions(item, { followup = false } = {}) {
+  const row = el("div", { class: "turn-actions" });
+  if (followup) {
+    row.append(
+      el(
+        "button",
+        {
+          class: "turn-action",
+          title: "Save this summary to Follow-ups — readable later without loading the session",
+          onclick: () => saveFollowup(item),
+        },
+        el("span", { class: "turn-action-icon", html: FOLLOWUP_ICON }),
+        el("span", { text: "Follow-up" })
+      )
+    );
+  }
+  row.append(
+    el(
+      "button",
+      { class: "turn-action", title: "Copy the answer as rich text (Markdown on the clipboard too)", onclick: () => copyTurn(item) },
+      el("span", { class: "turn-action-icon", html: COPY_ICON }),
+      el("span", { text: "Copy" })
+    )
+  );
+  return row;
+}
+
+/** Copy one turn's answer as rich text, plus its Markdown source. */
+async function copyTurn(item) {
+  const text = answerTextOf(item);
+  if (!text) return;
+  toast((await copyRichText(text)) ? "copied as rich text" : "copy failed", "info");
+}
+
 function renderItem(item) {
   switch (item.kind) {
     case "user": {
@@ -1437,6 +1603,8 @@ function renderItem(item) {
         const m = renderAssistantMeta(item.meta);
         if (m) box.append(m);
       }
+      const summary = isRunSummaryItem(item);
+      if (answerTextOf(item)) box.append(renderTurnActions(item, { followup: summary }));
       return box;
     }
     case "toolResultOrphan": {
@@ -1583,7 +1751,11 @@ function currentSessionMeta() {
 function renderHeader() {
   const meta = currentSessionMeta();
   const fallback = state.sessionFile ? state.sessionFile.split("/").pop().replace(/\.jsonl$/, "") : "—";
-  $("#session-name").textContent = state.sessionName || meta?.title || fallback;
+  // a follow-up on screen is what the tab is reading, even though the session
+  // stays attached underneath: the header has to name the thing being read
+  $("#session-name").textContent = state.openFollowup
+    ? state.openFollowup.title || "(untitled follow-up)"
+    : state.sessionName || meta?.title || fallback;
   const cu = state.stats?.contextUsage;
   // `tokens`/`percent` are null right after compaction until a fresh response;
   // contextWindow comes from the active model, so fall back to it for the max.
@@ -1986,8 +2158,7 @@ function renderPromptList() {
       )
     );
     // Indented second row: the prompt above answers "what did I ask", this one
-    // answers "where did pi conclude", which is otherwise a long scroll past the
-    // run's tool cards. A run that was interrupted before concluding has no
+    // answers "where did pi conclude", which is otherwise a long scroll past the    // run's tool cards. A run that was interrupted before concluding has no
     // summary, so it gets no row rather than a dead shortcut.
     const summary = replies.get(item);
     if (summary) {
@@ -2372,6 +2543,9 @@ const FAV_KEY = "piweb-favorites";
 /** star glyphs: filled = starred, outlined = not starred */
 const STAR_ICON = `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.85-4.2 4.1 1 5.8-5.2-2.75-5.2 2.75 1-5.8-4.2-4.1 5.8-.85z"/></svg>`;
 const STAR_OUTLINE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.6l2.6 5.3 5.8.85-4.2 4.1 1 5.8-5.2-2.75-5.2 2.75 1-5.8-4.2-4.1 5.8-.85z"/></svg>`;
+/** a bookmark: keeping a summary is a save, not a star */
+const FOLLOWUP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 4h11a1 1 0 0 1 1 1v15l-6.5-4-6.5 4V5a1 1 0 0 1 1-1z"/></svg>`;
+const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5.5A1.5 1.5 0 0 0 13.5 4H5.5A1.5 1.5 0 0 0 4 5.5v8A1.5 1.5 0 0 0 5.5 15"/></svg>`;
 
 /** two-level display name, e.g. /home/me/work/pi-web -> "work/pi-web" */
 function wsLabel(p) {
@@ -2382,11 +2556,12 @@ function wsLabel(p) {
 }
 
 /** keep the URL hash in sync so sessions are addressable/bookmarkable:
- *  #ws=<encoded cwd>&session=<encoded file|new> */
+ *  #ws=<encoded cwd>&session=<encoded file|new>[&followup=<id>] */
 function syncHash() {
   const params = new URLSearchParams();
   if (state.workspace) params.set("ws", state.workspace);
   params.set("session", state.sessionFile || "new");
+  if (state.openFollowup) params.set("followup", state.openFollowup.id);
   const hash = `#${params.toString()}`;
   if (location.hash !== hash) history.replaceState(null, "", hash);
 }
@@ -2399,6 +2574,7 @@ function hashState() {
     return {
       ws: p.get("ws") || null,
       session: p.get("session") || null, // "new" or a session file path
+      followup: p.get("followup") || null, // a saved follow-up shown instead
     };
   } catch {
     return null;
@@ -2488,14 +2664,109 @@ function sessionMatches(s, filter, { includeCwd = true } = {}) {
   );
 }
 
+/** One sidebar row for a saved follow-up: its title, the workspace it came from,
+ *  when it was kept, and a delete control. Opening it reads one JSON file — no
+ *  session is loaded and no pi process is involved. */
+function followupRow(f) {
+  const active = state.openFollowup?.id === f.id;
+  const repo = wsLabel(f.cwd) || "(no workspace)";
+  return el(
+    "div",
+    {
+      class: `session-item ${active ? "active" : ""}`,
+      tabindex: "0",
+      title: `${f.title}\n${f.sessionTitle || f.sessionFile || ""}`,
+      onclick: () => openFollowup(f.id),
+      onkeydown: onActivate(() => openFollowup(f.id)),
+    },
+    el(
+      "div",
+      { class: "s-title" },
+      el("span", { class: "s-title-text", text: f.title || "(untitled follow-up)" })
+    ),
+    el("div", { class: "s-repo", title: f.cwd || repo, text: repo }),
+    el(
+      "div",
+      { class: "s-meta" },
+      el("span", { text: fmtDate(f.createdAt) }),
+      el("span", { text: `${fmtNum(f.chars || 0)} chars` }),
+      el("button", {
+        class: "s-delete",
+        title: "Delete this follow-up",
+        "aria-label": "Delete this follow-up",
+        text: "✕",
+        onclick: (e) => {
+          // the row itself opens the follow-up; the delete control must not
+          e.stopPropagation();
+          deleteFollowup(f.id);
+        },
+        onkeydown: (e) => e.stopPropagation(),
+      })
+    )
+  );
+}
+
+async function loadFollowups() {
+  try {
+    const data = await api("/api/followups");
+    state.followups = Array.isArray(data.followups) ? data.followups : [];
+    if (state.sidebarTab === "followups") renderSidebar();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+/** Keep one turn's answer as a follow-up. The text stored is the same Markdown
+ *  the transcript rendered, so reopening it needs neither pi nor the session. */
+async function saveFollowup(item) {
+  const text = answerTextOf(item);
+  if (!text) return;
+  const prompt = promptOfRun(item);
+  const promptLine = prompt ? (parseSkillBlock(prompt.text)?.userMessage || prompt.text || "").replace(/\s+/g, " ").trim() : "";
+  const meta = currentSessionMeta();
+  const title = promptLine ? truncate(promptLine, 90) : (state.sessionName || meta?.title || "Follow-up");
+  try {
+    await api("/api/followups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title,
+        text,
+        ts: item.ts || null,
+        cwd: state.workspace || meta?.cwd || state.cwd || null,
+        sessionFile: state.sessionFile || null,
+        sessionTitle: state.sessionName || meta?.title || null,
+      }),
+    });
+    await loadFollowups();
+    toast("saved to Follow-ups");
+  } catch (err) {
+    toast(`could not save follow-up: ${err.message}`, "error");
+  }
+}
+
+async function deleteFollowup(id) {
+  try {
+    await fetch(`/api/followups/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (err) {
+    toast(`could not delete follow-up: ${err.message}`, "error");
+    return;
+  }
+  if (state.openFollowup?.id === id) closeFollowup();
+  await loadFollowups();
+  toast("follow-up deleted");
+}
+
 /** One sidebar row for a session. `showWorkspace` picks the timestamp that
  *  reads best in a flat list (last activity) versus a workspace-scoped one
  *  (the session's own last timestamp); `unstar` adds the remove-from-favorites
  *  control (Favorites tab).
  *
- *  Three lines: title, then the repository on a line of its own, then the
- *  metadata. The repository used to share its line with the date and message
- *  count, which cut long `owner/name` pairs to an unusable stub. */
+ *  Three blocks: a title of up to two lines, then the repository on a line of
+ *  its own, then the metadata. The repository used to share its line with the
+ *  date and message count, which cut long `owner/name` pairs to an unusable
+ *  stub; the title used to be a single ellipsized line, which hid the subject
+ *  of most sessions. */
 function sessionRow(s, { showWorkspace = false, unstar = false } = {}) {
   const active = s.file === state.sessionFile;
   const repo = wsLabel(s.cwd) || "(unknown)";
@@ -2512,7 +2783,7 @@ function sessionRow(s, { showWorkspace = false, unstar = false } = {}) {
       "div",
       { class: "s-title" },
       s.active ? el("span", { class: `s-dot${s.streaming ? " streaming" : ""}`, title: s.streaming ? "running in background" : "open in background" }) : null,
-      s.name || s.title || "(untitled)"
+      el("span", { class: "s-title-text", text: s.name || s.title || "(untitled)" })
     ),
     el("div", { class: "s-repo", title: s.cwd || repo, text: repo }),
     el(
@@ -2549,7 +2820,7 @@ function renderSidebar() {
   const crumb = $("#sidebar-crumb");
 
   // view tabs: "recent" (flat, all workspaces), "workspaces" (two-level),
-  // "favorites" (flat, starred only)
+  // "favorites" (flat, starred only), "followups" (saved summaries)
   const tab = state.sidebarTab;
   for (const name of SIDEBAR_TABS) {
     const btn = $(`#tab-${name}`);
@@ -2570,6 +2841,27 @@ function renderSidebar() {
         el("div", {
           class: "list-empty",
           text: favs.length ? "No favorites match" : "No favorites yet — star a session from the header",
+        })
+      );
+    }
+    return;
+  }
+
+  if (tab === "followups") {
+    // flat list of saved summaries, newest first; each row opens its own file —
+    // no session is loaded and no pi process is involved
+    crumb.classList.add("hidden");
+    const hits = state.followups.filter(
+      (f) => !filter || (f.title || "").toLowerCase().includes(filter) || (f.sessionTitle || "").toLowerCase().includes(filter)
+    );
+    for (const f of hits) list.append(followupRow(f));
+    if (!hits.length) {
+      list.append(
+        el("div", {
+          class: "list-empty",
+          text: state.followups.length
+            ? "No follow-ups match"
+            : "No follow-ups yet — open a summary and press Follow-up",
         })
       );
     }
@@ -2630,6 +2922,116 @@ function renderSidebar() {
     .filter((s) => sessionMatches(s, filter, { includeCwd: false }));
   for (const s of inWs) list.append(sessionRow(s));
   if (!inWs.length) list.append(el("div", { class: "list-empty", text: "No sessions here yet — use the new-session button" }));
+}
+
+// ---------------------------------------------------------------------------
+// follow-up view
+// ---------------------------------------------------------------------------
+// A saved summary is a document, not a transcript: it is rendered from one JSON
+// file into the main column, with the composer hidden and no agent attached.
+// Nothing about it needs pi — that is the point, a follow-up opens instantly.
+function renderFollowup(rec) {
+  const view = $("#followup-view");
+  const head = el(
+    "div",
+    { class: "fu-head" },
+    el(
+      "button",
+      {
+        class: "fu-back",
+        title: "Back to the session (Esc)",
+        onclick: () => closeFollowup(),
+      },
+      el("span", { class: "fu-back-arrow", text: "←" }),
+      el("span", { text: "Back" })
+    ),
+    el("div", { class: "fu-title", text: rec.title || "(untitled follow-up)" }),
+    el(
+      "div",
+      { class: "fu-meta" },
+      el("span", { text: fmtDate(rec.createdAt) }),
+      rec.cwd ? el("span", { text: wsLabel(rec.cwd), title: rec.cwd }) : null,
+      rec.sessionTitle ? el("span", { text: `from ${truncate(rec.sessionTitle, 60)}`, title: rec.sessionTitle }) : null
+    ),
+    el(
+      "div",
+      { class: "fu-actions" },
+      el("button", {
+        class: "turn-action",
+        title: "Copy as rich text (Markdown on the clipboard too)",
+        onclick: async () => {
+          toast((await copyRichText(rec.text)) ? "copied as rich text" : "copy failed", "info");
+        },
+      }, el("span", { class: "turn-action-icon", html: COPY_ICON }), el("span", { text: "Copy" })),
+      el("button", {
+        class: "turn-action",
+        title: "Open the session this summary came from",
+        onclick: () => openFollowupSession(rec),
+      }, el("span", { text: "Open session" })),
+      el("button", {
+        class: "turn-action danger",
+        title: "Delete this follow-up",
+        onclick: () => deleteFollowup(rec.id),
+      }, el("span", { text: "Delete" }))
+    )
+  );
+  const body = el("div", { class: "assistant-text fu-body" });
+  // renderMarkdown escapes the source text up front; htmlFragment keeps the
+  // result off innerHTML, exactly as the transcript does
+  body.replaceChildren(...htmlFragment(renderMarkdown(rec.text || "")));
+  view.replaceChildren(head, body);
+}
+
+/** Show one saved follow-up in the main column. The transcript is hidden, not
+ *  destroyed: its items and scroll offset stay, so returning to a session is
+ *  as cheap as showing it again. */
+async function openFollowup(id) {
+  let rec;
+  try {
+    const data = await api(`/api/followups/${encodeURIComponent(id)}`);
+    rec = data.followup;
+  } catch (err) {
+    toast(`could not open follow-up: ${err.message}`, "error");
+    return;
+  }
+  if (!rec) return;
+  state.openFollowup = rec;
+  renderFollowup(rec);
+  $("#followup-view").classList.remove("hidden");
+  $("#transcript-wrap").classList.add("hidden");
+  $("#composer-dock").classList.add("hidden");
+  $("#followup-view").scrollTop = 0;
+  renderHeader();
+  syncHash();
+  renderSidebar();
+}
+
+function closeFollowup() {
+  if (!state.openFollowup) return;
+  state.openFollowup = null;
+  $("#followup-view").classList.add("hidden");
+  $("#transcript-wrap").classList.remove("hidden");
+  $("#composer-dock").classList.remove("hidden");
+  renderHeader();
+  syncHash();
+  renderSidebar();
+  inputEl.focus();
+}
+
+/** Jump from a follow-up to the session it was saved from, when that file still
+ *  exists and the sidebar knows it. */
+async function openFollowupSession(rec) {
+  const file = rec.sessionFile;
+  if (!file) {
+    toast("this follow-up did not record a session file", "error");
+    return;
+  }
+  if (!state.sessions.some((s) => s.file === file)) {
+    toast("the session this follow-up came from is no longer on disk", "error");
+    return;
+  }
+  closeFollowup();
+  await switchSession(file, rec.cwd || undefined);
 }
 
 async function loadSessions() {
@@ -3234,6 +3636,9 @@ async function refreshCachedView(file) {
 }
 
 async function switchSession(file, cwd) {
+  // a session row always wins over a follow-up on screen: leaving the follow-up
+  // also restores the transcript and composer this session needs
+  if (state.openFollowup) closeFollowup();
   if (file === state.sessionFile) return;
   const gen = ++switchGen;
   const prevFile = state.sessionFile;
@@ -3306,6 +3711,9 @@ async function switchSession(file, cwd) {
 
 async function newSession() {
   try {
+    // a follow-up is a document, not a session: starting a session puts the
+    // transcript and composer back before anything else runs
+    if (state.openFollowup) closeFollowup();
     // On the workspace list there is no active workspace to start a session in.
     if (state.workspace == null) {
       toast("Select a workspace first — pick one from the list or use the folder button", "error");
@@ -3375,6 +3783,17 @@ function findStreamingAssistant() {
   return null;
 }
 
+/** Re-render the newest assistant turn: its Follow-up control depends on where
+ *  the run ended, which only the following message can tell. */
+function markLastAssistantDirty() {
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    if (state.items[i].kind === "assistant") {
+      state.items[i].dirty = true;
+      return;
+    }
+  }
+}
+
 function ensureBlock(item, idx, type) {
   while (item.blocks.length <= idx) item.blocks.push({ type: "text", text: "" });
   if (item.blocks[idx].type !== type) item.blocks[idx] = { type, text: "" };
@@ -3415,6 +3834,10 @@ function handleEvent(record) {
       // New live items extend the persisted branch without updating leafId —
       // mark the sync dirty so a stashed view falls back to a full refresh.
       entriesDirty = true;
+      // which turn carries a run's summary depends on what follows it: a new
+      // turn either makes the previous assistant turn the summary (a prompt
+      // arrived) or stops it from being one (another turn in the same run)
+      markLastAssistantDirty();
       const m = record.message;
       if (m.role === "user") {
         for (const it of buildItemsFromEntries([{ type: "message", message: m }])) {
@@ -4210,6 +4633,10 @@ function selectTab(tab) {
 $("#tab-workspaces").addEventListener("click", () => selectTab("workspaces"));
 $("#tab-recent").addEventListener("click", () => selectTab("recent"));
 $("#tab-favorites").addEventListener("click", () => selectTab("favorites"));
+$("#tab-followups").addEventListener("click", () => {
+  selectTab("followups");
+  loadFollowups();
+});
 
 // ---------------------------------------------------------------------------
 // workspace directory picker (local folder chooser dialog)
@@ -4419,6 +4846,8 @@ document.addEventListener("keydown", (e) => {
       setResourcesOpen(false);
     } else if (!searchOverlay.classList.contains("hidden")) {
       setSearchOpen(false);
+    } else if (!$("#followup-view").classList.contains("hidden")) {
+      closeFollowup();
     } else if (!$("#ws-overlay").classList.contains("hidden")) {
       closeWsPicker();
     } else if (!$("#dialog-overlay").classList.contains("hidden")) {
@@ -4474,10 +4903,13 @@ function connectEvents() {
   // boot must not stall on a slow extension registration.
   loadModels({ retry: true });
   await refresh({ sessions: true });
+  // Follow-ups are read once at boot so the tab is populated before it is
+  // clicked; the list is a directory read, not a session parse.
+  loadFollowups();
   // poll the session list so the sidebar's background-run dots stay current
   setInterval(() => loadSessions().catch(() => {}), 8000);
-  // deep link: #ws=<cwd>&session=<file|new> — open the hashed session if it
-  // differs from what this tab started with
+  // deep link: #ws=<cwd>&session=<file|new>[&followup=<id>] — open the hashed
+  // session if it differs from what this tab started with
   const hs = hashState();
   const target = hs?.session && hs.session !== "new" ? hs.session : null;
   if (target && target !== state.sessionFile) {
@@ -4486,5 +4918,6 @@ function connectEvents() {
   } else {
     syncHash();
   }
+  if (hs?.followup) await openFollowup(hs.followup);
   inputEl.focus();
 })();
