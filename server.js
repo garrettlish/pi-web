@@ -22,6 +22,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import zlib from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -643,12 +644,22 @@ function parseSkillBlock(text) {
   return { name: match[1], location: match[2], content: match[3], userMessage: match[4] ? match[4].trim() : "" };
 }
 
+/** The block the composer appends for an attached document. Both sides agree on
+ *  this shape (see `attachedFileBlock` in public/app.js), and the server only
+ *  ever needs to find it: to keep its body out of titles and search results. */
+const ATTACHED_FILE_BLOCK = /<attached-file name="([^"]*)"[^>]*>\n[\s\S]*?\n<\/attached-file>/g;
+const unescapeAttr = (s) =>
+  s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+
 /** A user message's own words. A skill body is instruction context pi injected
  *  on the user's behalf — never something they typed — so titles and search
  *  index the skill's name and the prompt that followed it. Indexing the body
- *  made one skill definition match every query in every session that used it. */
+ *  made one skill definition match every query in every session that used it.
+ *  A document the composer attached is the same situation: its text is what the
+ *  model read, so it is replaced by the file name and the body stays out of the
+ *  title and the index. */
 function promptText(content) {
-  const raw = userText(content);
+  const raw = userText(content).replace(ATTACHED_FILE_BLOCK, (_, name) => `[attached: ${unescapeAttr(name)}]`);
   const skill = parseSkillBlock(raw);
   return skill ? [skill.name, skill.userMessage].filter(Boolean).join("\n") : raw;
 }
@@ -1188,6 +1199,538 @@ async function searchSessions(query, limit = SEARCH_MAX_HITS, scope = "all") {
 }
 
 // ---------------------------------------------------------------------------
+// Composer file attachments: text extraction
+// ---------------------------------------------------------------------------
+// A prompt can carry more than an image. pi's RPC accepts only text and images,
+// so a PDF, a Word document or an HTML page is turned into text here and travels
+// inside the prompt — the model reads it directly, with no tool call and no need
+// for the file to exist on disk anywhere the agent can reach. Everything below
+// uses node: builtins only (zlib unpacks both containers), so a plain
+// `node server.js` keeps working with no dependency and no external binary.
+//
+// Extraction is deliberately approximate: readable content, not faithful layout.
+// A document the parser finds no text in (a scanned PDF, an encrypted file) is
+// refused with a reason instead of being sent to the model as an empty prompt.
+
+/** Upper bound on the text one attachment may add to a prompt. Unbounded, a
+ *  500-page PDF would silently blow up both the context window and the request. */
+const ATTACH_TEXT_MAX = 120000;
+/** Upper bound on a file that may be attached at all, before parsing. It also
+ *  keeps the base64 request body (4/3 of this) under the 32 MB body cap. */
+const ATTACH_FILE_MAX = 20 * 1024 * 1024;
+
+/** Ceiling on what one decompressed stream may produce. A 20 MB file can inflate
+ *  to gigabytes — that is a decompression bomb, not a document — so the inflate
+ *  itself is bounded rather than left to whatever the container claims. */
+const ATTACH_INFLATE_MAX = 64 * 1024 * 1024;
+/** Ceiling on everything one file may decompress to in total. Each stream has its
+ *  own limit, but a document can hold dozens of them and every inflated copy
+ *  stays in memory, so the sum is what actually has to be bounded. */
+const ATTACH_INFLATE_TOTAL = 96 * 1024 * 1024;
+/** Portion of a .docx or .html that is scanned for text. The extracted text is
+ *  capped at ATTACH_TEXT_MAX anyway; a document whose markup runs past this has
+ *  far more formatting than readable prose, and regex work is linear in it. */
+const ATTACH_SOURCE_MAX = 4 * 1024 * 1024;
+
+/** zlib inflate that also accepts a headerless deflate stream: PDF and OOXML
+ *  writers produce either framing and neither says which. `budget` is shared
+ *  across one extraction so the total stays bounded. */
+function inflateBytes(buf, budget) {
+  if (budget && budget.left <= 0) return null;
+  const maxOutputLength = Math.min(ATTACH_INFLATE_MAX, budget ? budget.left : ATTACH_INFLATE_MAX);
+  for (const fn of [zlib.inflateSync, zlib.inflateRawSync]) {
+    try {
+      const out = fn(buf, { maxOutputLength });
+      if (budget) budget.left -= out.length;
+      return out;
+    } catch {
+      // try the other framing
+    }
+  }
+  return null;
+}
+
+/** Trim the whitespace a text extraction leaves behind without collapsing the
+ *  blank lines that separate paragraphs. */
+function tidyText(text) {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function clipText(text, cap) {
+  return text.length > cap ? { text: text.slice(0, cap), truncated: true } : { text, truncated: false };
+}
+
+/** Every `N G obj` body in a PDF, keyed by object number, with its stream
+ *  inflated when Flate-compressed. The file is scanned rather than read through
+ *  the xref table: a damaged xref is common and the object headers are still
+ *  exactly where they were written. The count is capped so a file stuffed with
+ *  millions of tiny objects cannot spend the request's whole budget in the map. */
+const ATTACH_PDF_OBJECTS_MAX = 50000;
+const ATTACH_PDF_PAGES_MAX = 2000;
+
+function pdfObjects(buf, budget) {
+  const text = buf.toString("latin1");
+  const objects = new Map();
+  const re = /(\d+)\s+\d+\s+obj\b/g;
+  let m;
+  while (objects.size < ATTACH_PDF_OBJECTS_MAX && (m = re.exec(text))) {
+    const num = Number(m[1]);
+    const at = re.lastIndex;
+    const end = text.indexOf("endobj", at);
+    if (end < 0) continue;
+    const body = text.slice(at, end);
+    const streamAt = body.indexOf("stream");
+    if (streamAt < 0) {
+      objects.set(num, { dict: body, stream: null });
+      continue;
+    }
+    const dict = body.slice(0, streamAt);
+    // `stream` is followed by CRLF or LF; the data offsets are read off the
+    // buffer, which shares the latin1 slice's offsets one to one
+    let from = at + streamAt + "stream".length;
+    if (buf[from] === 0x0d) from++;
+    if (buf[from] === 0x0a) from++;
+    const to = at + body.lastIndexOf("endstream");
+    const raw = buf.subarray(from, to < from ? from : to);
+    objects.set(num, { dict, stream: /\/FlateDecode/.test(dict) ? inflateBytes(raw, budget) || raw : raw });
+  }
+  return objects;
+}
+
+/** PDF 1.5+ packs ordinary objects into compressed object streams. Unfolded they
+ *  stay invisible, taking the font dictionaries and most of the page tree with
+ *  them. */
+function expandPdfObjectStreams(objects) {
+  for (const obj of [...objects.values()]) {
+    if (!obj.stream || !/\/Type\s*\/ObjStm/.test(obj.dict)) continue;
+    const declared = Number((obj.dict.match(/\/N\s+(\d+)/) || [])[1] || 0);
+    const first = Number((obj.dict.match(/\/First\s+(\d+)/) || [])[1] || 0);
+    if (!declared || !first) continue;
+    // /N is attacker-controlled: a small stream can claim a million members and
+    // the header array would not have them, so bound it by what the file could
+    // possibly hold and by the global object cap
+    const count = Math.min(declared, Math.floor(first / 2), ATTACH_PDF_OBJECTS_MAX - objects.size);
+    if (count < 1) continue;
+    const body = obj.stream.toString("latin1");
+    const head = body.slice(0, first).trim().split(/\s+/).map(Number);
+    for (let i = 0; i < count; i++) {
+      const num = head[i * 2];
+      const from = head[i * 2 + 1];
+      const to = i + 1 < count ? head[(i + 1) * 2 + 1] : body.length - first;
+      if (!Number.isFinite(num) || !Number.isFinite(from) || objects.has(num)) continue;
+      objects.set(num, { dict: body.slice(first + from, first + to), stream: null });
+    }
+  }
+}
+
+/** Read a /ToUnicode CMap — the only reliable way to map a PDF's character codes
+ *  back to text for a subsetted font, where code 3 is whatever glyph the writer
+ *  happened to place third. */
+function pdfCMapOf(data) {
+  const text = data.toString("latin1");
+  const map = new Map();
+  let codeLen = 0;
+  const utf16 = (hex) => {
+    const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+    let out = "";
+    for (let i = 0; i + 4 <= clean.length; i += 4) out += String.fromCharCode(parseInt(clean.slice(i, i + 4), 16));
+    return out;
+  };
+  for (const block of text.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) {
+    for (const pair of block[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]*)>/g)) {
+      if (!codeLen) codeLen = pair[1].length / 2;
+      map.set(parseInt(pair[1], 16), utf16(pair[2]));
+    }
+  }
+  for (const block of text.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) {
+    for (const range of block[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(?:<([0-9a-fA-F]+)>|\[([^\]]*)\])/g)) {
+      if (!codeLen) codeLen = range[1].length / 2;
+      const lo = parseInt(range[1], 16);
+      const hi = parseInt(range[2], 16);
+      if (range[3]) {
+        const base = parseInt(range[3].slice(0, 4), 16);
+        for (let code = lo; code <= hi && code - lo < 65536; code++) map.set(code, String.fromCharCode(base + code - lo));
+      } else if (range[4]) {
+        [...range[4].matchAll(/<([0-9a-fA-F]+)>/g)].forEach((item, i) => map.set(lo + i, utf16(item[1])));
+      }
+    }
+  }
+  return map.size ? { map, codeLen: codeLen || 1 } : null;
+}
+
+/** Fonts carrying a usable mapping, by object number, plus the /Fx resource
+ *  names a content stream selects with Tf. */
+function pdfFonts(objects) {
+  const byObject = new Map();
+  const byName = new Map();
+  for (const [num, obj] of objects) {
+    const toUnicode = obj.dict.match(/\/ToUnicode\s+(\d+)\s+\d+\s+R/);
+    const cmap = toUnicode && objects.get(Number(toUnicode[1]))?.stream;
+    if (cmap) {
+      const parsed = pdfCMapOf(cmap);
+      if (parsed) byObject.set(num, parsed);
+    }
+    // a font resource dict is inherited through the page tree, so every dict is
+    // searched rather than only each page's own /Resources
+    for (const block of obj.dict.matchAll(/\/Font\s*<<([\s\S]*?)>>/g)) {
+      for (const entry of block[1].matchAll(/\/([^\s/<>[\](){}%]+)\s+(\d+)\s+\d+\s+R/g)) byName.set(entry[1], Number(entry[2]));
+    }
+  }
+  return { byObject, byName };
+}
+
+function decodePdfText(bytes, font) {
+  if (font) {
+    let out = "";
+    for (let i = 0; i + font.codeLen <= bytes.length; i += font.codeLen) {
+      let code = 0;
+      for (let k = 0; k < font.codeLen; k++) code = (code << 8) | bytes[i + k];
+      out += font.map.get(code) ?? "";
+    }
+    return out;
+  }
+  // no CMap: a UTF-16BE string still decodes, and simple fonts are single-byte
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    let out = "";
+    for (let i = 2; i + 1 < bytes.length; i += 2) out += String.fromCharCode((bytes[i] << 8) | bytes[i + 1]);
+    return out;
+  }
+  return Buffer.from(bytes).toString("latin1");
+}
+
+/** Pull the drawn text out of one page content stream. Line breaks come from the
+ *  text matrix's y (many writers emit one BT/ET per word with an absolute Tm, so
+ *  ending a text object alone would break after every word), and word spaces from
+ *  the large negative kerning offsets a TJ array uses in place of a space glyph. */
+function pdfContentText(data, fonts, cap) {
+  const src = data.toString("latin1");
+  const parts = [];
+  let length = 0;
+  let font = null;
+  let lineY = null;
+  let stack = [];
+  const push = (s) => {
+    if (!s) return;
+    parts.push(s);
+    length += s.length;
+  };
+  const newline = () => {
+    if (length && parts[parts.length - 1] !== "\n") push("\n");
+  };
+  const nums = () => stack.filter((t) => t.type === "num").map((t) => t.value);
+  const strs = () => stack.filter((t) => t.type === "str");
+
+  let i = 0;
+  while (i < src.length && length < cap) {
+    const c = src[i];
+    // a stream that never reaches an operator would otherwise grow the operand
+    // stack for every token it holds
+    if (stack.length > 65536) stack = [];
+    if (c === "(") {
+      // a literal string: escapes are symbolic, octal, or a line continuation
+      const bytes = [];
+      let depth = 1;
+      let j = i + 1;
+      while (j < src.length && depth > 0) {
+        const ch = src[j];
+        if (ch === "\\") {
+          const next = src[j + 1];
+          const simple = { n: 10, r: 13, t: 9, b: 8, f: 12, "(": 40, ")": 41, "\\": 92 };
+          if (simple[next] != null) {
+            bytes.push(simple[next]);
+            j += 2;
+          } else if (next >= "0" && next <= "7") {
+            const octal = src.slice(j + 1, j + 4).match(/^[0-7]{1,3}/)[0];
+            bytes.push(parseInt(octal, 8) & 0xff);
+            j += 1 + octal.length;
+          } else {
+            bytes.push(src.charCodeAt(j + 1) & 0xff);
+            j += 2;
+          }
+          continue;
+        }
+        if (ch === "(") depth++;
+        else if (ch === ")") {
+          depth--;
+          if (!depth) {
+            j++;
+            break;
+          }
+        }
+        bytes.push(src.charCodeAt(j) & 0xff);
+        j++;
+      }
+      stack.push({ type: "str", bytes });
+      i = j;
+      continue;
+    }
+    if (c === "<" && src[i + 1] !== "<") {
+      const end = src.indexOf(">", i);
+      if (end < 0) break;
+      const hex = src.slice(i + 1, end).replace(/[^0-9a-fA-F]/g, "");
+      const bytes = [];
+      for (let k = 0; k + 2 <= hex.length; k += 2) bytes.push(parseInt(hex.slice(k, k + 2), 16));
+      stack.push({ type: "str", bytes });
+      i = end + 1;
+      continue;
+    }
+    if (c === "/") {
+      let j = i + 1;
+      while (j < src.length && !/[\s/<>[\](){}%]/.test(src[j])) j++;
+      stack.push({ type: "name", value: src.slice(i + 1, j) });
+      i = j;
+      continue;
+    }
+    if (/[0-9+\-.]/.test(c)) {
+      let j = i;
+      while (j < src.length && /[0-9+\-.eE]/.test(src[j])) j++;
+      stack.push({ type: "num", value: Number(src.slice(i, j)) });
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z'"*]/.test(c)) {
+      let j = i;
+      while (j < src.length && /[A-Za-z'"*0-9]/.test(src[j])) j++;
+      const op = src.slice(i, j);
+      i = j;
+      if (op === "Tf") {
+        const name = [...stack].reverse().find((t) => t.type === "name");
+        if (name) font = fonts.byObject.get(fonts.byName.get(name.value)) || null;
+      } else if (op === "Tj" || op === "'" || op === '"') {
+        if (op !== "Tj") newline();
+        const list = strs();
+        if (list.length) push(decodePdfText(list[list.length - 1].bytes, font));
+      } else if (op === "TJ") {
+        for (const item of stack) {
+          if (item.type === "str") push(decodePdfText(item.bytes, font));
+          else if (item.type === "num" && item.value <= -180 && parts.length && !/\s$/.test(parts[parts.length - 1])) push(" ");
+        }
+      } else if (op === "Tm") {
+        const y = nums()[5];
+        if (y != null && lineY != null && Math.abs(y - lineY) > 1) newline();
+        if (y != null) lineY = y;
+      } else if (op === "Td" || op === "TD") {
+        const dy = nums()[1];
+        if (dy) {
+          newline();
+          if (lineY != null) lineY += dy;
+        }
+      } else if (op === "T*") {
+        newline();
+      }
+      stack = [];
+      continue;
+    }
+    if (c === "[" || c === "]") {
+      // the brackets carry nothing themselves; their items stay on the stack
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return parts.join("");
+}
+
+/** Page objects in reading order, walked from /Catalog /Pages so a document's
+ *  pages are not whatever order their objects happen to sit in the file. */
+function pdfPages(objects) {
+  const pages = [];
+  const seen = new Set();
+  const walk = (num) => {
+    if (seen.has(num) || pages.length >= ATTACH_PDF_PAGES_MAX) return;
+    seen.add(num);
+    const obj = objects.get(num);
+    if (!obj) return;
+    if (/\/Type\s*\/Page\b/.test(obj.dict)) {
+      pages.push(obj);
+      return;
+    }
+    const kids = obj.dict.match(/\/Kids\s*\[([^\]]*)\]/);
+    for (const kid of kids ? kids[1].matchAll(/(\d+)\s+\d+\s+R/g) : []) walk(Number(kid[1]));
+  };
+  for (const obj of objects.values()) {
+    if (!/\/Type\s*\/Catalog\b/.test(obj.dict)) continue;
+    const pagesRef = obj.dict.match(/\/Pages\s+(\d+)\s+\d+\s+R/);
+    if (pagesRef) walk(Number(pagesRef[1]));
+  }
+  if (!pages.length) {
+    for (const obj of objects.values()) {
+      if (pages.length >= ATTACH_PDF_PAGES_MAX) break;
+      if (/\/Type\s*\/Page\b/.test(obj.dict)) pages.push(obj);
+    }
+  }
+  return pages;
+}
+
+function pdfText(buf, cap, budget) {
+  const objects = pdfObjects(buf, budget);
+  expandPdfObjectStreams(objects);
+  const fonts = pdfFonts(objects);
+  const streams = [];
+  for (const page of pdfPages(objects)) {
+    const contents = page.dict.match(/\/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)/);
+    for (const ref of contents ? contents[1].matchAll(/(\d+)\s+\d+\s+R/g) : []) {
+      const stream = objects.get(Number(ref[1]))?.stream;
+      if (stream) streams.push(stream);
+    }
+  }
+  const chunks = [];
+  let length = 0;
+  for (const stream of streams) {
+    if (length >= cap) break;
+    const text = pdfContentText(stream, fonts, cap - length);
+    length += text.length;
+    if (text.trim()) chunks.push(text);
+  }
+  return { text: tidyText(chunks.join("\n")), pages: streams.length, truncated: length >= cap };
+}
+
+/** Minimal ZIP reader for OOXML: the central directory names the entries and
+ *  each local header gives the data offset. Word, LibreOffice and Pages all
+ *  write stored or deflated entries and nothing else. */
+function zipEntries(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) return null;
+  const directoryAt = buf.readUInt32LE(eocd + 16);
+  if (directoryAt > eocd) return null;
+  // a directory that cannot be right is refused rather than walked: every
+  // record is at least 46 bytes, so the declared count has an upper bound
+  const count = Math.min(buf.readUInt16LE(eocd + 10), Math.floor((eocd - directoryAt) / 46));
+  let at = directoryAt;
+  const entries = new Map();
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > buf.length || buf.readUInt32LE(at) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(at + 10);
+    const size = buf.readUInt32LE(at + 20);
+    const nameLen = buf.readUInt16LE(at + 28);
+    const extraLen = buf.readUInt16LE(at + 30);
+    const commentLen = buf.readUInt16LE(at + 32);
+    const localAt = buf.readUInt32LE(at + 42);
+    const name = buf.toString("utf8", at + 46, at + 46 + nameLen);
+    at += 46 + nameLen + extraLen + commentLen;
+    if (localAt + 30 > buf.length || buf.readUInt32LE(localAt) !== 0x04034b50) continue;
+    const localNameLen = buf.readUInt16LE(localAt + 26);
+    const localExtraLen = buf.readUInt16LE(localAt + 28);
+    const from = localAt + 30 + localNameLen + localExtraLen;
+    entries.set(name, { method, raw: buf.subarray(from, from + size) });
+  }
+  return entries;
+}
+
+/** Long documents are read only as far as a source cap. The extracted text is
+ *  capped at ATTACH_TEXT_MAX, and markup-to-text is regex work linear in its
+ *  input, so a file larger than this has far more formatting than prose. */
+function cappedSource(text) {
+  return text.length > ATTACH_SOURCE_MAX ? text.slice(0, ATTACH_SOURCE_MAX) : text;
+}
+
+/** Decode the head of a buffer for a source cap: slicing the bytes first keeps
+ *  a multi-megabyte file from becoming a string only to be cut. */
+function cappedUtf8(buf) {
+  return cappedSource(buf.subarray(0, ATTACH_SOURCE_MAX).toString("utf8"));
+}
+
+/** WordprocessingML to text: paragraphs and breaks become newlines, tabs stay
+ *  tabs, run formatting is dropped. w:tab and w:br are the only elements carrying
+ *  the document's whitespace, so they are replaced before the tags are stripped. */
+function docxText(buf, budget) {
+  const entries = zipEntries(buf);
+  const main = entries?.get("word/document.xml");
+  if (!main) return null;
+  const xml = main.method === 8 ? inflateBytes(main.raw, budget) : main.raw;
+  if (!xml) return null;
+  const text = cappedSource(xml.toString("utf8"))
+    .replace(/<w:tab\b[^>]*\/>/g, "\t")
+    .replace(/<w:(br|cr)\b[^>]*\/>/g, "\n")
+    .replace(/<\/w:p>/g, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+  return { text: tidyText(text) };
+}
+
+/** HTML to text, keeping block structure as newlines and list items as bullets.
+ *  Script, style and template bodies go whole: their contents are not readable
+ *  prose and would otherwise arrive in the prompt as code noise. */
+function htmlText(buf) {
+  const html = cappedUtf8(buf).replace(/^\uFEFF/, "");
+  const text = html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|template)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<br\b[^>]*>/gi, "\n")
+    .replace(/<\/(p|div|section|article|li|tr|h[1-6]|blockquote|pre|table|ul|ol|dd|dt|header|footer)>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n- ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, "&");
+  return { text: tidyText(text) };
+}
+
+/** Plain-text formats the browser can already decode, listed so a dropped .md or
+ *  .csv does not need a trip through a parser. */
+const ATTACH_TEXT_TYPES = new Set(["txt", "md", "markdown", "csv", "json", "log", "yaml", "yml"]);
+
+/** Which handler a file goes to, by extension first and magic bytes second: a
+ *  PDF saved without an extension still parses, while a file merely *named*
+ *  .pdf is refused rather than guessed at. */
+function attachmentKind(name, buf) {
+  const ext = String(name || "").toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+  if (ext === "pdf" || buf.subarray(0, 5).toString("latin1") === "%PDF-") return "pdf";
+  if (ext === "docx") return "docx";
+  if (ext === "html" || ext === "htm") return "html";
+  if (ATTACH_TEXT_TYPES.has(ext)) return "text";
+  if (ext === "doc") return "doc";
+  return null;
+}
+
+/** Extract one attachment's text as `{ kind, text, pages?, truncated }`. Throws a
+ *  message meant for the user when the file cannot be read, because the composer
+ *  has to say why an attachment was refused. */
+function extractAttachment(name, buf) {
+  if (!buf.length) throw new Error("the file is empty");
+  if (buf.length > ATTACH_FILE_MAX) throw new Error(`the file is larger than ${ATTACH_FILE_MAX / (1024 * 1024)} MB`);
+  const kind = attachmentKind(name, buf);
+  if (kind === "doc") throw new Error("legacy .doc is not supported — save it as .docx or PDF");
+  if (!kind) throw new Error("unsupported file type — attach a PDF, .docx, .html or a text file");
+  const budget = { left: ATTACH_INFLATE_TOTAL };
+  if (kind === "pdf") {
+    const { text, pages, truncated } = pdfText(buf, ATTACH_TEXT_MAX, budget);
+    if (!text) throw new Error("no text layer found — the PDF is probably a scan, which needs OCR first");
+    return { kind, text: truncated ? text.slice(0, ATTACH_TEXT_MAX) : text, pages, truncated };
+  }
+  if (kind === "docx") {
+    const parsed = docxText(buf, budget);
+    if (!parsed?.text) throw new Error("not a readable .docx, or the document has no text");
+    return { kind, ...clipText(parsed.text, ATTACH_TEXT_MAX) };
+  }
+  if (kind === "html") {
+    const { text } = htmlText(buf);
+    if (!text) throw new Error("the page contains no text");
+    return { kind, ...clipText(text, ATTACH_TEXT_MAX) };
+  }
+  return { kind, ...clipText(tidyText(cappedUtf8(buf)), ATTACH_TEXT_MAX) };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -1499,6 +2042,39 @@ const server = http.createServer(async (req, res) => {
       const proc = client && client.key ? procs.get(client.key) : null;
       const out = await runPiMcpList(proc?.cwd || CWD);
       sendJson(res, 200, out);
+      return;
+    }
+
+    // Text of a composer attachment: a PDF, .docx, .html or plain-text file the
+    // user dropped on the composer, or picked, is turned into text here so it can
+    // ride inside the next prompt. pi's RPC prompt accepts only text and images,
+    // so extraction has to happen before the prompt, not in the agent.
+    //
+    // The bytes come from the browser's own File — nothing is read from a path on
+    // this machine — and the response is text only, so this route is not a file
+    // reader. JSON with a base64 body keeps the whole thing one request and holds
+    // the body cap (32 MB) that every other write route already has.
+    if (pathname === "/api/extract" && req.method === "POST") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const name = stringField(body.name, 512) || "attachment";
+      if (typeof body.data !== "string" || !body.data) {
+        sendJson(res, 400, { error: "missing file data" });
+        return;
+      }
+      // base64 is 4/3 of the file, so cap the encoded form rather than decoding an
+      // oversized payload only to reject it
+      if (body.data.length > Math.ceil((ATTACH_FILE_MAX * 4) / 3) + 4) {
+        sendJson(res, 413, { error: `the file is larger than ${ATTACH_FILE_MAX / (1024 * 1024)} MB` });
+        return;
+      }
+      let extracted;
+      try {
+        extracted = extractAttachment(name, Buffer.from(body.data, "base64"));
+      } catch (err) {
+        sendJson(res, 415, { error: err.message });
+        return;
+      }
+      sendJson(res, 200, { name, ...extracted });
       return;
     }
 

@@ -36,6 +36,90 @@ function writeFixture(dirName, file, lines) {
   fs.writeFileSync(path.join(dir, file), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
 }
 
+/** One-page PDF whose only content is one text run, built by hand so the test
+ *  needs no fixture file. Object 4 is the page content stream. */
+function minimalPdf(line) {
+  const content = `BT /F1 12 Tf 72 720 Td (${line}) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  objects.forEach((body, i) => {
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  // No xref table: the extractor scans for object headers, and a test fixture
+  // with a hand-computed offset table would be more fragile than useful.
+  return `${pdf}trailer\n<< /Root 1 0 R /Size ${objects.length + 1} >>\n%%EOF\n`;
+}
+
+/** An uncompressed .docx: a ZIP with the one part that carries the text. Written
+ *  by hand for the same reason — no dependency, no binary fixture in the repo.
+ *  `corrupt` writes document.xml as deflate-marked garbage, the shape a truncated
+ *  or damaged file has. */
+function minimalDocx(escapedText, { corrupt = false } = {}) {
+  const files = [
+    ["[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'],
+    [
+      "word/document.xml",
+      `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${escapedText}</w:t></w:r></w:p></w:body></w:document>`,
+    ],
+  ];
+  const table = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = (buf) => {
+    let crc = 0xffffffff;
+    for (const byte of buf) crc = table[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const [name, text] of files) {
+    // document.xml can be written as a deflate-marked entry that is not deflate
+    // data, which is what a damaged file looks like on disk
+    const isCorrupt = corrupt && name === "word/document.xml";
+    const data = isCorrupt ? Buffer.from([0xff, 0xff, 0xff, 0xff]) : Buffer.from(text, "utf8");
+    const method = isCorrupt ? 8 : 0;
+    const nameBuf = Buffer.from(name, "utf8");
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(crc32(data), 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(crc32(data), 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, nameBuf, data);
+    centrals.push(central, nameBuf);
+    offset += 30 + nameBuf.length + data.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
 let failures = 0;
 function check(name, ok, detail = "") {
   if (ok) console.log(`  ok    ${name}`);
@@ -230,6 +314,35 @@ writeFixture("--tmp-ws-gamma--", "2026-03-03T00-00-00-000Z_cccc.jsonl", [
   },
 ]);
 
+// A prompt the composer sent with a document carries the extracted text in a
+// block of pi-web's own. That text is what the model read, not what the user
+// typed, so the session title and the prompt index must show the file name and
+// leave the body alone — a 100 KB PDF would otherwise match every query.
+writeFixture("--tmp-ws-delta--", "2026-04-04T00-00-00-000Z_dddd.jsonl", [
+  { type: "session", version: 3, id: "dddd", timestamp: "2026-04-04T00:00:00.000Z", cwd: "/tmp/ws-delta" },
+  {
+    type: "message",
+    id: "u4",
+    parentId: null,
+    timestamp: "2026-04-04T00:00:01.000Z",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: [
+            "DOCPROMPTTERM summarize this",
+            "",
+            '<attached-file name="quarterly &amp; report.pdf" kind="pdf" pages="2">',
+            "ATTACHEDBODYONLY revenue rose twelve percent",
+            "</attached-file>",
+          ].join("\n"),
+        },
+      ],
+    },
+  },
+]);
+
 const server = spawn(
   process.execPath,
   [path.join(ROOT, "server.js"), "--port", String(PORT), "--session-dir", FIXTURE_DIR, "--followup-dir", FOLLOWUP_DIR],
@@ -413,6 +526,23 @@ try {
     const res = await fetch(`${BASE}${asset}`);
     check(`GET ${asset} returns 200`, res.status === 200, `got ${res.status}`);
   }
+
+  // A file:// link used to fall through the inline parser and render as raw
+  // "[text](url)". It is a separate branch because the click cannot navigate:
+  // Chrome refuses to take an http page to a local path, so the handler copies
+  // it. Both halves are pinned here — the parse and the styled outcome.
+  const appJs = await (await fetch(`${BASE}/app.js`)).text();
+  check("app.js parses file: links", appJs.includes('a class="local-link"'));
+  check("app.js turns a local-link click into a copy", appJs.includes('closest("a.local-link")'));
+  const css = await (await fetch(`${BASE}/style.css`)).text();
+  check("style.css gives rendered links a palette color", css.includes(".assistant-text a {"));
+
+  // The Follow-up control is a toggle: a second press removes what the first
+  // press saved. Both halves have to be present — the pressed class the render
+  // sets, the handler that deletes, and the fill that makes "kept" visible.
+  check("app.js renders the Follow-up control as a toggle", appJs.includes('class: `turn-action followup-toggle'));
+  check("app.js un-keeps a follow-up on a second press", appJs.includes("async function unsaveFollowup"));
+  check("style.css paints the pressed Follow-up control", css.includes(".turn-action.kept {"));
 
   const securityHeaders = (await fetch(`${BASE}/`)).headers;
   check("X-Content-Type-Options: nosniff", securityHeaders.get("x-content-type-options") === "nosniff");
@@ -653,6 +783,31 @@ try {
   );
   const unknownScope = await search("flibbertigibbet", "&scope=bogus");
   check("/api/search treats an unknown scope as the full corpus", unknownScope.hits.length === both.hits.length);
+
+  // A document the composer attached is quoted into the prompt, so its text is
+  // in the session file. It must not become a prompt: the title and the prompt
+  // scope name the file, the body stays out.
+  const docPrompt = await search("DOCPROMPTTERM", "&scope=prompts");
+  check("/api/search finds the prompt that carried an attachment", docPrompt.hits.length === 1);
+  check(
+    "/api/search skips an attached document's body",
+    (await search("ATTACHEDBODYONLY")).hits.length === 0
+  );
+  check(
+    "/api/search names the attached file in the prompt snippet",
+    !`${docPrompt.hits[0]?.before}${docPrompt.hits[0]?.after}`.includes("<attached-file") &&
+      `${docPrompt.hits[0]?.before}${docPrompt.hits[0]?.after}`.includes("quarterly"),
+    JSON.stringify([docPrompt.hits[0]?.before, docPrompt.hits[0]?.after])
+  );
+  check(
+    "/api/sessions titles an attachment session by the prompt and the file name",
+    (() => {
+      const title = sessions.sessions.find((s) => s.cwd === "/tmp/ws-delta")?.title || "";
+      return title.includes("DOCPROMPTTERM") && title.includes("quarterly & report.pdf") && !title.includes("ATTACHEDBODYONLY");
+    })(),
+    JSON.stringify(sessions.sessions.find((s) => s.cwd === "/tmp/ws-delta")?.title)
+  );
+
   const searchCrossOrigin = await fetch(`${BASE}/api/search?q=flibbertigibbet`, {
     headers: { Origin: "https://evil.example.com" },
   });
@@ -699,6 +854,58 @@ try {
   check("/api/image refuses a non-image file", notImage.status === 415, `got ${notImage.status}`);
   const realPng = path.join(ROOT, "public", "favicon.svg");
   check("/api/image refuses SVG (no script-bearing types)", (await img(`path=${encodeURIComponent(realPng)}`)).status === 415);
+
+  // /api/extract turns a dropped document into prompt text. pi's RPC prompt only
+  // takes text and images, so a PDF, .docx or HTML page has to be readable here
+  // or it cannot be attached at all. The three fixtures are written by hand: a
+  // PDF small enough to read in the test, an uncompressed .docx, and a page.
+  const extract = async (name, data) =>
+    fetch(`${BASE}/api/extract`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, data: Buffer.from(data).toString("base64") }),
+    });
+  const textOf = async (res) => {
+    const body = await res.json().catch(() => ({}));
+    return body.text || "";
+  };
+  const pdfRes = await extract("report.pdf", minimalPdf("EXTRACTEDPDFTERM"));
+  const pdfBody = await pdfRes.json().catch(() => ({}));
+  check("/api/extract reads a PDF's text layer", pdfRes.ok && pdfBody.text?.includes("EXTRACTEDPDFTERM"), JSON.stringify(pdfBody).slice(0, 200));
+  check("/api/extract reports a PDF's page count", pdfBody.pages === 1, `pages=${pdfBody.pages}`);
+  const docxRes = await extract("notes.docx", minimalDocx("EXTRACTEDDOCXTERM &amp; 报告"));
+  const docxText = await textOf(docxRes);
+  check("/api/extract reads a .docx", docxRes.ok && docxText.includes("EXTRACTEDDOCXTERM"), docxText.slice(0, 120));
+  check("/api/extract decodes a .docx XML entity", docxText.includes("EXTRACTEDDOCXTERM & 报告"), docxText.slice(0, 120));
+  const htmlRes = await extract("page.html", "<html><body><h1>EXTRACTEDHTMLTERM</h1><p>one</p><ul><li>two</li></ul><script>BADSCRIPT</script></body></html>");
+  const htmlOut = await textOf(htmlRes);
+  check("/api/extract reads an .html file", htmlRes.ok && htmlOut.includes("EXTRACTEDHTMLTERM"), htmlOut.slice(0, 120));
+  check("/api/extract keeps list items as bullets", htmlOut.includes("- two"), JSON.stringify(htmlOut));
+  check("/api/extract drops script bodies", !htmlOut.includes("BADSCRIPT"), JSON.stringify(htmlOut));
+  const txtRes = await extract("notes.md", "# EXTRACTEDMDTERM\n\nbody line");
+  check("/api/extract passes a text file through", txtRes.ok && (await textOf(txtRes)).includes("EXTRACTEDMDTERM"));
+  check("/api/extract refuses an unsupported type", (await extract("archive.zip", "PK\u0003\u0004nothing")).status === 415);
+  check("/api/extract explains a legacy .doc", (await (await extract("old.doc", "text")).json()).error?.includes(".docx"), "");
+  check("/api/extract refuses an empty body", (await fetch(`${BASE}/api/extract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status === 400);
+  // A file merely named .pdf must fail loudly: sending the model a binary blob
+  // as if it were a document is worse than refusing the attachment.
+  const fakePdf = await extract("fake.pdf", "this is not a pdf at all");
+  check("/api/extract refuses a .pdf with no text layer", fakePdf.status === 415, `got ${fakePdf.status}`);
+  // A container that lies about its contents must be refused, not walked: a
+  // .docx whose document.xml is not deflate data and a zip whose directory
+  // points past the end of the file both have to fail as a 415 with a reason.
+  const corruptDocx = await extract("broken.docx", minimalDocx("x", { corrupt: true }));
+  check("/api/extract refuses a corrupt .docx", corruptDocx.status === 415, `got ${corruptDocx.status}`);
+  const lyingZip = minimalDocx("x");
+  lyingZip.writeUInt32LE(0xffffff00, lyingZip.length - 6); // directory offset past EOF
+  check("/api/extract refuses a .docx with a bad zip directory", (await extract("lying.docx", lyingZip)).status === 415);
+  const extractCrossOrigin = await fetch(`${BASE}/api/extract`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://evil.example.com" },
+    body: JSON.stringify({ name: "a.txt", data: "aGk=" }),
+  });
+  check("cross-origin extract is rejected", extractCrossOrigin.status === 403, `got ${extractCrossOrigin.status}`);
+
 
   // Only run the agent-backed check when pi is actually installed: /api/open
   // succeeds either way, so ask the agent for its state and treat a 503 as

@@ -74,7 +74,9 @@ pi-web --cwd ~/code/my-project
 
 - Assistant text, thinking and tool-call arguments stream in as pi works
   (`message_start` / `message_update` / `message_end`, `tool_execution_*`, retry and compaction
-  events), with a subset of Markdown rendered inline.
+  events), with a subset of Markdown rendered inline. `http(s)` links open in a new tab; a `file://`
+  link is rendered too, but a browser page cannot navigate to one — clicking it copies the path
+  instead of failing silently.
 - Tool calls appear as one-line rows in the transcript; clicking one opens a popup with the request
   arguments, live execution updates and the final response (text, images, `details`, error state,
   duration). For `edit` calls the popup leads with a colored, line-numbered diff — green additions,
@@ -165,7 +167,11 @@ pi-web --cwd ~/code/my-project
   its structure), while anything that only accepts plain text gets the Markdown source.
 - **Follow-up** appears on the turn that concludes a run — the same turn the prompt outline jumps
   to and the search's summary scope covers — and saves that answer to a JSON file under
-  `~/.pi/followups`. The **Follow-ups** sidebar tab lists what you kept, newest first; clicking a row
+  `~/.pi/followups`. It is a toggle: once that turn is kept, the control stays on it filled in the
+  accent color, and pressing it again removes the saved copy. The pressed state survives a reload
+  (the turn's timestamp and session file identify its saved copy), and a turn that was kept stays
+  toggleable even when a later turn takes over as the run's summary. The **Follow-ups** sidebar tab
+  lists what you kept, newest first; clicking a row
   opens the summary as a document in the main column, laid out like the transcript (full width, same
   gutter, no centered reading column), with a **Back** control, **Copy**, **Edit**, **Open
   session** and **Delete**. Opening one reads only that file: no `pi` process is spawned and no
@@ -204,11 +210,21 @@ pi-web --cwd ~/code/my-project
   the run's summary — the concluding answer after the tool loop, landing on its text rather than on
   a turn whose tool cards can run for screens. A run that was interrupted (aborted or failed) has no
   summary, so it shows no such row.
-- Attach images to the next message either way: drop files anywhere on the page, or use the
-  image button beside the composer hint to pick them from the OS file dialog (both paths accept
-  image files only and land in the same thumbnail row); click a thumbnail to enlarge it. Images
-  already in a transcript prompt open the same way — click one to see it in a popup, then click the
-  picture in that popup for the full-window viewer (the same two steps a tool-result image takes).
+- Attach files to the next message either way: drop them anywhere on the page, or use the
+  attach button beside the composer hint to pick them from the OS file dialog. Images land in a
+  thumbnail row and are sent as image blocks; click a thumbnail to enlarge it. Images already in a
+  transcript prompt open the same way — click one to see it in a popup, then click the picture in
+  that popup for the full-window viewer (the same two steps a tool-result image takes).
+- A **PDF**, **.docx**, **.html** or plain-text file (`.txt`, `.md`, `.csv`, `.json`, `.log`,
+  `.yaml`) is read as text and added to the prompt, so the agent can reason about a document you
+  hand it without a tool call. The server extracts the text — `pi`'s RPC prompt takes only text and
+  images — and the composer shows a chip with the file name, the page count for a PDF and how many
+  characters it will add; clicking the chip opens the extracted text, the same way a tool result
+  does. A document that cannot be read (a scanned PDF with no text layer, a legacy `.doc`, a file
+  over 20 MB, an encrypted file) is refused with the reason on its chip and must be removed before
+  the message can be sent. Long documents are truncated at 120,000 characters and the chip says so.
+  The transcript shows the attachment as the same chip, and its body is kept out of the session
+  title and cross-session search — it is what the model read, not what you typed.
 - `ArrowUp` / `ArrowDown` in the composer walk back and forward through previously sent
   prompts (terminal-style, kept in the browser's local storage, capped at 200 entries);
   the in-progress draft is restored when you arrow past the newest entry. Arrows keep
@@ -265,6 +281,7 @@ localhost-only by default.
 | `POST /api/cmd` | `{client, type, …}` — forward a pi RPC command, await its response |
 | `POST /api/ui-response` | Answer an extension UI request |
 | `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
+| `POST /api/extract` | `{name, data}` (base64) — extract the text of a composer attachment (PDF, `.docx`, `.html`, plain text) so it can ride inside a prompt; returns `{name, kind, text, pages?, truncated?}`, 415 with a reason when the file cannot be read |
 | `GET /api/sessions` | List sessions with live active/streaming flags |
 | `GET /api/followups` | List saved follow-ups: `{ followups: [{ id, title, createdAt, ts, cwd, sessionFile, sessionTitle, chars }] }` — metadata only, no bodies |
 | `POST /api/followups` | `{ title, text, ts?, cwd?, sessionFile?, sessionTitle? }` — save one summary under the follow-up directory; returns its metadata |
@@ -325,6 +342,13 @@ Either way, put authentication in front of the port before it is reachable by an
   else — text, JSON, SVG — is refused with 415, so the endpoint cannot be used as a general file
   reader.
 - Session listing walks only the configured session directory.
+- `POST /api/extract` never reads a path: the bytes come from the browser's own `File`, are capped at
+  20 MB, and leave as text only. The readers are bounded at every level — a decompressed stream at
+  64 MB and a whole file's decompressed total at 96 MB (a small file can inflate to gigabytes), PDF
+  objects at 50,000 and pages at 2,000, the declared member count of an object stream against what
+  the file can hold, markup scanned at 4 MB, and the extracted text at 120,000 characters. A
+  malformed or hostile container is refused with 415 instead of decompressing without limit. No
+  external binary (no `pdftotext`, no `unzip`) is invoked.
 - Cross-session search reads only the same session directory, returns snippets and never writes.
   Parsed indexes live in a byte-capped in-memory cache and are keyed by each file's mtime and size.
 - Session summaries for the sidebar are cached per file under the same mtime+size key, so polling
@@ -376,6 +400,14 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - No multi-user support: one person, one machine, many tabs.
 - A follow-up keeps the summary's Markdown text only. Images in it are not copied, and it is not
   updated when the session it came from changes — save it again for a newer answer.
+- A `file://` link in an answer is shown as a link, but Chrome will not let an `http` page open a
+  local file, so clicking it copies the path rather than navigating. Open the path from a terminal
+  (`open <path>`, `xdg-open <path>`).
+- Attachment extraction is approximate and layout-blind: PDF text comes out in reading order only as
+  well as the page's text operators allow (a multi-column page can interleave columns, tables become
+  one cell per line), a scanned PDF has no text to extract and needs OCR first, and legacy `.doc`,
+  `.xls`, `.pptx` and `.docm` are not accepted. Formatting, images, footnotes and comments are
+  dropped — the agent gets the words, not the document.
 - Cross-session search indexes the text of every message in every session file, not only the active
   branch. History from before a compaction is reachable (and rendered), but a message on a branch
   that was branched away from has no transcript row: clicking such a hit reports that it is not on

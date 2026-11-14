@@ -187,7 +187,16 @@ function inlineMd(s) {
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|\W)\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // http(s) opens in a new tab; file: cannot, because Chrome refuses to
+    // navigate an http page to a local path ("Not allowed to load local
+    // resource"). It is still rendered as a link — a silent, unclickable one
+    // would be worse — and the click handler below turns it into the one thing
+    // the reader can act on: the path on the clipboard.
+    .replace(/\[([^\]]+)\]\(((?:https?|file):\/\/[^)\s]+)\)/g, (match, text, href) =>
+      href.startsWith("file:")
+        ? `<a class="local-link" href="${href}" title="A browser page cannot open a local file — clicking copies the path">${text}</a>`
+        : `<a href="${href}" target="_blank" rel="noopener">${text}</a>`
+    );
 }
 
 /** pi expands a skill invocation into a user message whose text is its own
@@ -500,7 +509,10 @@ function buildItemsFromEntries(entries) {
             if (b.type === "text") text += (text ? "\n" : "") + b.text;
             else if (b.type === "image") images.push(b);
           }
-        items.push({ kind: "user", text, images, ts, entry });
+        // a prompt the composer sent with a document carries its text in a
+        // block of ours; the transcript shows a chip for it, not the body
+        const { text: typed, files } = splitAttachedFiles(text);
+        items.push({ kind: "user", text: typed, images, files, ts, entry });
         break;
       }
       case "assistant": {
@@ -1450,6 +1462,44 @@ function promptImage(img) {
   return el("img", { src, alt: "prompt image", title: "Click to enlarge", onclick: () => openImagePopup(src, "prompt image") });
 }
 
+/** A document the prompt carried, shown as a chip with its name and page count.
+ *  The text itself stays out of the way — it is what the model read, not what
+ *  the reader typed — and opens in a popup on click, laid out like a tool
+ *  result's text body. */
+function attachedDocChip(doc) {
+  // the badge already names the format, so the meta line carries only what is
+  // not visible: how big the document is and whether it was cut short
+  const meta = [];
+  if (doc.pages) meta.push(`${doc.pages} page${doc.pages === 1 ? "" : "s"}`);
+  meta.push(`${fmtTokens(doc.body.length)} chars`);
+  if (doc.truncated) meta.push("truncated");
+  const chip = el(
+    "div",
+    {
+      class: "prompt-file",
+      role: "button",
+      tabindex: "0",
+      title: "Open the text this prompt attached",
+    },
+    el("span", { class: "attachment-ext", text: fileExt(doc.name) }),
+    el(
+      "span",
+      { class: "attachment-file-text" },
+      el("span", { class: "attachment-name", text: doc.name }),
+      el("span", { class: "attachment-meta", text: meta.join(" · ") })
+    ),
+    el("span", { class: "tc-open-icon", text: "↗" })
+  );
+  const open = () =>
+    openPopup(`attachment: ${doc.name}`, {
+      paint: () => el("pre", { class: "tc-text doc-body", text: doc.body }),
+      payload: () => doc,
+    });
+  chip.addEventListener("click", open);
+  chip.addEventListener("keydown", onActivate(open));
+  return chip;
+}
+
 /** the visible part of a skill invocation: a chip naming the skill, the prompt
  *  the user typed after it, and the expanded SKILL.md folded away. The chip is
  *  the highlight — a skill call is an event in the run, and the definition it
@@ -1518,14 +1568,22 @@ function promptOfRun(item) {
  *  a mid-loop answer is not what "the summary" names. */
 function renderTurnActions(item, { followup = false } = {}) {
   const row = el("div", { class: "turn-actions" });
-  if (followup) {
+  // A turn that already kept its answer offers the same control in its pressed
+  // state, so the second press can take it back. It stays on screen even if the
+  // turn later stops being the run's summary, or the saved copy could no longer
+  // be un-kept from where it was made.
+  const saved = savedFollowupOf(item);
+  if (followup || saved) {
     row.append(
       el(
         "button",
         {
-          class: "turn-action",
-          title: "Save this summary to Follow-ups — readable later without loading the session",
-          onclick: () => saveFollowup(item),
+          class: `turn-action followup-toggle${saved ? " kept" : ""}`,
+          "aria-pressed": String(!!saved),
+          title: saved
+            ? "Saved to Follow-ups — press again to remove it"
+            : "Save this summary to Follow-ups — readable later without loading the session",
+          onclick: () => toggleFollowup(item),
         },
         el("span", { class: "turn-action-icon", html: FOLLOWUP_ICON }),
         el("span", { text: "Follow-up" })
@@ -1562,6 +1620,7 @@ function renderItem(item) {
       const skill = parseSkillBlock(item.text);
       if (skill) {
         box.append(renderSkillInvocation(skill));
+        for (const doc of item.files || []) box.append(attachedDocChip(doc));
         for (const img of item.images || []) box.append(promptImage(img));
         return box;
       }
@@ -1569,6 +1628,7 @@ function renderItem(item) {
       body.style.whiteSpace = "pre-wrap";
       body.textContent = item.text;
       box.append(body);
+      for (const doc of item.files || []) box.append(attachedDocChip(doc));
       for (const img of item.images || []) box.append(promptImage(img));
       return box;
     }
@@ -1689,6 +1749,23 @@ transcriptEl.addEventListener("click", (e) => {
     setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("done"); }, 1500);
   }).catch(() => toast("copy failed", "error"));
 });
+
+// A file:// link cannot be followed from an http page: Chrome answers the
+// click with "Not allowed to load local resource" and stays put. Rather than
+// drop the link, keep it and make the click hand over the one thing the reader
+// can actually use — the path, ready to paste into an editor or `open`.
+// Document-level so it also covers a follow-up body and the summary document,
+// which are not inside #transcript.
+document.addEventListener("click", (e) => {
+  const link = e.target.closest("a.local-link");
+  if (!link) return;
+  e.preventDefault();
+  navigator.clipboard.writeText(link.getAttribute("href")).then(
+    () => toast("local path copied — open it from your terminal", "info"),
+    () => toast("copy failed", "error")
+  );
+});
+
 function renderTranscript({ follow = true } = {}) {
   const nearBottom = transcriptAtBottom();
   const nodes = [];
@@ -2149,13 +2226,15 @@ function renderPromptList() {
     // a skill invocation puts its chip first, then the prompt the user typed, so
     // the outline matches the transcript instead of listing "<skill name=…"
     const skill = parseSkillBlock(item.text);
+    const files = item.files || [];
+    const typed = (item.text || "").replace(/\s+/g, " ").trim();
     const text = skill
       ? [skill.name.replace(/^skill:/, ""), skill.userMessage].filter(Boolean).join(" · ")
-      : (item.text || "").replace(/\s+/g, " ").trim() || "(images only)";
+      : typed || (files.length ? "(file only)" : item.images?.length ? "(images only)" : "");
     const group = el("div", { class: "pl-group" },
       el("div", {
         class: "pl-entry",
-        title: skill ? `${skill.name}\n\n${skill.userMessage}` : item.text || "",
+        title: skill ? `${skill.name}\n\n${skill.userMessage}` : [typed, ...files.map((f) => `[attached: ${f.name}]`)].filter(Boolean).join("\n"),
         onclick: () => {
           setPromptListOpen(false);
           scrollToUserPrompt(item);
@@ -2163,6 +2242,7 @@ function renderPromptList() {
       },
         el("span", { class: "pl-num", text: String(n + 1) }),
         skill ? el("span", { class: "pl-skill", text: "skill" }) : null,
+        files.length ? el("span", { class: "pl-file", text: files.length === 1 ? fileExt(files[0].name) : `+${files.length} files` }) : null,
         el("span", { class: "pl-text", text: text }),
         el("span", { class: "pl-time", text: item.ts ? fmtTime(item.ts) : "" })
       )
@@ -2721,14 +2801,74 @@ async function loadFollowups() {
   try {
     const data = await api("/api/followups");
     state.followups = Array.isArray(data.followups) ? data.followups : [];
+    // the list is what the Follow-up controls read, so a fresh copy (boot, a
+    // delete from another tab's sidebar) has to reach the turns on screen
+    syncFollowupControls();
     if (state.sidebarTab === "followups") renderSidebar();
   } catch (err) {
     console.error(err);
   }
 }
 
+/** The saved follow-up kept from this turn, if any. The id the save returned is
+ *  remembered on the item, so a turn's own save is found even if the list has
+ *  not been reloaded yet; the fallback matches the stored record by session
+ *  file plus the turn's timestamp, which is what makes the control still read
+ *  as "kept" after a reload. */
+function savedFollowupOf(item) {
+  if (item.followupId) {
+    const byId = state.followups.find((f) => f.id === item.followupId);
+    if (byId) return byId;
+  }
+  if (!item.ts || !state.followups.length) return null;
+  const file = state.sessionFile || null;
+  return state.followups.find((f) => f.ts === item.ts && (f.sessionFile || null) === file) || null;
+}
+
+/** Press the Follow-up control: keep this turn's answer the first time, take it
+ *  back the second. A press while the request is in flight is dropped: the
+ *  toggle invites a double click, and two POSTs would leave two copies of the
+ *  same summary. */
+function toggleFollowup(item) {
+  if (item.followupBusy) return;
+  const saved = savedFollowupOf(item);
+  if (saved) unsaveFollowup(item, saved);
+  else saveFollowup(item);
+}
+
+/** The Follow-up control reads state.followups, so a save, an unsave or a
+ *  delete from the sidebar has to be reflected on the turns already on screen.
+ *  Their state is patched in place rather than re-rendering the transcript: a
+ *  full re-render would throw away the node the click came from and can move
+ *  the reader's scroll position. */
+function syncFollowupControls() {
+  let rerender = false;
+  for (const it of state.items) {
+    if (it.kind !== "assistant" || it.streaming || !it.node) continue;
+    const saved = savedFollowupOf(it);
+    const btn = it.node.querySelector(".turn-action.followup-toggle");
+    if (!btn) {
+      // a turn that was rendered without the control now has something to
+      // offer (only reachable when the list arrived after the turn did)
+      if (saved) {
+        it.dirty = true;
+        rerender = true;
+      }
+      continue;
+    }
+    btn.classList.toggle("kept", !!saved);
+    btn.setAttribute("aria-pressed", String(!!saved));
+    btn.title = saved
+      ? "Saved to Follow-ups — press again to remove it"
+      : "Save this summary to Follow-ups — readable later without loading the session";
+  }
+  if (rerender) scheduleRender();
+}
+
 /** Keep one turn's answer as a follow-up. The text stored is the same Markdown
- *  the transcript rendered, so reopening it needs neither pi nor the session. */
+ *  the transcript rendered, so reopening it needs neither pi nor the session.
+ *  The id is kept on the item so a turn's own save is unambiguous even when two
+ *  turns of the same session end in the same millisecond. */
 async function saveFollowup(item) {
   const text = answerTextOf(item);
   if (!text) return;
@@ -2736,8 +2876,9 @@ async function saveFollowup(item) {
   const promptLine = prompt ? (parseSkillBlock(prompt.text)?.userMessage || prompt.text || "").replace(/\s+/g, " ").trim() : "";
   const meta = currentSessionMeta();
   const title = promptLine ? truncate(promptLine, 90) : (state.sessionName || meta?.title || "Follow-up");
+  item.followupBusy = true;
   try {
-    await api("/api/followups", {
+    const data = await api("/api/followups", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2749,23 +2890,46 @@ async function saveFollowup(item) {
         sessionTitle: state.sessionName || meta?.title || null,
       }),
     });
+    item.followupId = data.followup?.id || null;
+    // loadFollowups() re-reads the list the control reads and re-syncs it
     await loadFollowups();
-    toast("saved to Follow-ups");
+    toast("saved to Follow-ups — press Follow-up again to remove it");
   } catch (err) {
     toast(`could not save follow-up: ${err.message}`, "error");
+  } finally {
+    item.followupBusy = false;
   }
 }
 
-async function deleteFollowup(id) {
+/** Un-keep the follow-up saved from this turn: the button is a toggle, so a
+ *  second press on the same turn removes what the first press stored. */
+async function unsaveFollowup(item, saved) {
+  item.followupBusy = true;
   try {
-    await fetch(`/api/followups/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!(await deleteFollowup(saved.id, { quiet: true }))) return;
+    item.followupId = null;
+    toast("removed from Follow-ups");
+  } finally {
+    item.followupBusy = false;
+  }
+}
+
+/** Delete one saved follow-up. Returns false when the server refused, so a
+ *  caller that also has on-screen state to update does not clear it on a
+ *  delete that did not happen. */
+async function deleteFollowup(id, { quiet = false } = {}) {
+  try {
+    const res = await fetch(`/api/followups/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(`server said ${res.status}`);
   } catch (err) {
     toast(`could not delete follow-up: ${err.message}`, "error");
-    return;
+    return false;
   }
   if (state.openFollowup?.id === id) closeFollowup();
+  // loadFollowups() re-reads the list the Follow-up controls read and re-syncs them
   await loadFollowups();
-  toast("follow-up deleted");
+  if (!quiet) toast("follow-up deleted");
+  return true;
 }
 
 /** One sidebar row for a session. `showWorkspace` picks the timestamp that
@@ -3625,35 +3789,54 @@ async function loadCommands() {
 async function sendPrompt() {
   const input = $("#input");
   const text = input.value.trim();
+  const pending = attachments.some((a) => a.state === "reading");
+  // a document that could not be read contributes nothing, so it must not look
+  // like part of the prompt; it stays in the row (marked) for the user to remove
+  const ready = attachments.filter((a) => a.kind === "doc" ? a.state === "ready" : true);
+  const failed = attachments.filter((a) => a.kind === "doc" && a.state === "error");
   if (!text) {
     // pi's user message always carries a text block; an empty one can be
-    // rejected by providers, so images need at least a short message
-    if (attachments.length) toast("type a short message for the image(s), then send", "warning");
+    // rejected by providers, so an attachment needs at least a short message
+    if (attachments.length) toast(`type a short message for the ${failed.length ? "attachment(s)" : "file(s)"}, then send`, "warning");
     return;
   }
+  if (pending) {
+    toast("still reading the attached file — send again in a moment", "warning");
+    return;
+  }
+  if (failed.length) {
+    toast(`${failed.map((a) => a.name).join(", ")} could not be read — remove it to send`, "error");
+    return;
+  }
+  const images = ready.filter((a) => a.kind === "image");
+  const docs = ready.filter((a) => a.kind === "doc");
   input.value = "";
   autosize(input);
   closeCmdMenu();
   rememberPrompt(text);
-  const images = attachments.splice(0, attachments.length);
+  attachments.splice(0, attachments.length);
   renderAttachments();
   const extra = state.isStreaming ? { streamingBehavior: "steer" } : {};
   if (images.length) extra.images = images.map((a) => ({ type: "image", data: a.data, mimeType: a.mimeType }));
+  // a document is appended to the message rather than sent beside it: pi's RPC
+  // prompt has no file block, and text is what the model reads anyway. The block
+  // is markup so the transcript can show a chip instead of dumping the body.
+  const message = docs.length ? [text, ...docs.map(attachedFileBlock)].join("\n\n") : text;
   const restore = () => {
     input.value = text;
     autosize(input);
-    attachments.unshift(...images);
+    attachments.unshift(...ready);
     renderAttachments();
   };
   try {
-    const res = await cmd("prompt", { message: text, ...extra });
+    const res = await cmd("prompt", { message, ...extra });
     const disp = res.data?.disposition;
     $("#composer-hint").textContent = disp ? `disposition: ${disp}` : "";
   } catch (err) {
     // if racing a running agent, retry as steer (steer accepts images too)
     if (state.isStreaming) {
       try {
-        const res = await cmd("prompt", { message: text, ...extra });
+        const res = await cmd("prompt", { message, ...extra });
         $("#composer-hint").textContent = `disposition: ${res.data?.disposition}`;
         return;
       } catch {}
@@ -4658,52 +4841,196 @@ inputEl.addEventListener("keydown", (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// composer image attachments: drag screenshots in for quick triage
+// composer attachments: images ride along as image blocks, documents are read
+// into text by the server and ride inside the prompt
+//
+// pi's RPC prompt takes text and images only, so a PDF, .docx, .html or text
+// file is turned into text by `POST /api/extract` and appended to the message.
+// The block below is the wire format both sides agree on: the composer writes
+// it, the transcript parses it back into a chip instead of showing a document
+// inline, and the server leaves the body out of titles and the search index.
 // ---------------------------------------------------------------------------
 const attachmentsEl = $("#attachments");
-const attachments = []; // { data: base64 payload, mimeType, url: dataURL }
+const attachments = []; // { kind: "image", data, mimeType, url } | { kind: "doc", … }
+
+const ATTACHED_NAME_MAX = 200;
+/** Attribute values go through `esc`, so a quote in a file name cannot break out
+ *  of the attribute and the block stays one well-formed element. */
+/** The body must not contain the block's own closing tag: a document that
+ *  quotes pi-web's markup would otherwise end the block early and spill the
+ *  rest of its text into the prompt as loose prose. Breaking the tag with a
+ *  space keeps the text readable and the framing unambiguous. */
+function safeAttachedBody(text) {
+  return String(text || "").replace(/<(\/?)attached-file\b/gi, "<$1 attached-file");
+}
+
+function attachedFileBlock(doc) {
+  // doc.kind is the composer's "image"|"doc" switch; the block records how the
+  // text was extracted (pdf, docx, html, text), which is what a reader of the
+  // saved session needs to know
+  const attrs = [`name="${esc(doc.name)}"`, `kind="${esc(doc.fileKind || "text")}"`];
+  if (doc.pages) attrs.push(`pages="${doc.pages}"`);
+  if (doc.truncated) attrs.push(`truncated="true"`);
+  return `<attached-file ${attrs.join(" ")}>\n${safeAttachedBody(doc.text)}\n</attached-file>`;
+}
+
+const ATTACHED_FILE_RE =
+  /<attached-file name="([^"]*)" kind="([^"]*)"(?: pages="(\d+)")?( truncated="true")?>\n([\s\S]*?)\n<\/attached-file>/g;
+const unescAttr = (s) =>
+  s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+
+/** Split a user message into the words the user typed and the documents the
+ *  composer appended. A message without any block comes back unchanged, so the
+ *  cost on an ordinary prompt is one failed match. */
+function splitAttachedFiles(text) {
+  const files = [];
+  const body = String(text || "").replace(ATTACHED_FILE_RE, (_, name, kind, pages, truncated, content) => {
+    files.push({
+      name: unescAttr(name),
+      kind: kind || "text",
+      pages: pages ? Number(pages) : null,
+      truncated: Boolean(truncated),
+      body: content,
+    });
+    return "";
+  });
+  return files.length ? { text: body.replace(/\n{3,}/g, "\n\n").trim(), files } : { text: String(text || ""), files };
+}
+
+/** A readable name for a document chip: the extension is the badge, so the name
+ *  does not need to repeat it. */
+function fileExt(name) {
+  return (String(name).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "file").toUpperCase();
+}
+
+function docMeta(doc) {
+  const parts = [];
+  if (doc.pages) parts.push(`${doc.pages} page${doc.pages === 1 ? "" : "s"}`);
+  if (doc.state === "reading") parts.push("reading…");
+  else if (doc.state === "error") parts.push(doc.error || "could not be read");
+  else {
+    parts.push(`${fmtTokens(doc.text.length)} chars`);
+    if (doc.truncated) parts.push("truncated");
+  }
+  return parts.join(" · ");
+}
+
+function removeAttachment(i) {
+  attachments.splice(i, 1);
+  renderAttachments();
+}
 
 function renderAttachments() {
   attachmentsEl.innerHTML = "";
   attachmentsEl.classList.toggle("hidden", !attachments.length);
   attachments.forEach((a, i) => {
+    const remove = el("button", {
+      class: "attachment-remove",
+      title: "Remove attachment",
+      "aria-label": "Remove attachment",
+      text: "✕",
+      onclick: () => removeAttachment(i),
+    });
+    if (a.kind === "doc") {
+      // a document is a chip, not a picture: what identifies it is the name and
+      // how much text it will add, and the popup is the extracted text itself
+      const chip = el(
+        "div",
+        { class: `attachment-file${a.state === "error" ? " error" : ""}` },
+        el("span", { class: "attachment-ext", text: fileExt(a.name) }),
+        el(
+          "span",
+          { class: "attachment-file-text" },
+          el("span", { class: "attachment-name", text: a.name, title: a.name }),
+          el("span", { class: "attachment-meta", text: docMeta(a) })
+        ),
+        remove
+      );
+      if (a.state === "ready") {
+        chip.title = "Click to read the extracted text";
+        chip.addEventListener("click", (e) => {
+          if (e.target.closest(".attachment-remove")) return;
+          openPopup(`attachment: ${a.name}`, {
+            paint: () => el("pre", { class: "doc-body", text: a.text }),
+            payload: () => ({ name: a.name, kind: a.kind, pages: a.pages, truncated: a.truncated, text: a.text }),
+          });
+        });
+      }
+      attachmentsEl.append(chip);
+      return;
+    }
     // clicking a thumbnail opens the full image in the popup for detail review
     const zoom = () => openImagePopup(a.url, "attachment");
     attachmentsEl.append(
-      el(
-        "div",
-        { class: "attachment" },
-        el("img", { src: a.url, alt: "attachment preview", title: "Click to enlarge", onclick: zoom }),
-        el("button", {
-          class: "attachment-remove",
-          title: "Remove attachment",
-          "aria-label": "Remove attachment",
-          text: "✕",
-          onclick: () => {
-            attachments.splice(i, 1);
-            renderAttachments();
-          },
-        })
-      )
+      el("div", { class: "attachment" }, el("img", { src: a.url, alt: "attachment preview", title: "Click to enlarge", onclick: zoom }), remove)
     );
   });
 }
 
-function addImageFiles(files) {
-  let added = 0;
-  for (const f of files) {
-    if (!f.type.startsWith("image/")) continue;
-    added++;
+/** Files an attachment can be built from. Anything else is refused by name so a
+ *  mistyped extension is not silently ignored. */
+const DOC_EXTENSIONS = new Set(["pdf", "docx", "html", "htm", "txt", "md", "markdown", "csv", "json", "log", "yaml", "yml"]);
+/** A file this size goes to the server as base64 in a JSON body, which is 4/3 of
+ *  it, so it has to stay clear of the server's 32 MB body cap. Refusing it here
+ *  is the difference between a named reason and "Failed to fetch". */
+const ATTACH_FILE_MAX_MB = 20;
+
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      const url = String(reader.result); // data:<mime>;base64,<payload>
-      attachments.push({ data: url.slice(url.indexOf(",") + 1), mimeType: f.type, url });
-      renderAttachments();
-    };
-    reader.readAsDataURL(f);
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error || new Error("could not read the file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Turn a dropped or picked file into an attachment. An image is kept as base64
+ *  and sent as an image block; anything else is posted to the server, which
+ *  extracts its text. The placeholder goes in first, so a slow PDF shows up in
+ *  the row immediately with "reading…" rather than after a pause. */
+async function addFile(file) {
+  if (file.size > ATTACH_FILE_MAX_MB * 1024 * 1024) {
+    toast(`${file.name} is larger than ${ATTACH_FILE_MAX_MB} MB — attach a smaller file`, "error");
+    return;
   }
-  if (added) inputEl.focus();
-  else toast("unsupported file — images only", "error");
+  if (file.type.startsWith("image/")) {
+    const url = await readAsDataUrl(file);
+    attachments.push({ kind: "image", data: url.slice(url.indexOf(",") + 1), mimeType: file.type, url });
+    renderAttachments();
+    return;
+  }
+  const ext = String(file.name).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+  if (!DOC_EXTENSIONS.has(ext)) {
+    toast(`unsupported file: ${file.name} — attach an image, PDF, .docx, .html or a text file`, "error");
+    return;
+  }
+  const doc = { kind: "doc", name: file.name.slice(0, ATTACHED_NAME_MAX), fileKind: ext, state: "reading" };
+  attachments.push(doc);
+  renderAttachments();
+  try {
+    const url = await readAsDataUrl(file);
+    const res = await fetch("/api/extract", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: doc.name, data: url.slice(url.indexOf(",") + 1) }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    Object.assign(doc, { state: "ready", kind: "doc", text: body.text, pages: body.pages || null, truncated: !!body.truncated, fileKind: body.kind });
+  } catch (err) {
+    doc.state = "error";
+    doc.error = err.message;
+  }
+  renderAttachments();
+}
+
+async function addFiles(files) {
+  const list = [...files];
+  if (!list.length) return;
+  inputEl.focus();
+  // one at a time: every document becomes a request, and a burst of ten would
+  // only make the row jump around while they land out of order
+  for (const file of list) await addFile(file);
 }
 
 // The attach button opens the OS file picker; dropping files still works.
@@ -4712,13 +5039,13 @@ function addImageFiles(files) {
 $("#btn-attach").addEventListener("click", () => $("#file-input").click());
 $("#file-input").addEventListener("change", (e) => {
   const files = [...(e.target.files || [])];
-  if (files.length) addImageFiles(files);
+  if (files.length) addFiles(files);
   e.target.value = "";
 });
 
 // File drops are accepted anywhere on the page and routed to the composer.
 // Cancelling at window level is what actually prevents the browser's default
-// action (opening the dropped image in a tab / navigating away) — a composer-
+// action (opening the dropped file in a tab / navigating away) — a composer-
 // scoped handler misses every drop that lands a few pixels outside it.
 // Text/URL drags carry no "Files" type and keep their default behavior.
 const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files");
@@ -4737,7 +5064,7 @@ window.addEventListener("drop", (e) => {
   if (!hasFiles(e)) return;
   e.preventDefault();
   document.body.classList.remove("dropping");
-  if (e.dataTransfer?.files?.length) addImageFiles([...e.dataTransfer.files]);
+  if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
 });
 
 $("#btn-send").addEventListener("click", sendPrompt);
