@@ -424,6 +424,170 @@ async function sseClient(url) {
   };
 }
 
+/** Background processes a bash call leaves behind.
+ * * The failure this pins: `nohup node server/x.js &` inside a bash tool call keeps
+ * running after the call, the run and the agent process — reparented to init,
+ * with nothing in the RPC stream ever mentioning it again. Without this the
+ * server is invisible from the UI and can only be found with `ps`.
+ *
+ * Driven through test/fake-pi.js so it needs no credentials: the fake starts a
+ * real detached child during a tool call, and the server's before/after diff has
+ * to see it. */
+async function backgroundProcessChecks() {
+  const port = PORT + 2;
+  const base = `http://127.0.0.1:${port}`;
+  const fakeBin = path.join(ROOT, "test", "fake-pi.js");
+  // The fake appends each leftover's pid here, so a run that fails before reading
+  // it still cleans up.
+  const pidFile = path.join(os.tmpdir(), `pi-web-smoke-pids-${process.pid}`);
+  const child = spawn(
+    process.execPath,
+    [path.join(ROOT, "server.js"), "--port", String(port), "--session-dir", FIXTURE_DIR, "--pi", fakeBin],
+    {
+      cwd: ROOT,
+      env: { ...process.env, PI_WEB_SMOKE_PIDFILE: pidFile },
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
+  let log = "";
+  child.stdout.on("data", (d) => (log += d));
+  child.stderr.on("data", (d) => (log += d));
+
+  const post = async (pathname, body) =>
+    (
+      await fetch(`${base}${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+    ).json();
+  const spawnedPids = [];
+  const killSpawned = () => {
+    for (const pid of spawnedPids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    try {
+      for (const line of fs.readFileSync(pidFile, "utf8").split("\n")) {
+        const pid = Number(line.trim());
+        if (Number.isInteger(pid) && pid > 0) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+      }
+      fs.rmSync(pidFile, { force: true });
+    } catch {}
+  };
+
+  const exists = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      // EPERM means it is there but owned by someone else — alive either way.
+      return err.code === "EPERM";
+    }
+  };
+
+  try {
+    const wsDir = path.join(FIXTURE_DIR, "--proc-ws--");
+    const sessionFile = path.join(wsDir, "2026-05-05T00-00-00-000Z_pp.jsonl");
+    writeFixture("--proc-ws--", path.basename(sessionFile), [
+      { type: "session", version: 3, id: "pp", timestamp: "2026-05-05T00:00:00.000Z", cwd: FIXTURE_DIR },
+    ]);
+
+    for (let i = 0; i < 100; i++) {
+      try {
+        if ((await fetch(`${base}/api/health`)).ok) break;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    const es = await sseClient(`${base}/api/events?client=p1`);
+    await es.waitFor((r) => r?.event === "hello", 3000);
+    await post("/api/open", { client: "p1", sessionFile });
+
+    // Nothing left running yet: the panel must be empty, not merely unloaded.
+    const none = await (await fetch(`${base}/api/processes?client=p1`)).json();
+    check("/api/processes starts empty for a fresh session", Array.isArray(none.processes) && none.processes.length === 0, JSON.stringify(none).slice(0, 200));
+
+    await post("/api/cmd", { client: "p1", type: "prompt", message: "LEAVE-A-PROCESS please" });
+
+    // The fake emits `fake_child` after `tool_execution_end`, and the server's
+    // broadcast for that call is emitted on `tool_execution_end` — so waiting for
+    // fake_child collects both records in one batch.
+    const batch = await es.waitFor((r) => r?.type === "fake_child", 8000);
+    const fakePid = batch.find((r) => r?.type === "fake_child")?.pid ?? null;
+    if (fakePid) spawnedPids.push(fakePid);
+
+    const pushedList = batch.filter((r) => r?.event === "background_processes").at(-1)?.processes || [];
+    check(
+      "a leftover is broadcast to the attached tab",
+      pushedList.length > 0,
+      batch.length ? JSON.stringify(batch).slice(0, 300) : "no background_processes record"
+    );
+    check(
+      "the broadcast names the process that was left running",
+      fakePid ? pushedList.some((p) => p.pid === fakePid) : false,
+      `fake pid ${fakePid} vs ${JSON.stringify(pushedList).slice(0, 300)}`
+    );
+
+    const listed = await (await fetch(`${base}/api/processes?client=p1`)).json();
+    check(
+      "/api/processes lists the leftover with a pid and command",
+      listed.processes?.some((p) => p.pid === fakePid && typeof p.command === "string" && p.command.length > 0),
+      JSON.stringify(listed).slice(0, 300)
+    );
+
+    // The route is an allow-list, not "kill any pid": the whole point of the
+    // panel is that it cannot be turned into arbitrary process control.
+    const foreign = await post("/api/processes/kill", { client: "p1", pid: 1 });
+    check("killing a pid this session did not start is refused", foreign?.ok !== true, JSON.stringify(foreign).slice(0, 200));
+    check("a refused kill leaves pid 1 alive", exists(1));
+
+    const killed = await post("/api/processes/kill", { client: "p1", pid: fakePid });
+    check("killing a recorded leftover is accepted", killed?.ok === true, JSON.stringify(killed).slice(0, 200));
+
+    // SIGTERM lands immediately; the entry is dropped without waiting for the
+    // SIGKILL backstop.
+    let gone = false;
+    for (let i = 0; i < 40; i++) {
+      if (!exists(fakePid)) {
+        gone = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    check("the killed leftover is gone", gone, `pid ${fakePid} still alive`);
+
+    const after = await (await fetch(`${base}/api/processes?client=p1`)).json();
+    check(
+      "/api/processes drops a stopped process",
+      !(after.processes || []).some((p) => p.pid === fakePid),
+      JSON.stringify(after).slice(0, 300)
+    );
+
+    // A page reload reconnects to a process that may still hold leftovers, and
+    // nothing is broadcast until the next bash call — so the snapshot rides the
+    // attach, exactly like the queue snapshot above.
+    es.close();
+    const reconnected = await sseClient(`${base}/api/events?client=p1`);
+    const replayed = await reconnected.waitFor((r) => r?.event === "background_processes", 3000);
+    check(
+      "re-attaching replays the background process list",
+      replayed.length > 0 && Array.isArray(replayed.at(-1)?.processes),
+      JSON.stringify(replayed).slice(0, 300)
+    );
+    reconnected.close();
+  } finally {
+    killSpawned();
+    child.kill("SIGTERM");
+    if (failures && log.trim()) console.error(`\nbackground-process server log:\n${log.trim()}`);
+  }
+}
+
 /** Queue snapshot on (re)attach, driven by test/fake-pi.js so it needs no
  *  credentials. pi emits queue_update only when the queue changes, so without
  *  the snapshot a tab that switches away and back keeps an empty dock while
@@ -968,6 +1132,7 @@ try {
   // that switches away and back must be told what its process still holds —
   // otherwise the dock looks empty while the messages are in fact pending.
   await queueSnapshotChecks();
+  await backgroundProcessChecks();
 } finally {
   stopServer();
   fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });

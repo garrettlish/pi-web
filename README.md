@@ -198,13 +198,26 @@ pi-web --cwd ~/code/my-project
   updated as each assistant message completes, not only when a run ends — with a session-details
   popover for the session title, full path, session id, cwd and token breakdown.
 - The settings button at the right of the `pi running` status row opens a centered, near-full-window
-  read-only inspector with three tabs: **Models** (every configured model with its provider/id,
+  read-only inspector with four tabs: **Models** (every configured model with its provider/id,
   context window, output cap, per-million-token costs, API dialect, accepted input types and whether
   it is the current one), **Skills** (each skill pi discovered for this session, with scope, origin,
-  description and `SKILL.md` path) and **MCPs**. The MCP tab asks the
+  description and `SKILL.md` path), **MCPs** and **Processes**. The MCP tab asks the
   server to run `pi mcp list --json` in the session's workspace, so it shows live connection state,
   scope, exposure, transport, an auth provider, the tools each server offers as chips and the error
   or stderr tail of a failed one; reopen it or click the tab again to re-read.
+- The **Processes** tab lists long-running processes this session's bash calls started and never
+  stopped — the `nohup node server.js &` a run leaves behind, which keeps working (and keeps holding
+  its port) after the call, the run and the agent process are gone. Each row gives the command line,
+  the pid, the working directory, the port it listens on and how long it has been up, with a
+  **Stop** that sends `SIGTERM` and then `SIGKILL` if it is still there after two seconds. The list is
+  built by comparing the process table before and after every `bash` tool call: a process that
+  appeared during a call and has been orphaned out of pi's own process tree is something that call
+  left behind. So the tab cannot stop anything the agent did not start — a pid is only accepted when
+  that session recorded it during one of its own calls. A count on the settings button shows how many
+  are still running, which is the only always-on cue: no banner takes transcript space, but a session
+  that left a server running no longer looks identical to one that did not. A process is only
+  attributed to the call that was running when it started, so one started before this version of
+  pi-web was running is not listed.
 - The list button in the header outlines every user prompt in the session; clicking an entry
   scrolls the transcript to that message. Each entry carries an indented second row that jumps to
   the run's summary — the concluding answer after the tool loop, landing on its text rather than on
@@ -253,7 +266,7 @@ pi-web --cwd ~/code/my-project
 
 | File | Role |
 | --- | --- |
-| `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, follow-up store, static files |
+| `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, follow-up store, background-process tracking, static files |
 | `public/index.html` | Application shell |
 | `public/app.js` | State, transcript reconciliation, event handling — no framework |
 | `public/style.css` | Design tokens, the six palettes, layout |
@@ -291,6 +304,8 @@ localhost-only by default.
 | `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts\|summary>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts, `scope=summary` to the answer each run concluded with; returns snippet hits plus a `truncated` flag |
 | `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
 | `GET /api/mcp?client=<id>` | MCP server state as `pi mcp list --json` reports it, run in that client's session workspace; `{ servers, errors }`, where a disconnected server still returns 200 with its state and error |
+| `GET /api/processes?client=<id>` | Background processes that session's bash calls left running: `{ processes: [{ pid, command, cwd, port, since, toolCallId }] }`, with stopped processes dropped and the list replayed when a tab re-attaches |
+| `POST /api/processes/kill` | `{ client, pid }` — stop one recorded leftover (`SIGTERM`, then `SIGKILL` after two seconds); a pid this session did not record during one of its own bash calls is refused with 404 |
 
 ## Configuration
 
@@ -412,6 +427,11 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
   branch. History from before a compaction is reachable (and rendered), but a message on a branch
   that was branched away from has no transcript row: clicking such a hit reports that it is not on
   the active branch instead of jumping.
+- The **Processes** tab only sees what it watched happen: a process is attributed to a bash call by
+  comparing the process table before and after that call, so anything started before this version of
+  pi-web was running is not listed. Detection relies on the tool shell's process group, so a program
+  that deliberately re-parents itself into a fresh group (`setsid`, a daemonizer with that behaviour)
+  can escape it. Linux and macOS only — the tab is empty where `ps -o lstart=` is not available.
 
 ## License
 

@@ -369,12 +369,26 @@ button:disabled { opacity: 0.4; cursor: default; transform: none; }
 .icon-btn {
   flex: none; width: 30px; height: 30px; min-height: 30px; padding: 0;
   color: var(--text-2); background: transparent; border-color: transparent;
+  /* anchors .icon-badge to the button rather than the nearest positioned ancestor */
+  position: relative;
 }
 .icon-btn:hover { background: var(--elevated); border-color: transparent; color: var(--text); }
 .icon-btn:active { background: var(--border); }
 .icon-btn svg { width: 17px; height: 17px; display: block; }
 .icon-btn:disabled { opacity: 0.35; }
 .icon-btn:disabled:hover { background: transparent; color: var(--text-2); }
+/* a count of something waiting behind an icon button: the accent is already the
+   "look here" color, and the number keeps it from being read as decoration */
+.icon-badge {
+  position: absolute; top: -1px; right: -1px;
+  min-width: 15px; height: 15px; padding: 0 4px;
+  display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-ink);
+  border-radius: var(--radius-pill);
+  font-size: 10px; font-weight: 600; line-height: 1;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
 
 /* ---------------- sidebar ---------------- */
 #sidebar {
@@ -1750,6 +1764,15 @@ body.dropping #input { border-color: var(--accent); border-style: dashed; box-sh
 .res-tag.warn { color: var(--warning); background: var(--warning-tint); border-color: transparent; }
 .res-tag.bad { color: var(--danger); background: var(--danger-tint); border-color: transparent; }
 .res-tag.current { color: var(--accent-text); background: var(--accent-tint); border-color: transparent; }
+.res-tag.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* trailing row controls (the process panel's Stop) sit at the end of the line
+   without squeezing the name, which ellipsizes instead */
+.res-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.res-stop { min-height: 22px; padding: 1px 10px; font-size: 11.5px; }
+/* the process list is sparse — one line per leftover — so its rows span the
+   dialog instead of hugging their text, which would leave Stop floating */
+.res-body .res-item { width: 100%; }
+.res-body .res-line { width: 100%; }
 .res-error {
   margin-top: 6px; padding: 6px 9px;
   background: var(--danger-tint); color: var(--danger);

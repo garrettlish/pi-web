@@ -15,7 +15,7 @@
  * No npm dependencies. Node >= 18.
  */
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { readFileSync, openSync, readSync, closeSync, createReadStream } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import fsp from "node:fs/promises";
@@ -174,6 +174,54 @@ class PiProc {
      *  this a tab that switches away and back would show an empty dock while
      *  the process still holds those messages. */
     this.queued = { steering: [], followUp: [] };
+    /** toolCallId -> the process table before that bash call ran */
+    this.callSnapshots = new Map();
+    /** pid -> {pid, command, cwd, port, since, toolCallId} — what this session's
+     *  bash calls left running. Survives the process that started them, which is
+     *  the whole point: the tab is the only place they can be stopped from. */
+    this.leftovers = new Map();
+  }
+
+  /** Record the process table when a bash call starts, so its end can tell what
+   *  the call started. Cheap (one `ps`, ~30 ms) and only for bash. */
+  noteBashStart(toolCallId) {
+    if (!toolCallId || this.callSnapshots.has(toolCallId)) return;
+    this.callSnapshots.set(toolCallId, processSnapshot());
+  }
+
+  /** Diff the process table against the call's start, keep what survived, and
+   *  report the change to attached tabs. A call that started nothing leaves no
+   *  entry and sends nothing. */
+  noteBashEnd(toolCallId) {
+    const before = this.callSnapshots.get(toolCallId);
+    if (!before) return;
+    this.callSnapshots.delete(toolCallId);
+    const after = processSnapshot();
+    // The agent process is the root of this session's tree: anything still
+    // attached to it is reachable and not "lost".
+    const roots = this.proc?.pid ? [this.proc.pid] : [];
+    const survivors = leftoversOf(after, newPidsSince(before, after), roots);
+    // Drop entries whose process has since exited, so a stopped server stops
+    // showing up without the tab having to ask again.
+    this.pruneLeftovers(after);
+    if (!survivors.length) return;
+    const { cwdByPid, portsByPid } = describeProcesses(survivors);
+    for (const entry of survivors) {
+      const described = describeProcess(entry, cwdByPid, portsByPid);
+      this.leftovers.set(described.pid, { ...described, since: Date.now(), toolCallId });
+    }
+    this.broadcast({ type: "server", event: "background_processes", processes: this.backgroundProcesses() });
+  }
+
+  /** Forget leftovers that are no longer running. */
+  pruneLeftovers(table = processSnapshot()) {
+    for (const pid of [...this.leftovers.keys()]) if (!table.has(pid)) this.leftovers.delete(pid);
+  }
+
+  /** Current leftovers, oldest first, with a fresh liveness filter. */
+  backgroundProcesses() {
+    this.pruneLeftovers();
+    return [...this.leftovers.values()].sort((a, b) => a.since - b.since);
   }
 
   /** Hand a client that just (re)attached the queue as it stands now. Attaching
@@ -184,6 +232,19 @@ class PiProc {
     if (!steering.length && !followUp.length) return;
     try {
       res.write(`data: ${JSON.stringify({ type: "queue_update", steering, followUp })}\n\n`);
+    } catch {
+      // the close handler on the SSE request cleans the entry up
+    }
+  }
+
+  /** Same reasoning as the queue: a page reload reconnects to a process that may
+   *  have left servers running, and nothing new will be broadcast until the next
+   *  bash call — so the leftovers are replayed on (re)attach. Always sent, even
+   *  when empty, because an empty list is how a fresh tab learns it has nothing
+   *  to show and clears a badge left over from a previous session. */
+  sendProcessSnapshot(res) {
+    try {
+      res.write(`data: ${JSON.stringify({ type: "server", event: "background_processes", processes: this.backgroundProcesses() })}\n\n`);
     } catch {
       // the close handler on the SSE request cleans the entry up
     }
@@ -211,6 +272,14 @@ class PiProc {
     }
     if (record && record.type === "agent_start") this.isStreaming = true;
     else if (record && (record.type === "agent_settled" || record.type === "agent_end")) this.isStreaming = false;
+    // Bash calls are bracketed here, in the one place every record passes
+    // through: a `nohup … &` the call starts is only attributable while the call
+    // runs, so the before/after snapshots have to be taken on these events.
+    if (record && record.type === "tool_execution_start" && record.toolName === "bash") {
+      this.noteBashStart(record.toolCallId);
+    } else if (record && record.type === "tool_execution_end") {
+      this.noteBashEnd(record.toolCallId);
+    }
     // Remember the queue while broadcasting: pi sends it only on change, so
     // this copy is the only way a re-attaching tab can learn what is pending.
     if (record && record.type === "queue_update") {
@@ -299,6 +368,11 @@ class PiProc {
     }
     this.pending.clear();
     this.isStreaming = false;
+    // A call still in flight will never report its end, so its before-snapshot
+    // (a whole process table) would be retained forever. `leftovers` is
+    // deliberately NOT cleared: those processes outlive pi on purpose, and the
+    // tab must still be able to stop them after a restart.
+    this.callSnapshots.clear();
     // The queue lived in the process, so a restart must not replay it.
     this.queued = { steering: [], followUp: [] };
     this.broadcast({ type: "server", event: "pi_exit", code, signal });
@@ -395,6 +469,7 @@ async function openSession({ client, sessionFile, cwd }) {
       c.res.write(`data: ${JSON.stringify({ type: "server", event: "hello" })}\n\n`);
     } catch {}
     proc.sendQueueSnapshot(c.res);
+    proc.sendProcessSnapshot(c.res);
   }
   return { ok: true, sessionFile: proc.sessionFile, cwd: proc.cwd };
 }
@@ -555,6 +630,173 @@ function filterConfiguredModels(models, patterns) {
   if (!patterns.length) return models;
   const filtered = models.filter((m) => patterns.some((p) => patternMatches(p, m.provider, m.id)));
   return filtered.length ? filtered : models; // never leave the dropdown empty on unmatched patterns
+}
+
+// ---------------------------------------------------------------------------
+// Background processes a bash tool call left behind (resources panel)
+// ---------------------------------------------------------------------------
+// `nohup node server/x.js &` inside a bash tool call outlives the tool call, the
+// agent run and — because the tool's own shell is gone — any parent link back to
+// pi: the child is reparented to launchd and nothing in the RPC event stream ever
+// mentions it again. In the terminal you would still see it in `ps`; here it was
+// invisible until it collided with a port or ate memory.
+//
+// The process table is read before and after every bash tool call and the two
+// snapshots are diffed: everything that appeared belongs to that call, and what
+// is still alive when the call ends is what it left behind. Polling for children
+// during the call cannot do this — the shell of `cmd &` exits in milliseconds,
+// which a poll can miss, while the process it started is still running after.
+//
+// Two things this deliberately cannot do:
+//  - A process that finishes inside the call window looks like any other
+//    short-lived command, so only leftovers are reported.
+//  - Detection needs a call window; a server started before this version of
+//    pi-web was running is not retroactively attributed to a session.
+
+/** One snapshot of every process this user owns, keyed by pid. */
+function processSnapshot() {
+  let out;
+  try {
+    out = execFileSync("ps", ["-axww", "-o", "pid=,uid=,ppid=,pgid=,lstart=,command="], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: 5000,
+      // A C locale keeps lstart's month names stable for the comparison below.
+      env: { ...process.env, LC_ALL: "C" },
+    });
+  } catch {
+    return new Map();
+  }
+  // Only this user's processes: a tool call cannot have started anyone else's.
+  const uid = String(process.getuid ? process.getuid() : "");
+  const rows = new Map();
+  for (const line of out.split("\n")) {
+    // lstart is five whitespace-separated fields ("Sat Nov 14 20:00:23 2026"),
+    // so the command cannot be split off the front of the line alone.
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/);
+    if (!m) continue;
+    if (uid && m[2] !== uid) continue;
+    rows.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[3]), pgid: Number(m[4]), started: m[5], args: m[6] });
+  }
+  return rows;
+}
+
+/** Pids that appeared — or changed identity — between two snapshots. The start
+ *  time is compared as well as the pid so a recycled pid is not mistaken for a
+ *  process the call started. */
+function newPidsSince(before, after) {
+  const pids = [];
+  for (const [pid, entry] of after) {
+    const old = before.get(pid);
+    if (!old || old.started !== entry.started) pids.push(pid);
+  }
+  return pids;
+}
+
+/**
+ * What a tool call left running, out of everything that appeared during it.
+ *
+ * Not every new process belongs to the call, and the differences are structural:
+ *
+ *  - The agent's own children (a language server, an MCP host) stay in pi's
+ *    process tree. pi's shutdown path still reaches them, so they are not lost
+ *    and do not belong in a list of things to clean up by hand.
+ *  - An unrelated process that merely started during the window *leads its own
+ *    process group*; nothing about it points back to this call.
+ *  - A `nohup server &` is started by the tool's shell, which pi spawns
+ *    detached — so the child inherits that shell's process group. When the shell
+ *    exits, the group keeps its id but the leader is gone: `pgid !== pid` with no
+ *    process holding `pgid`. That dangling group is the signature of an orphan
+ *    of this very call, and it is why this survives the shells of `cmd &`
+ *    exiting in milliseconds — the child is still there to be found.
+ *
+ * `during` is the pid set that appeared; `after` is the table from the end of the
+ * call; `agentPids` are the roots of this session's process tree.
+ */
+function leftoversOf(after, during, agentPids) {
+  const inTree = descendantPids(after, agentPids);
+  const survivors = [];
+  for (const pid of during) {
+    const entry = after.get(pid);
+    if (!entry || inTree.has(pid) || isShellNoise(entry)) continue;
+    // Its group leader must be gone: still running means it is not an orphan of
+    // this call, and being its own leader means it was started independently.
+    if (entry.pgid === entry.pid || after.has(entry.pgid)) continue;
+    survivors.push(entry);
+  }
+  return survivors;
+}
+
+/** Every live pid reachable from `roots` through parent links. */
+function descendantPids(table, roots) {
+  const children = new Map();
+  for (const [pid, entry] of table) {
+    if (!children.has(entry.ppid)) children.set(entry.ppid, []);
+    children.get(entry.ppid).push(pid);
+  }
+  const seen = new Set();
+  const queue = [...roots];
+  while (queue.length) {
+    const pid = queue.pop();
+    for (const child of children.get(pid) || []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      queue.push(child);
+    }
+  }
+  return seen;
+}
+
+/** A shell that is only a command's transport, or that has no job control left
+ *  (an orphaned `/bin/sh` reports `$-` without `m`/`i`), is noise in a list of
+ *  "what the agent left running". The real process is listed on its own line. */
+function isShellNoise(entry) {
+  return /^(?:\/bin\/)?(?:sh|bash|zsh|dash)$/.test(entry.args) || /^(?:\/bin\/)?\S*sh -c /.test(entry.args);
+}
+
+/** Everything a report from this server needs about one survivor. */
+function describeProcess(entry, cwdByPid, portsByPid) {
+  const command = entry.args.length > 120 ? `${entry.args.slice(0, 117)}…` : entry.args;
+  return {
+    pid: entry.pid,
+    command,
+    cwd: cwdByPid.get(entry.pid) || "",
+    port: portsByPid.get(entry.pid) || 0,
+  };
+}
+
+/** Working directory and listening port for a handful of pids, in two batched
+ *  `lsof` calls. Both are only ever asked for the few survivors of one call, and
+ *  a missing lsof (or a process that exits mid-call) degrades to empty fields
+ *  rather than failing the report. */
+function describeProcesses(entries) {
+  const cwdByPid = new Map();
+  const portsByPid = new Map();
+  if (!entries.length) return { cwdByPid, portsByPid };
+  const pidList = entries.map((e) => e.pid).join(",");
+  const run = (args) => {
+    try {
+      return execFileSync("lsof", args, { encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024 });
+    } catch {
+      return ""; // lsof exits 1 when nothing matches, which is the normal case
+    }
+  };
+  let pid = 0;
+  for (const line of run(["-a", "-p", pidList, "-d", "cwd", "-Fn", "-Fp"]).split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && pid) cwdByPid.set(pid, line.slice(1));
+  }
+  pid = 0;
+  // -P keeps the port numeric: the name a service is registered under is not
+  // what the reader needs to find and stop it again.
+  for (const line of run(["-a", "-p", pidList, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn", "-Fp"]).split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && pid) {
+      const port = Number(line.slice(1).replace(/.*:/, ""));
+      if (port) portsByPid.set(pid, port);
+    }
+  }
+  return { cwdByPid, portsByPid };
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,7 +2064,10 @@ const server = http.createServer(async (req, res) => {
       // a reconnected stream (page reload) missed every queue_update since the
       // process started holding messages — replay the current queue now
       const attached = c.key ? procs.get(c.key) : null;
-      if (attached) attached.sendQueueSnapshot(res);
+      if (attached) {
+        attached.sendQueueSnapshot(res);
+        attached.sendProcessSnapshot(res);
+      }
       req.on("close", () => {
         if (c.res !== res) return;
         c.res = null;
@@ -1863,7 +2108,9 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 503, { error: "no pi process — open a session first" });
         return;
       }
-      const { client, ...cmdbody } = body;
+      // `client` is destructured only to keep it out of the command body pi
+      // receives; the underscore marks it as deliberately unused.
+      const { client: _client, ...cmdbody } = body;
       const response = await proc.sendCommand(cmdbody);
       if (cmdbody.type === "get_available_models" && response?.data?.models) {
         const filtered = filterConfiguredModels(response.data.models, enabledModelPatterns());
@@ -1890,7 +2137,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 503, { error: "pi not running" });
         return;
       }
-      const { client, ...rest } = body;
+      // `client` routes the request; it must not reach pi's stdin.
+      const { client: _client, ...rest } = body;
       proc.proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", ...rest })}\n`);
       sendJson(res, 200, { ok: true });
       return;
@@ -2024,6 +2272,60 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, { path: dir, parent, dirs, home: os.homedir() });
+      return;
+    }
+
+    // Background processes this session's bash calls left running, and the way to
+    // stop one. The list is per session — a stray server belongs to the session
+    // that started it — but the kill route takes any pid the same session has on
+    // record, so it can only ever stop what the agent actually started.
+    if (pathname === "/api/processes" && req.method === "GET") {
+      const client = clients.get(url.searchParams.get("client") || "");
+      const proc = client && client.key ? procs.get(client.key) : null;
+      sendJson(res, 200, { processes: proc ? proc.backgroundProcesses() : [] });
+      return;
+    }
+
+    if (pathname === "/api/processes/kill" && req.method === "POST") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const pid = Number(body.pid);
+      const c = clients.get(body.client);
+      const proc = c && c.key ? procs.get(c.key) : null;
+      if (!proc || !proc.proc) {
+        sendJson(res, 503, { error: "no pi process — open a session first" });
+        return;
+      }
+      // The allow-list is what makes this safe: a pid is only signalable when
+      // this session recorded it during one of its own bash calls, so the route
+      // cannot be turned into "kill anything I can name".
+      if (!Number.isInteger(pid) || !proc.leftovers.has(pid)) {
+        sendJson(res, 404, { error: "not a process this session started" });
+        return;
+      }
+      let stopped = false;
+      try {
+        process.kill(pid, "SIGTERM");
+        stopped = true;
+      } catch (err) {
+        if (err.code !== "ESRCH") {
+          sendJson(res, 500, { error: err.message });
+          return;
+        }
+        // ESRCH: it was already gone — the outcome asked for, so report success
+        // and let the row disappear instead of leaving a dead entry behind.
+      }
+      // Give it a moment for a clean exit, then make sure it is gone. A server
+      // that ignores SIGTERM is exactly the kind this panel exists for.
+      setTimeout(() => {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+        proc.leftovers.delete(pid);
+        proc.broadcast({ type: "server", event: "background_processes", processes: proc.backgroundProcesses() });
+      }, 2000).unref();
+      proc.leftovers.delete(pid);
+      proc.broadcast({ type: "server", event: "background_processes", processes: proc.backgroundProcesses() });
+      sendJson(res, 200, { ok: true, pid, signalled: stopped });
       return;
     }
 

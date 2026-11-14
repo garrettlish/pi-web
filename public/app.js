@@ -108,6 +108,9 @@ const state = {
   commands: [], // discoverable slash commands (extension commands, prompt templates, skills)
   mcps: null, // { servers, errors } from /api/mcp; null = not fetched yet
   mcpsAt: 0, // when that snapshot was taken
+  /** background processes this session's bash calls left running (pid, command,
+   *  cwd, port, since); the server pushes updates, so this is a mirror */
+  processes: [],
   thinkingLevel: null,
   thinkingLevels: [],
   stats: null,
@@ -2333,11 +2336,13 @@ document.addEventListener("click", () => setPromptListOpen(false));
 const resourcesBtn = $("#btn-resources");
 const resourcesOverlay = $("#resources-overlay");
 const resourcesBody = $("#res-body");
-const RES_TABS = ["models", "skills", "mcps"];
+const RES_TABS = ["models", "skills", "mcps", "processes"];
 const RES_HINT = {
   models: "Models come from the running agent, already filtered by enabledModels in settings.json",
   skills: "Skills pi advertises to the model; the body loads only when a task needs it",
   mcps: "From `pi mcp list --json`, run in this session's workspace; click the tab again to re-read",
+  processes:
+    "Long-running processes this session's bash calls left behind; stopping one asks politely, then insists",
 };
 let resTab = "models";
 let resLoading = null; // in-flight MCP fetch, so a second tab click does not spawn a second `pi mcp list`
@@ -2354,6 +2359,9 @@ function setResourcesOpen(open) {
   $("#res-close").focus({ preventScroll: true });
   if (!(state.models || []).length) loadModels(); // a tab opened before a session existed
   renderResources();
+  // The process list is cheap and can go stale the moment anything exits, so it
+  // is re-read on every open; live changes arrive as broadcasts anyway.
+  if (resTab === "processes") loadProcesses();
   // Server state is the one thing that has to be asked for, is slow (it
   // connects every server), and goes stale (sign-in, edits, crashes), so it is
   // refetched on open rather than kept for the life of the page.
@@ -2371,6 +2379,7 @@ function setResTab(tab) {
   }
   // clicking the tab already showing is the only way to ask for a fresh read
   if (tab === "mcps") loadMcps({ refresh: again || state.mcps == null });
+  else if (tab === "processes") loadProcesses();
   renderResources();
 }
 
@@ -2396,6 +2405,38 @@ async function loadMcps({ refresh = false } = {}) {
   return resLoading;
 }
 
+/** Read the leftover-process list for the open session. The server also pushes
+ *  this after every bash call and after a stop, so the tab mostly mirrors it;
+ *  this request covers a panel opened before any call has reported. */
+async function loadProcesses() {
+  try {
+    const res = await api(`/api/processes?client=${encodeURIComponent(CLIENT_ID)}`);
+    state.processes = Array.isArray(res.processes) ? res.processes : [];
+  } catch {
+    state.processes = [];
+  }
+  if (!resourcesOverlay.classList.contains("hidden") && resTab === "processes") renderResources();
+}
+
+/** Stop one leftover. The row disappears when the server broadcasts the new
+ *  list, so nothing here has to guess whether the signal worked. */
+async function stopProcess(pid, button) {
+  if (button) button.disabled = true;
+  try {
+    await api("/api/processes/kill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client: CLIENT_ID, pid }),
+    });
+    toast(`asked ${pid} to stop`, "info", 2500);
+    loadProcesses();
+  } catch (err) {
+    toast(err.message, "error");
+    if (button) button.disabled = false;
+    loadProcesses();
+  }
+}
+
 function resTag(text, kind = "") {
   return el("span", { class: `res-tag ${kind}`.trim(), text });
 }
@@ -2403,15 +2444,22 @@ function resTag(text, kind = "") {
 /** One uniform row: name on the left, a state tag on the right, then the
  *  detail lines the dialog has room for. `facts` renders as uppercase
  *  key/value pairs that wrap side by side; `tools` as chips. Every value
- *  arrives from pi or mcp.json, so it is set as text and never as markup. */
-function resItem({ name, tag, sub, desc, facts, tools, error }) {
+ *  arrives from pi or mcp.json, so it is set as text and never as markup.
+ *  `actions` are trailing buttons (the process panel's Stop). */
+function resItem({ name, tag, sub, desc, facts, tools, error, actions }) {
   const factNodes = (facts || [])
     .filter(([, v]) => v != null && v !== "")
     .map(([k, v]) => el("span", { class: "res-fact" }, el("b", { text: k }), el("span", { text: String(v) })));
   return el(
     "div",
     { class: "res-item" },
-    el("div", { class: "res-line" }, el("span", { class: "res-name", text: name, title: name }), tag || null),
+    el(
+      "div",
+      { class: "res-line" },
+      el("span", { class: "res-name", text: name, title: name }),
+      tag || null,
+      actions?.length ? el("span", { class: "res-actions" }, actions) : null
+    ),
     sub ? el("div", { class: "res-sub", text: sub, title: sub }) : null,
     desc ? el("div", { class: "res-desc", text: desc }) : null,
     factNodes.length ? el("div", { class: "res-facts" }, factNodes) : null,
@@ -2510,19 +2558,69 @@ function renderMcps() {
   return nodes;
 }
 
+/** How long a leftover has been running, as the panel shows it. */
+function fmtAge(ms) {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** Background processes a bash call left running. Every row is something the
+ *  agent started and did not stop — the server only lists what it watched one
+ *  of this session's calls create, so a Stop button cannot reach anything else. */
+function renderProcesses() {
+  const list = state.processes || [];
+  if (!list.length) {
+    return [
+      el("div", {
+        class: "res-empty",
+        text: "nothing left running\na server a bash call starts in the background shows up here, with a way to stop it",
+      }),
+    ];
+  }
+  return list.map((p) => {
+    const sub = [p.cwd, p.port ? `:${p.port}` : ""].filter(Boolean).join("  ·  ");
+    const stop = el("button", { class: "ghost res-stop", text: "Stop", title: `Stop ${p.pid} (SIGTERM, then SIGKILL)` });
+    stop.addEventListener("click", () => stopProcess(p.pid, stop));
+    return resItem({
+      name: p.command,
+      // the pid is the one thing an operator needs to type elsewhere, so it is
+      // its own muted token rather than part of the command line
+      tag: el("span", { class: "res-tag mono", text: `pid ${p.pid}` }),
+      sub,
+      facts: [
+        ["up", fmtAge(p.since)],
+        ["port", p.port || null],
+      ],
+      actions: [stop],
+    });
+  });
+}
+
 function renderResources() {
   const body = resourcesBody;
   const keepScroll = body.scrollTop;
   body.replaceChildren();
-  const items = resTab === "models" ? renderModels() : resTab === "skills" ? renderSkills() : renderMcps();
+  const items =
+    resTab === "models"
+      ? renderModels()
+      : resTab === "skills"
+        ? renderSkills()
+        : resTab === "mcps"
+          ? renderMcps()
+          : renderProcesses();
   const count =
     resTab === "models"
       ? `${(state.models || []).length} models`
       : resTab === "skills"
         ? `${(state.commands || []).filter((c) => c.source === "skill").length} skills`
-        : state.mcps
-          ? `${(state.mcps.servers || []).length} servers`
-          : "";
+        : resTab === "mcps"
+          ? state.mcps
+            ? `${(state.mcps.servers || []).length} servers`
+            : ""
+          : `${(state.processes || []).length} running`;
   $("#res-count").textContent = count;
   $("#res-hint").textContent = RES_HINT[resTab];
   for (const item of items) body.append(item);
@@ -2538,6 +2636,22 @@ $("#resources-dialog").addEventListener("click", (e) => e.stopPropagation());
 resourcesOverlay.addEventListener("click", () => setResourcesOpen(false));
 $("#res-close").addEventListener("click", () => setResourcesOpen(false));
 for (const t of RES_TABS) $(`#res-tab-${t}`).addEventListener("click", () => setResTab(t));
+
+/** The resources button carries a count of leftover background processes, and
+ *  its title names them. This is the whole always-on signal: no banner takes
+ *  transcript space, but a session that left a server running cannot look
+ *  identical to one that did not. */
+function renderProcessBadge() {
+  const n = (state.processes || []).length;
+  const badge = $("#resources-badge");
+  const btn = $("#btn-resources");
+  badge.textContent = n > 99 ? "99+" : String(n);
+  badge.classList.toggle("hidden", n === 0);
+  btn.title = n
+    ? `Models, skills and MCP servers — ${n} background process${n === 1 ? "" : "es"} still running`
+    : "Models, skills, MCP servers and background processes";
+  btn.setAttribute("aria-label", btn.title);
+}
 
 function renderStatus() {
   const bar = $("#status-bar");
@@ -4128,6 +4242,13 @@ function handleEvent(record) {
       } else if (record.event === "hello") {
         $("#pi-status").textContent = "pi running";
         $("#pi-status").className = "pi-status ok";
+      } else if (record.event === "background_processes") {
+        // the server watched these appear during a bash call and now reports
+        // them (or that they stopped); mirror the list so the panel and the
+        // sidebar note stay current without polling
+        state.processes = Array.isArray(record.processes) ? record.processes : [];
+        renderProcessBadge();
+        if (!resourcesOverlay.classList.contains("hidden") && resTab === "processes") renderResources();
       }
       break;
     }
