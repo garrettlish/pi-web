@@ -1550,6 +1550,14 @@ details.item-thinking[open] > summary { margin-bottom: 4px; }
 .sa-request > summary { cursor: pointer; font-size: 11.5px; color: var(--text-3); }
 .sa-request[open] > summary { margin-bottom: 6px; }
 
+/* a background completion notice is a card like a run, not a grey note: it
+   reports work that finished while the reader was somewhere else */
+.toolcall.subagent-notice { cursor: pointer; }
+.toolcall.subagent-notice .tc-open-icon { color: var(--accent-text); }
+.toolcall.subagent-notice .tc-head { cursor: pointer; }
+.toolcall.subagent-notice .sa-child { cursor: default; }
+.toolcall.subagent-notice .sa-child:hover { background: transparent; }
+
 /* narrow windows: the inspector stacks, list first, because the child list is
    what a reader scans before choosing one */
 @media (max-width: 720px) {

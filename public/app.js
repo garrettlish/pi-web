@@ -487,6 +487,19 @@ function buildItemsFromEntries(entries) {
         items.push({ kind: "notice", text: `label: ${entry.label}` });
       } else if (entry.type === "session_info") {
         // shown in header
+      } else if (entry.type === "custom_message") {
+        // A message an extension injected into the context. pi persists it under
+        // its own entry type, so it is not the `role: "custom"` message the live
+        // event carries, and its body lives on the entry rather than a message.
+        const text =
+          typeof entry.content === "string"
+            ? entry.content
+            : (entry.content || []).map((b) => b?.text || "[image]").join("\n");
+        if (SUBAGENT_NOTICES.has(entry.customType)) {
+          items.push({ kind: "subagentNotice", message: { ...entry, role: "custom" }, text, ts: entry.timestamp });
+        } else {
+          items.push({ kind: "summary", title: `custom [${entry.customType}]`, text, data: entry, ts: entry.timestamp });
+        }
       } else if (entry.type === "custom") {
         items.push({ kind: "notice", text: `custom entry [${entry.customType}]`, data: entry });
       } else if (entry.type === "context_edit") {
@@ -554,6 +567,12 @@ function buildItemsFromEntries(entries) {
       }
       case "custom": {
         const text = typeof m.content === "string" ? m.content : (m.content || []).map((b) => b.text || "[image]").join("\n");
+        // A background subagent reporting in is the extension talking to the
+        // parent, not a note the reader has to decode from "custom [..]".
+        if (SUBAGENT_NOTICES.has(m.customType)) {
+          items.push({ kind: "subagentNotice", message: m, text, ts });
+          break;
+        }
         items.push({ kind: "summary", title: `custom [${m.customType}]`, text, data: m });
         break;
       }
@@ -870,6 +889,10 @@ function imageResultSection(title, blocks) {
 // are ignored, so a newer extension version degrades to the generic tool view
 // instead of breaking the transcript.
 const SUBAGENT_TOOL = "subagent";
+/** custom_message types the subagents extension injects into the parent: a
+ *  background run's completion, and one workflow child settling mid-run. Both
+ *  carry `details` this module renders as a card instead of a generic notice. */
+const SUBAGENT_NOTICES = new Set(["subagent-notify", "subagent-incremental-child-notify"]);
 /** children listed under the card head; the inspector holds the rest */
 const SUBAGENT_INLINE_MAX = 6;
 const REDACTED_TASK = "[prompt redacted]";
@@ -1645,6 +1668,204 @@ function openSubagent(call, block) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// background subagent completion notices
+// ---------------------------------------------------------------------------
+// A background run cannot report into a tool call — the call already answered
+// "detached" and control went back to the reader. The extension reports later
+// through a custom message: `subagent-notify` for a finished run, and
+// `subagent-incremental-child-notify` for one workflow child settling while the
+// run continues. Both carry their structure in `details`; the content string is
+// the same information formatted for the model, so it is only the fallback.
+
+/** one notice's runs: `details.runs[]` for a completion, a single flat record
+ *  for an incremental child settlement. Unknown shapes yield an empty list so
+ *  the card degrades to its content text instead of printing "[object]". */
+function subagentNoticeRuns(message) {
+  const d = message?.details || {};
+  const runs = Array.isArray(d.runs) ? d.runs : [];
+  if (!runs.length && (d.childKey || d.outcome)) {
+    // An incremental child settlement reports a flat record, not a run list:
+    // the run id lives in the content text, the identity in `childKey`.
+    const id = String(message?.content || "").match(/Workflow run: ([0-9a-f-]{8,})/i)?.[1] || null;
+    runs.push({ agent: d.childKey, status: d.outcome, workflowRunId: id });
+  }
+  return runs.filter((r) => r && typeof r === "object").map((r) => ({
+    agent: typeof r.agent === "string" && r.agent ? r.agent : "subagent",
+    status: typeof r.status === "string" ? r.status : d.outcome || null,
+    runId: typeof r.runId === "string" ? r.runId : null,
+    durationMs: typeof r.durationMs === "number" ? r.durationMs : null,
+    session: typeof r.sessionValue === "string" ? r.sessionValue : null,
+    sessionLabel: typeof r.sessionLabel === "string" ? r.sessionLabel : null,
+    workflowRunId: typeof r.workflowRunId === "string" ? r.workflowRunId : null,
+    childRuns: Array.isArray(r.childRuns) ? r.childRuns : [],
+    childOutputs: Array.isArray(r.childOutputs) ? r.childOutputs : [],
+  }));
+}
+
+/** The card's one-word verdict. "completed" is success, "failed"/"stopped"/
+ *  "paused" are not, and a notice with no runs at all (an older extension, or a
+ *  child-settlement message) falls back to the entry's own outcome. */
+function subagentNoticeTone(runs, fallback) {
+  const statuses = runs.map((r) => r.status).filter(Boolean);
+  if (fallback) statuses.push(fallback);
+  if (!statuses.length) return { word: "notice", tone: "" };
+  if (statuses.every((s) => s === "completed")) return { word: "completed", tone: "ok" };
+  if (statuses.some((s) => s === "failed" || s === "rejected")) return { word: "failed", tone: "error" };
+  if (statuses.some((s) => s === "stopped")) return { word: "stopped", tone: "warn" };
+  if (statuses.some((s) => s === "paused")) return { word: "paused", tone: "warn" };
+  if (statuses.some((s) => s === "detached")) return { word: "detached", tone: "running" };
+  return { word: statuses[0], tone: "" };
+}
+
+/** the notice's prose minus the "Parent action: …" trailer. That line is an
+ *  instruction to the model, not something the reader needs above the result. */
+function subagentNoticeBody(text) {
+  const cut = String(text || "").split(/\n\nParent action:/)[0];
+  return cut.trim();
+}
+
+/** transcript card for one background notice: the verdict, the runs it covers
+ *  and, per run, the child outputs the extension kept. The full content and the
+ *  raw details stay one click away in a popup — the same popup every other
+ *  structured item opens, so nothing is lost by summarizing here. */
+function renderSubagentNotice(item) {
+  const message = item.message || {};
+  const runs = subagentNoticeRuns(message);
+  const verdict = subagentNoticeTone(runs, message.details?.outcome);
+  const accent = verdict.tone === "error" ? "error" : verdict.tone === "warn" ? "partial" : "";
+  const incremental = message.customType === "subagent-incremental-child-notify";
+  const body = subagentNoticeBody(item.text);
+
+  const open = () =>
+    openRawTool(
+      incremental ? "workflow child settled" : "background subagent",
+      () => subagentNoticePopup(message, body, runs),
+      message
+    );
+
+  const card = el("div", {
+    class: `toolcall subagent-notice ${accent}`,
+    role: "button",
+    tabindex: "0",
+    title: "Open the completion notice",
+    "aria-haspopup": "dialog",
+    onclick: open,
+    onkeydown: onActivate(open),
+  });
+  card.append(
+    el(
+      "div",
+      { class: "tc-head" },
+      el("span", { class: "tc-open-icon", text: "⧉" }),
+      el("span", { class: "tc-name", text: incremental ? "child settled" : "subagent" }),
+      saBadge(incremental ? "workflow child" : "background run", "mode"),
+      el("span", { class: "tc-summary", text: runs.length ? runs.map((r) => r.agent).join(", ") : (body.split("\n")[0] || "background run") }),
+      runs.length > 1 ? el("span", { class: "sa-count", text: `${runs.length} runs` }) : null,
+      el("span", { class: `sa-badge ${verdict.tone}`, text: verdict.word, title: "Outcome reported by the background run" })
+    )
+  );
+
+  if (runs.length) card.append(subagentNoticeRows(runs, body));
+  return el("div", { class: "item" }, card);
+}
+
+/** the notice's rows: one per child a completion lists, one per run when the
+ *  notice carries no child detail. */
+function subagentNoticeRows(runs, body) {
+  const rows = el("div", { class: "sa-rows" });
+  for (const run of runs) {
+    for (const child of run.childOutputs.length ? run.childOutputs : [null]) {
+      const tone = subagentTone(subagentStatus(child?.status || run.status, null, null));
+      rows.append(
+        el(
+          "div",
+          { class: "sa-child" },
+          el("span", { class: `sa-dot ${tone}` }),
+          el("span", { class: "sa-agent", text: child?.agent || child?.workflowKey || run.agent }),
+          el("span", { class: "sa-what", text: subagentNoticeChildLine(child, body) }),
+          el("span", { class: "sa-meta", text: [child?.status, run.durationMs ? fmtDuration(run.durationMs) : null].filter(Boolean).join(" · ") })
+        )
+      );
+    }
+  }
+  return rows;
+}
+
+/** the notice's popup: its Markdown, each run's retained child output, and the
+ *  raw details. Built on demand so a transcript full of notices holds no more
+ *  than the cards. */
+function subagentNoticePopup(message, body, runs) {
+  const wrap = el("div", { class: "tc-body" });
+  if (body) {
+    // The notice is written in Markdown for the model, so it is rendered the
+    // same way here rather than shown with its "**" markers intact.
+    wrap.append(el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: "message" }), markdownBlock(body)));
+  }
+  for (const run of runs) {
+    const facts = [run.status, run.durationMs ? fmtDuration(run.durationMs) : null, run.runId ? `run ${run.runId.slice(0, 8)}` : null].filter(Boolean);
+    const sec = el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: `${run.agent}${facts.length ? ` · ${facts.join(" · ")}` : ""}` }));
+    for (const child of run.childOutputs) {
+      const tone = subagentTone(subagentStatus(child.status, null, null));
+      sec.append(
+        el(
+          "div",
+          { class: "sa-tool" },
+          el("span", { class: `sa-dot ${tone}` }),
+          el("span", { class: "sa-tool-name", text: child.workflowKey || child.agent || "child" }),
+          el("span", { class: "sa-tool-args", text: child.error ? truncate(plainNoticeText(child.error), 160) : (child.status || "") })
+        )
+      );
+      if (child.preview) sec.append(markdownBlock(child.preview));
+      if (child.savedOutputPath) sec.append(el("div", { class: "sa-session-path", text: child.savedOutputPath, title: child.savedOutputPath }));
+    }
+    if (!run.childOutputs.length) sec.append(el("div", { class: "dim", text: "no child output reported" }));
+    wrap.append(sec);
+  }
+  wrap.append(el("div", { class: "tc-section" }, el("div", { class: "tc-label", text: "details" }), jsonBlock(message.details ?? {})));
+  return wrap;
+}
+
+/** Markdown written by a child or an extension, rendered as prose in a frame
+ *  that matches a child's output in the run inspector. */
+function markdownBlock(text) {
+  const block = el("div", { class: "sa-output assistant-text" });
+  block.replaceChildren(...htmlFragment(renderMarkdown(String(text || ""))));
+  return block;
+}
+
+/** The one line a notice row can afford. A structured child gives its own
+ *  error or output preview; a bare notice has to be read, so the first line that
+ *  carries something — not the title, not a path — wins. */
+function subagentNoticeChildLine(child, fallback) {
+  if (child) {
+    if (child.error) return truncate(plainNoticeText(child.error), 160);
+    const preview = String(child.preview || "").split("\n").map((l) => l.trim()).find(Boolean);
+    if (preview) return truncate(plainNoticeText(preview), 160);
+    if (child.savedOutputPath) return `output saved: ${child.savedOutputPath.split("/").pop()}`;
+    return child.status ? subagentStatusText(subagentStatus(child.status, null, null)) : "";
+  }
+  return truncate(plainNoticeText(noticeSummaryLine(fallback)), 160);
+}
+
+/** markdown emphasis and heading marks do not belong in a one-line row */
+function plainNoticeText(text) {
+  return String(text || "").replace(/\*\*/g, "").replace(/^#+\s*/, "").trim();
+}
+
+/** The most informative line of a notice body: its error, else its first
+ *  sentence that is not the title, a correlation line or a path. */
+const NOTICE_NOISE = /^(Workflow run|Child run|Child runs|Status|Output|Workflow receipt|Retention-managed async directory|Session file):/i;
+function noticeSummaryLine(text) {
+  const lines = String(text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  // "Error: none" is how a clean settlement says there was nothing to report
+  const error = lines.map((l) => l.match(/^Error:\s*(.+)$/i)?.[1]?.trim()).find((v) => v && !/^(none|n\/?a|-)$/i.test(v));
+  if (error) return error;
+  // a bare "delegate:" heading names the child, not what happened to it
+  const useful = (l) => !NOTICE_NOISE.test(l) && !/^[\w.\- ]{1,40}:$/.test(l) && !/^Error:\s*(none|n\/?a|-)$/i.test(l);
+  return lines.find((l, i) => i > 0 && useful(l)) || lines[0] || "";
+}
+
 /** Split a Cursor activity response into its prose preamble and its unified
  *  diff. Cursor sends both in one text block ("edit <path>\n\n+1 -0\n\n---
  *  a/x\n+++ b/x\n@@ …"), which lets the popup lead with the colored diff
@@ -2106,6 +2327,8 @@ function renderItem(item) {
       chip.addEventListener("click", () => openJson(item.title, { title: item.title, text: item.text, data: item.data }));
       return el("div", { class: "item item-notice" }, chip);
     }
+    case "subagentNotice":
+      return renderSubagentNotice(item);
     case "notice": {
       const chip = el("div", { class: "notice-chip", text: item.text });
       if (item.data) chip.addEventListener("click", () => openJson("entry", item.data));
@@ -4742,7 +4965,7 @@ function handleEvent(record) {
         }
       } else {
         // replace the tentative live item pushed by message_start
-        const kind = roleKind(m.role);
+        const kind = roleKind(m.role, m.customType);
         let idx = -1;
         for (let i = state.items.length - 1; i >= 0; i--) {
           if (state.items[i]._live && state.items[i].kind === kind) {
@@ -4865,7 +5088,10 @@ function handleEvent(record) {
   }
 }
 
-function roleKind(role) {
+function roleKind(role, customType) {
+  // a background notice keeps its own kind so the card survives the
+  // message_start/message_end swap that rebuilds every other message item
+  if (role === "custom" && SUBAGENT_NOTICES.has(customType)) return "subagentNotice";
   return { user: "user", system: "system", bashExecution: "bash" }[role] || "notice";
 }
 

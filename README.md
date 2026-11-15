@@ -113,6 +113,14 @@ pi-web --cwd ~/code/my-project
   so an open inspector keeps updating while the run is still going. Management calls (`status`,
   `stop`, agent CRUD, `guide`) answer with the same envelope but are not runs, so they keep the plain
   tool row.
+- **A background run's completion is a card, not a grey note.** When a detached run finishes, the
+  `subagents` extension wakes the parent with a `subagent-notify` custom message; pi-web renders it as
+  a transcript card carrying the outcome (completed / failed / stopped / paused), the runs it covers,
+  and one row per child with its error or the first line of its retained output. A
+  `subagent-incremental-child-notify` — one workflow child settling while the run continues — gets
+  the same card labelled `child settled`. Clicking either opens the notice's own Markdown plus each
+  child's full retained output and the raw `details`, so the notice's "Parent action: …" trailer
+  (an instruction to the model, not to the reader) stays out of the transcript.
 - **A skill invocation is shown as a call, not as its definition.** pi expands `/skill-name args`
   into one user message holding the whole `SKILL.md` inside a `<skill>` block, followed by the args.
   The transcript parses that apart and renders a `SKILL` chip with the skill's name, then the prompt
