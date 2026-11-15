@@ -1,460 +1,53 @@
-# pi-web
+# pi-web — DEPRECATED
 
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
-[![Dependencies](https://img.shields.io/badge/dependencies-none-blue)](package.json)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+> **This repository is deprecated and archived.**
+> Use **[pi-ui](https://github.com/garrettlish/pi-ui)** instead.
 
-A local web UI for the [pi coding agent](https://github.com/earendil-works/pi).
+`pi-web` was a local web UI for the [pi coding agent](https://github.com/earendil-works/pi) that
+bridged a documented `pi --mode rpc` subprocess over SSE and JSON.
 
-`pi` ships with a terminal UI. `pi-web` puts the same agent in a browser and adds what a terminal
-is bad at: browsing every past session across every project, and inspecting exactly what the model
-sent and received — request arguments, live tool output, full responses, token usage and cost.
+## Why it was replaced
 
-It is deliberately plain: one Node process, three static frontend files, **no npm dependencies and
-no build step**. The browser never talks to `pi` directly — `server.js` bridges a documented
-[`pi --mode rpc`](https://github.com/earendil-works/pi/blob/main/docs/rpc.md) subprocess over
-SSE and JSON.
+[`pi-ui`](https://github.com/garrettlish/pi-ui) is the same UI with the **pi SDK embedded in-process**
+instead of driven over RPC. The frontend and the HTTP surface are unchanged — what changed is the
+backend, and with it every cost that came from running one subprocess per session:
 
-## Contents
+| | `pi --mode rpc` (one process per session) | pi-ui (in-process SDK) |
+| --- | --- | --- |
+| New session | 1.33 s | **0.036 s** |
+| Open a 30 MB session | 1.39 s | **0.75 s** |
+| Read a 30 MB transcript | 2.80 s / 30.5 MB | **0.005 s / 1.9 MB** |
+| Ten sessions in one workspace | ten process boots | one workspace build, ten × 46 ms |
 
-- [Why another UI](#why-another-ui)
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Configuration](#configuration)
-- [Remote access](#remote-access)
-- [Security notes](#security-notes)
-- [Development](#development)
-- [Limitations](#limitations)
-- [License](#license)
+Three separate costs were measured and removed:
 
-## Why another UI
+- **Booting the agent.** ~0.9 s of every process start is `createAgentSessionServices()`
+  discovering extensions, skills and MCP servers — work that depends only on the working directory.
+  pi-ui builds it once per workspace and reuses it.
+- **Shipping the transcript.** One real session was 28.7 MB of base64 PNG data across 36 image
+  blocks. pi-ui keeps the bytes on the server and sends an `imageId` placeholder the browser fetches
+  only when a picture is on screen, cutting the payload from 30.5 MB to 1.9 MB.
+- **Framing the pipe.** A 30 MB JSONL line restarted the record scan from index 0 on every chunk —
+  a consequence of the previous cost, and gone entirely once there is no pipe.
 
-- **Terminal parity.** Streaming assistant text, thinking blocks, tool calls with live partial
-  results, retries, compaction — all rendered as pi produces them, not after the fact.
-- **Sessions are objects, not a scrollback.** Every session under the pi session directory is
-  listable, filterable, resumable, and addressable by URL.
-- **The inspector.** Every tool call keeps its request, its execution updates, its response and
-  its raw JSON one double-click away. Assistant turns keep their model, token counts and cost.
+## Migrating
 
-## Requirements
-
-- Node.js **18 or newer** (uses ESM and `node:` imports only).
-- A working `pi` install on your `PATH` (`pi --version` should succeed), or pass `--pi <path>`.
-- Nothing else. No `npm install` is required to run it.
-
-## Quick start
+Nothing to port. pi-ui runs from a bare checkout:
 
 ```bash
-git clone https://github.com/garrettlish/pi-web.git
-cd pi-web
+git clone https://github.com/garrettlish/pi-ui.git
+cd pi-ui
 node server.js
 ```
 
-Open <http://localhost:3210>. The agent starts in the directory `server.js` was launched
-from — use the folder button in the sidebar to work somewhere else, or:
+Then open <http://localhost:3220>. Sessions, follow-ups and settings under `~/.pi` are read by both
+projects, so existing history appears as-is. The one flag that moved is the default port (`3210` →
+`3220`); every other flag keeps its name, and `--sdk <dir>` is new for pinning the SDK package.
 
-```bash
-node server.js --cwd ~/code/my-project   # agent works in another project
-node server.js --port 8080               # different port
-node server.js --help                    # every option
-```
+## This repository
 
-You can also install it as a global command:
-
-```bash
-npm install -g .
-pi-web --cwd ~/code/my-project
-```
-
-## Features
-
-**Live transcript**
-
-- Assistant text, thinking and tool-call arguments stream in as pi works
-  (`message_start` / `message_update` / `message_end`, `tool_execution_*`, retry and compaction
-  events), with a subset of Markdown rendered inline. `http(s)` links open in a new tab; a `file://`
-  link is rendered too, but a browser page cannot navigate to one — clicking it copies the path
-  instead of failing silently.
-- Tool calls appear as one-line rows in the transcript; clicking one opens a popup with the request
-  arguments, live execution updates and the final response (text, images, `details`, error state,
-  duration). For `edit` calls the popup leads with a colored, line-numbered diff — green additions,
-  red deletions — followed by the raw request and response. Edits Cursor performs through its own
-  activity tool render identically: the row shows the file and its `+N −M` counts, the popup title
-  names the file, and the body opens on the colored diff even though Cursor reports the change as
-  response text (or as a `diff` next to the counts) rather than as an `edit` result. The popup has a
-  **Raw JSON** toggle and copies the full payload — the transcript itself never grows or scrolls, so
-  the surrounding messages stay put.
-- **Subagent runs are shown as their own transcript card**, not as an opaque tool row. The card
-  head names the shape of the fan-out — `single`, `parallel`, `chain` or `workflow` — so a run of
-  eight lanes never reads like one reviewer, then summarizes it (agents involved,
-  running/failed/done counts, wall time, tokens). One row per child carries its live state and
-  current activity: the tool it is running, its most recent tools and output, and its error when it
-  fails.
-- Clicking the card (or any child row) opens a **run inspector**: a summary strip (shape, transport,
-  workflow resource and lanes, child count, wall clock, tokens, tools, cost, run id) over a
-  master/detail layout — every child in a selectable list on the left, the selected child on the
-  right with its task, a `progress_update` report from `contact_supervisor`, live `now` activity and
-  how long the current tool has been open, recent tools, the child's recorded tool-call log, recent
-  output, its error, its Markdown output (with a copy control, and marked **partial output** when the
-  child stopped mid-stream), structured output, model and thinking level, `fresh`/`fork` context,
-  tool/turn/token/duration counts, its **acceptance** verdict, and an **open transcript** button that
-  switches this tab to that child's own session. A single-child run skips the list and shows its one
-  panel directly; **open in full** gives a long output the whole dialog. Children that share an agent
-  name are numbered (`reviewer 1`, `reviewer 2`) so a repeated lane is addressable. A run with some
-  failed children is marked as a partial success rather than a failed tool call.
-- Workflows are read from `details.workflowChildren` as well as from `details.results`, so a
-  workflow's children appear as soon as the run inventories them — before any child has produced a
-  result. A launch that has not reported children yet lists the tasks the call asked for, so a queued
-  run is legible immediately instead of showing an empty card. A background launch explains that its
-  children arrive later instead of pretending the run finished. Both live progress
-  (`tool_execution_update` snapshots) and the persisted result render from one normalized view model,
-  so an open inspector keeps updating while the run is still going. Management calls (`status`,
-  `stop`, agent CRUD, `guide`) answer with the same envelope but are not runs, so they keep the plain
-  tool row.
-- **A background run's completion is a card, not a grey note.** When a detached run finishes, the
-  `subagents` extension wakes the parent with a `subagent-notify` custom message; pi-web renders it as
-  a transcript card carrying the outcome (completed / failed / stopped / paused), the runs it covers,
-  and one row per child with its error or the first line of its retained output. A
-  `subagent-incremental-child-notify` — one workflow child settling while the run continues — gets
-  the same card labelled `child settled`. Clicking either opens the notice's own Markdown plus each
-  child's full retained output and the raw `details`, so the notice's "Parent action: …" trailer
-  (an instruction to the model, not to the reader) stays out of the transcript.
-- **A skill invocation is shown as a call, not as its definition.** pi expands `/skill-name args`
-  into one user message holding the whole `SKILL.md` inside a `<skill>` block, followed by the args.
-  The transcript parses that apart and renders a `SKILL` chip with the skill's name, then the prompt
-  you actually typed, with the definition folded behind a `definition · N lines` disclosure — a
-  one-line request no longer scrolls for thousands of words you never wrote. The same parse feeds the
-  session title (skill name plus prompt) and the prompt index, so a skill body is neither the title
-  of every session that used it nor a match for every search.
-- Assistant turns carry model, provider, input/output/cache tokens, cost and stop reason.
-- Queued steering / follow-up messages appear in a dock directly above the composer, next to the
-  running indicator; each can be undone individually or the whole queue cleared. The queue belongs
-  to the attached session's agent process — switching sessions shows only that session's queue,
-  and switching back restores it (the server re-sends the process's current queue when a tab
-  re-attaches).
-- `Esc` or **Stop** aborts the current run. The running/compacting indicator and **Stop** share one
-  row in that same dock above the input — indicator on the left, **Stop** at its far right — so they
-  are visible from where you are typing; if `pi` dies, the sidebar status line turns into a restart
-  button.
-
-**Sessions**
-
-- The sidebar lists every session under the pi session directory with title, message count, cost
-  and last activity. Each row shows the title on up to two lines (so long prompts stay readable),
-  then the repository, then the date and message count. **Recent** is a flat, cross-project list;
-  **Workspaces** is a two-level
-  project → session view; **Favorites** is a flat list of the sessions you starred; **Follow-ups**
-  lists the summaries you kept (next section). The four view tabs share one row at every sidebar
-  width; below about 240px the labels ellipsize rather than wrap. The star beside
-  the session details button in the header adds or removes the open session, and each row in the
-  Favorites tab carries a star that removes it. Stars live in the browser's local storage, so they
-  are per-browser and survive reloads; a starred session that no longer exists is skipped.
-- Opening a session rebuilds the transcript from its active branch, including history from before
-  a compaction, so you see the same conversation the terminal would. The switch is optimistic:
-  the sidebar highlight and URL hash update immediately, sessions opened before in the same tab
-  render from an in-memory cache and pull only entries appended since (via the `get_entries
-  since` cursor), and unseen sessions show a "loading session…" notice while `pi` boots. Each
-  session also remembers its scroll position: switching away and back returns you to the line you
-  left, and a session that was following the stream resumes following it.
-- Every open session runs in **its own `pi --mode rpc` process**. Switching sessions does not stop
-  the previous one: it keeps running in the background (marked with a pulsing dot in the sidebar)
-  and you can re-attach at any time. Each browser tab is bound to exactly one process, so parallel
-  tabs never interleave each other's output.
-- Sessions are addressable: the URL hash (`#ws=…&session=…&followup=…`) survives a reload and can be
-  bookmarked or shared between your own tabs; with a follow-up open, `&followup=<id>` reopens it.
-- Idle processes with no attached tab are reaped after 30 minutes.
-- The sidebar filter matches a session's title only. The search button beside the workspace button
-  (or `Cmd/Ctrl`+`K`) opens a dialog with three tabs, **Prompts** first and selected by default:
-  it searches only what you typed, so a word that recurs in tool output cannot bury the prompt
-  that asked for it. **Summary** narrows the same query to **the answer each run concluded with** —
-  the last turn of the run, and only when it settled: a turn that was aborted, failed, cut off
-  mid tool loop or still streaming has no summary and contributes nothing, which is the same rule
-  the prompt outline uses for its summary jump. **Everything** widens the query to **every prompt,
-  response, tool request and tool result in every workspace**: all typed terms must match
-  (case-insensitive), newest occurrences first, and each hit shows its role, workspace, session and
-  a snippet around the match. Switching tabs re-runs the query and puts the caret back in the
-  search field. A subagent's child output is indexed too and labelled by agent
-  (`subagent/reviewer`), so a reviewer's own wording is findable even when the parent's summary
-  paraphrases it. Clicking a hit switches to that session and jumps to the occurrence — scrolling
-  to the message, or opening the tool call's request/response popup. The system prompt and thinking
-  blocks are left out of the index: identical in every session, they would bury every query under
-  false hits.
-
-**Follow-ups and copying a summary**
-
-- Each assistant turn carries two quiet controls at its foot. **Copy** puts the answer on the
-  clipboard as **rich text plus Markdown** at once: headings, lists, tables and code are rewritten
-  with inline styles (email clients drop class-based CSS, which is why a pasted summary used to lose
-  its structure), while anything that only accepts plain text gets the Markdown source.
-- **Follow-up** appears on the turn that concludes a run — the same turn the prompt outline jumps
-  to and the search's summary scope covers — and saves that answer to a JSON file under
-  `~/.pi/followups`. It is a toggle: once that turn is kept, the control stays on it filled in the
-  accent color, and pressing it again removes the saved copy. The pressed state survives a reload
-  (the turn's timestamp and session file identify its saved copy), and a turn that was kept stays
-  toggleable even when a later turn takes over as the run's summary. The **Follow-ups** sidebar tab
-  lists what you kept, newest first; clicking a row
-  opens the summary as a document in the main column, laid out like the transcript (full width, same
-  gutter, no centered reading column), with a **Back** control, **Copy**, **Edit**, **Open
-  session** and **Delete**. Opening one reads only that file: no `pi` process is spawned and no
-  session is replayed, so it is immediate even when the original session has been deleted. The tab
-  filter matches a follow-up's title and its session title.
-- **Edit** turns the open follow-up into an in-place editor: the title becomes a single-line input
-  and the body becomes a Markdown source textarea. **Save** (or Cmd/Ctrl+Enter) writes the file back
-  under the same id, keeping its creation time, workspace and session link, so the row does not jump
-  in the list; **Cancel** or Esc discards the change, and the title may be cleared — the body may not.
-- A run that was aborted, failed, is still streaming or ended mid tool loop has no summary, so it
-  offers **Copy** only.
-
-**Controls**
-
-- Switch model and thinking level from the header. The model list honors `enabledModels` from
-  `~/.pi/agent/settings.json`. Both are in-app menus anchored below their button, with the height
-  clamped to the space left under it, so they scroll instead of spilling off the window.
-- A new session starts on the model configured in `~/.pi/agent/settings.json` (`defaultProvider`
-  plus `defaultModel`), and a resumed session restarts on the last model its own file recorded, so
-  the header never disagrees with the picker. Providers that register late — workbuddy resolves
-  credentials and fetches its catalog after pi boots — would otherwise lose the race for pi's
-  default and leave the session on an unrelated provider.
-- Context-window usage (used / max / percent), session cost and token totals in the header —
-  updated as each assistant message completes, not only when a run ends — with a session-details
-  popover for the session title, full path, session id, cwd and token breakdown.
-- The settings button at the right of the `pi running` status row opens a centered, near-full-window
-  read-only inspector with four tabs: **Models** (every configured model with its provider/id,
-  context window, output cap, per-million-token costs, API dialect, accepted input types and whether
-  it is the current one), **Skills** (each skill pi discovered for this session, with scope, origin,
-  description and `SKILL.md` path), **MCPs** and **Processes**. The MCP tab asks the
-  server to run `pi mcp list --json` in the session's workspace, so it shows live connection state,
-  scope, exposure, transport, an auth provider, the tools each server offers as chips and the error
-  or stderr tail of a failed one; reopen it or click the tab again to re-read.
-- The **Processes** tab lists long-running processes this session's bash calls started and never
-  stopped — the `nohup node server.js &` a run leaves behind, which keeps working (and keeps holding
-  its port) after the call, the run and the agent process are gone. Each row gives the command line,
-  the pid, the working directory, the port it listens on and how long it has been up, with a
-  **Stop** that sends `SIGTERM` and then `SIGKILL` if it is still there after two seconds. The list is
-  built by comparing the process table before and after every `bash` tool call: a process that
-  appeared during a call and has been orphaned out of pi's own process tree is something that call
-  left behind. So the tab cannot stop anything the agent did not start — a pid is only accepted when
-  that session recorded it during one of its own calls. A count on the settings button shows how many
-  are still running, which is the only always-on cue: no banner takes transcript space, but a session
-  that left a server running no longer looks identical to one that did not. A process is only
-  attributed to the call that was running when it started, so one started before this version of
-  pi-web was running is not listed.
-- The list button in the header outlines every user prompt in the session; clicking an entry
-  scrolls the transcript to that message. Each entry carries an indented second row that jumps to
-  the run's summary — the concluding answer after the tool loop, landing on its text rather than on
-  a turn whose tool cards can run for screens. A run that was interrupted (aborted or failed) has no
-  summary, so it shows no such row.
-- Attach files to the next message either way: drop them anywhere on the page, or use the
-  attach button beside the composer hint to pick them from the OS file dialog. Images land in a
-  thumbnail row and are sent as image blocks; click a thumbnail to enlarge it. Images already in a
-  transcript prompt open the same way — click one to see it in a popup, then click the picture in
-  that popup for the full-window viewer (the same two steps a tool-result image takes).
-- A **PDF**, **.docx**, **.html** or plain-text file (`.txt`, `.md`, `.csv`, `.json`, `.log`,
-  `.yaml`) is read as text and added to the prompt, so the agent can reason about a document you
-  hand it without a tool call. The server extracts the text — `pi`'s RPC prompt takes only text and
-  images — and the composer shows a chip with the file name, the page count for a PDF and how many
-  characters it will add; clicking the chip opens the extracted text, the same way a tool result
-  does. A document that cannot be read (a scanned PDF with no text layer, a legacy `.doc`, a file
-  over 20 MB, an encrypted file) is refused with the reason on its chip and must be removed before
-  the message can be sent. Long documents are truncated at 120,000 characters and the chip says so.
-  The transcript shows the attachment as the same chip, and its body is kept out of the session
-  title and cross-session search — it is what the model read, not what you typed.
-- `ArrowUp` / `ArrowDown` in the composer walk back and forward through previously sent
-  prompts (terminal-style, kept in the browser's local storage, capped at 200 entries);
-  the in-progress draft is restored when you arrow past the newest entry. Arrows keep
-  their normal caret role while the cursor is inside a multi-line draft.
-- The sidebar collapses to give the transcript the full window width; the state is
-  remembered across reloads, and a button at the left edge of the header brings it back.
-- Extension UI requests (`select`, `confirm`, `input`, `editor`) surface as real dialogs; `notify`
-  becomes a toast.
-- Clicking a tool call opens its request/response popup. A result that read a picture is shown as
-  the image itself (click to enlarge into a full-window viewer layered over the popup, so the
-  request/response stays readable underneath), not just as `{"content": "", "fileSize": …}` —
-  whether pi returned the bytes inline or only reported the file size and path.
-- Six independent palettes — mono (minimal grey/white), sky (fresh blue), grove (natural green),
-  ember (energetic orange), elegant (soft violet) and night (dark) — picked from a swatch dropdown
-  in the header, with the choice remembered across reloads; a resizable sidebar and keyboard
-  focus styling. Every palette is built from one token set, so the palettes differ only in color:
-  a neutral grouped page, white content surfaces, a single accent reserved for the primary action
-  and the current selection, and a translucent functional layer (toolbar, sidebar, composer) that
-  turns opaque under the system's Reduce Transparency setting.
-- Tool-call state is read twice over: a rail on the row's leading edge and a worded chip, so
-  `queued`, `running`, `done` and `error` are distinguishable without relying on color alone.
-
-## Architecture
-
-![pi-web architecture: browser tabs talk to one Node process over POST /api/* and the SSE event stream; that process keeps one pi --mode rpc subprocess per session, exchanging JSONL over stdio, and lists and searches the session directory those subprocesses write](docs/pi-web-architecture.png)
-
-| File | Role |
-| --- | --- |
-| `server.js` | Process pool of `pi --mode rpc`, client routing, session listing, follow-up store, background-process tracking, static files |
-| `public/index.html` | Application shell |
-| `public/app.js` | State, transcript reconciliation, event handling — no framework |
-| `public/style.css` | Design tokens, the six palettes, layout |
-
-The server keeps one `pi` subprocess per open session, keyed by session file. A browser tab
-registers a client id; `/api/open` attaches the tab to a process (spawning one if needed) and all
-later commands and SSE events are routed by that id. stdout is framed strictly on LF (the pi docs
-warn that `readline` also splits on U+2028/U+2029), and command responses are correlated by id.
-
-A process per session is deliberate: the in-process `switch_session` RPC invalidates contexts held
-by loaded extensions, which then fail with "extension ctx is stale after session replacement".
-Starting a fresh process with `--session <file>` avoids that class of bug entirely.
-
-### HTTP API
-
-Everything the frontend uses is plain JSON; there is no auth layer because the server is
-localhost-only by default.
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/config` | Server cwd, session directory, pi binary |
-| `GET /api/health` | Liveness, live process count, and tracked client count |
-| `GET /api/events?client=<id>` | SSE stream of pi records for this client's session |
-| `POST /api/open` | `{client, sessionFile?, cwd?}` — attach this client to a session; a fresh spawn is awaited until pi answers RPC |
-| `POST /api/cmd` | `{client, type, …}` — forward a pi RPC command, await its response |
-| `POST /api/ui-response` | Answer an extension UI request |
-| `GET /api/image?path=<file>` | Serve an image a tool call referenced by path (PNG/JPEG/GIF/WebP only, verified by magic bytes, 16 MB cap) |
-| `POST /api/extract` | `{name, data}` (base64) — extract the text of a composer attachment (PDF, `.docx`, `.html`, plain text) so it can ride inside a prompt; returns `{name, kind, text, pages?, truncated?}`, 415 with a reason when the file cannot be read |
-| `GET /api/sessions` | List sessions with live active/streaming flags |
-| `GET /api/followups` | List saved follow-ups: `{ followups: [{ id, title, createdAt, ts, cwd, sessionFile, sessionTitle, chars }] }` — metadata only, no bodies |
-| `POST /api/followups` | `{ title, text, ts?, cwd?, sessionFile?, sessionTitle? }` — save one summary under the follow-up directory; returns its metadata |
-| `GET /api/followups/<id>` | One saved follow-up, including its stored Markdown `text` |
-| `PATCH /api/followups/<id>` | `{ title?, text? }` — rewrite a saved follow-up's title and Markdown body; `id`, `createdAt`, `cwd` and the session link are kept; returns the updated record with its `text` |
-| `DELETE /api/followups/<id>` | Delete a saved follow-up |
-| `GET /api/search?q=<terms>&limit=<n>&scope=<all\|prompts\|summary>` | Full-text search across every session's prompts, responses, tool requests and tool results; `scope=prompts` narrows it to user prompts, `scope=summary` to the answer each run concluded with; returns snippet hits plus a `truncated` flag |
-| `GET /api/browse?path=<dir>` | Directory listing for the workspace picker |
-| `GET /api/mcp?client=<id>` | MCP server state as `pi mcp list --json` reports it, run in that client's session workspace; `{ servers, errors }`, where a disconnected server still returns 200 with its state and error |
-| `GET /api/processes?client=<id>` | Background processes that session's bash calls left running: `{ processes: [{ pid, command, cwd, port, since, toolCallId }] }`, with stopped processes dropped and the list replayed when a tab re-attaches |
-| `POST /api/processes/kill` | `{ client, pid }` — stop one recorded leftover (`SIGTERM`, then `SIGKILL` after two seconds); a pid this session did not record during one of its own bash calls is refused with 404 |
-
-## Configuration
-
-Command-line flags (each has an environment-variable equivalent):
-
-| Flag | Env | Default | Meaning |
-| --- | --- | --- | --- |
-| `--port <n>` | `PI_WEB_PORT` | `3210` | Listen port |
-| `--host <addr>` | `PI_WEB_HOST` | `127.0.0.1` | Bind address; a non-loopback value enables remote access |
-| `--cwd <dir>` | `PI_WEB_CWD` | current directory | Directory the agent works in |
-| `--session-dir <dir>` | `PI_CODING_AGENT_SESSION_DIR` | `~/.pi/agent/sessions` | Where pi stores sessions |
-| `--followup-dir <dir>` | `PI_WEB_FOLLOWUP_DIR` | `~/.pi/followups` | Where Follow-ups are saved (one JSON file each) |
-| `--pi <path>` | `PI_BIN` | `pi` on `PATH` | pi executable to spawn |
-| `--allow-remote` | `PI_WEB_ALLOW_REMOTE=1` | off | Drop the loopback request guards (reverse proxies) |
-
-`--help` prints the same list; `--version` prints the package version.
-
-## Remote access
-
-**Do not expose this server to a network you do not control.** Anything that can reach the port can
-drive the agent, and the agent runs shell commands as you. There is no login.
-
-By default the server binds to `127.0.0.1` and also rejects requests whose `Host` or `Origin` is not
-local, which blocks DNS rebinding and cross-origin requests from other browser tabs.
-
-Preferred remote setup — keep the server on loopback and tunnel to it:
-
-```bash
-node server.js                                   # stays on 127.0.0.1
-ssh -N -L 3210:127.0.0.1:3210 you@your-machine   # then browse http://localhost:3210
-```
-
-Two escape hatches exist for containers and reverse proxies, and both log a warning at startup
-because they remove the request guards:
-
-- `--host 0.0.0.0` — bind beyond loopback (binding elsewhere is itself the opt-in).
-- `--allow-remote` — stay on loopback but drop the `Host`/`Origin` checks, e.g. when a proxy
-  rewrites the `Host` header.
-
-Either way, put authentication in front of the port before it is reachable by anyone else.
-
-## Security notes
-
-- Paths from the browser are resolved and checked against the public asset directory before being
-  served; the workspace picker only lists existing directories.
-- `GET /api/image` is the one route that reads an arbitrary absolute path, because a tool result can
-  reference a picture anywhere on disk. It is restricted to image bytes: the content must sniff as
-  PNG, JPEG, GIF or WebP, the size is capped at 16 MB, and it is served with `no-store`. Anything
-  else — text, JSON, SVG — is refused with 415, so the endpoint cannot be used as a general file
-  reader.
-- Session listing walks only the configured session directory.
-- `POST /api/extract` never reads a path: the bytes come from the browser's own `File`, are capped at
-  20 MB, and leave as text only. The readers are bounded at every level — a decompressed stream at
-  64 MB and a whole file's decompressed total at 96 MB (a small file can inflate to gigabytes), PDF
-  objects at 50,000 and pages at 2,000, the declared member count of an object stream against what
-  the file can hold, markup scanned at 4 MB, and the extracted text at 120,000 characters. A
-  malformed or hostile container is refused with 415 instead of decompressing without limit. No
-  external binary (no `pdftotext`, no `unzip`) is invoked.
-- Cross-session search reads only the same session directory, returns snippets and never writes.
-  Parsed indexes live in a byte-capped in-memory cache and are keyed by each file's mtime and size.
-- Session summaries for the sidebar are cached per file under the same mtime+size key, so polling
-  re-parses only the sessions that changed instead of re-reading the whole corpus.
-- Follow-ups are read from and written to the configured follow-up directory only, by UUID-derived
-  file name; the id in the URL must match `[A-Za-z0-9_-]{1,80}`, so a request cannot address any
-  other path. Saving and editing write a temporary file and rename it, so a half-written summary is
-  never listed; an edit rewrites the body under the same id and cannot change where the record
-  lives. The list endpoint returns metadata only; a body is read only when a follow-up is opened.
-- No `eval`, no `innerHTML` with unescaped session content: transcripts are built with
-  `textContent`, and the Markdown subset escapes before formatting.
-- Reported vulnerabilities: see [SECURITY.md](SECURITY.md).
-
-## Development
-
-There is no build step. Both entry points are plain files that a browser or Node runs directly.
-
-```bash
-npm start          # same as node server.js
-npm run check      # node --check on the server, frontend and smoke test
-npm test           # end-to-end smoke test (starts a throwaway server)
-```
-
-`npm test` boots the server on a random port and verifies what has actually broken before: the page
-and assets are served, the HTTP API answers, search reaches every channel of a fixture session and
-skips the system prompt and thinking blocks, each scope stops where it should (a prompt, a mid-loop
-answer and an aborted run stay out of the summary scope), follow-ups round-trip through their own
-directory (save, list without bodies, read, edit in place, delete, and an id that cannot escape it),
-foreign `Host`/`Origin` requests are
-rejected, path traversal cannot escape `public/`, and malformed commands return a clean 4xx. It also
-pins the static-asset revalidation (`ETag` → `304`) and the client bound that keeps closed event
-streams from accumulating. It runs against a throwaway session directory, needs no agent
-credentials, and — when `pi` happens to be installed — also checks the agent round-trip, otherwise it
-skips that check.
-
-Frontend changes apply on reload (static files are served with `Cache-Control: no-cache` plus an
-`ETag`, so an unchanged asset revalidates as a bodyless `304` instead of being re-sent). Server
-changes need a restart. Session files are plain JSONL and readable with any text editor, which is
-often the fastest way to debug an event you did not expect.
-
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Limitations
-
-- Only the active branch of a session is rendered; pi supports branching, but there is no branch
-  visualization yet.
-- The RPC `bash` command is intentionally unused — send prompts instead.
-- No authentication. See [Remote access](#remote-access).
-- No multi-user support: one person, one machine, many tabs.
-- A follow-up keeps the summary's Markdown text only. Images in it are not copied, and it is not
-  updated when the session it came from changes — save it again for a newer answer.
-- A `file://` link in an answer is shown as a link, but Chrome will not let an `http` page open a
-  local file, so clicking it copies the path rather than navigating. Open the path from a terminal
-  (`open <path>`, `xdg-open <path>`).
-- Attachment extraction is approximate and layout-blind: PDF text comes out in reading order only as
-  well as the page's text operators allow (a multi-column page can interleave columns, tables become
-  one cell per line), a scanned PDF has no text to extract and needs OCR first, and legacy `.doc`,
-  `.xls`, `.pptx` and `.docm` are not accepted. Formatting, images, footnotes and comments are
-  dropped — the agent gets the words, not the document.
-- Cross-session search indexes the text of every message in every session file, not only the active
-  branch. History from before a compaction is reachable (and rendered), but a message on a branch
-  that was branched away from has no transcript row: clicking such a hit reports that it is not on
-  the active branch instead of jumping.
-- The **Processes** tab only sees what it watched happen: a process is attributed to a bash call by
-  comparing the process table before and after that call, so anything started before this version of
-  pi-web was running is not listed. Detection relies on the tool shell's process group, so a program
-  that deliberately re-parents itself into a fresh group (`setsid`, a daemonizer with that behaviour)
-  can escape it. Linux and macOS only — the tab is empty where `ps -o lstart=` is not available.
+Archived, read-only, kept for its history and for the design notes in earlier commits. Issues and
+pull requests should go to [garrettlish/pi-ui](https://github.com/garrettlish/pi-ui).
 
 ## License
 
