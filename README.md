@@ -86,18 +86,33 @@ pi-web --cwd ~/code/my-project
   response text (or as a `diff` next to the counts) rather than as an `edit` result. The popup has a
   **Raw JSON** toggle and copies the full payload — the transcript itself never grows or scrolls, so
   the surrounding messages stay put.
-- **Subagent runs are shown as their own transcript card**, not as an opaque tool row. When the
-  `subagent` tool fans work out to child agents, the card head summarizes the run (agents involved,
-  running/failed/done counts, wall time, tokens) and one row per child carries its live state and
-  current activity — the tool it is running, its most recent tools and output, and its error when
-  it fails. Clicking the card (or any child row) opens a run inspector: a summary strip with mode,
-  child count, run id, duration, tokens and cost, then one panel per child with its task, live
-  `now` activity, recent tools, recent output, final Markdown output, error, model/thinking level
-  and an **open transcript** button that switches this tab to that child's own session. A run with
-  some failed children is marked as a partial success rather than a failed tool call, and a
-  background launch explains that its children are reported when the run completes. Both live
-  progress (`tool_execution_update` snapshots) and the persisted result render from one normalized
-  view model, so an open inspector keeps updating while the run is still going.
+- **Subagent runs are shown as their own transcript card**, not as an opaque tool row. The card
+  head names the shape of the fan-out — `single`, `parallel`, `chain` or `workflow` — so a run of
+  eight lanes never reads like one reviewer, then summarizes it (agents involved,
+  running/failed/done counts, wall time, tokens). One row per child carries its live state and
+  current activity: the tool it is running, its most recent tools and output, and its error when it
+  fails.
+- Clicking the card (or any child row) opens a **run inspector**: a summary strip (shape, transport,
+  workflow resource and lanes, child count, wall clock, tokens, tools, cost, run id) over a
+  master/detail layout — every child in a selectable list on the left, the selected child on the
+  right with its task, a `progress_update` report from `contact_supervisor`, live `now` activity and
+  how long the current tool has been open, recent tools, the child's recorded tool-call log, recent
+  output, its error, its Markdown output (with a copy control, and marked **partial output** when the
+  child stopped mid-stream), structured output, model and thinking level, `fresh`/`fork` context,
+  tool/turn/token/duration counts, its **acceptance** verdict, and an **open transcript** button that
+  switches this tab to that child's own session. A single-child run skips the list and shows its one
+  panel directly; **open in full** gives a long output the whole dialog. Children that share an agent
+  name are numbered (`reviewer 1`, `reviewer 2`) so a repeated lane is addressable. A run with some
+  failed children is marked as a partial success rather than a failed tool call.
+- Workflows are read from `details.workflowChildren` as well as from `details.results`, so a
+  workflow's children appear as soon as the run inventories them — before any child has produced a
+  result. A launch that has not reported children yet lists the tasks the call asked for, so a queued
+  run is legible immediately instead of showing an empty card. A background launch explains that its
+  children arrive later instead of pretending the run finished. Both live progress
+  (`tool_execution_update` snapshots) and the persisted result render from one normalized view model,
+  so an open inspector keeps updating while the run is still going. Management calls (`status`,
+  `stop`, agent CRUD, `guide`) answer with the same envelope but are not runs, so they keep the plain
+  tool row.
 - **A skill invocation is shown as a call, not as its definition.** pi expands `/skill-name args`
   into one user message holding the whole `SKILL.md` inside a `<skill>` block, followed by the args.
   The transcript parses that apart and renders a `SKILL` chip with the skill's name, then the prompt

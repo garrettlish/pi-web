@@ -864,13 +864,25 @@ function imageResultSection(title, blocks) {
 // The subagents extension reports a run through the generic tool channel: a
 // `subagent` call whose result carries `details.results[]` (one row per child)
 // plus a `progress` snapshot that is re-sent whole on every
-// tool_execution_update. Everything below reads only that documented shape —
-// unknown fields are ignored, so a newer extension version degrades to the
-// generic tool view instead of breaking the transcript.
+// tool_execution_update. A workflow reports its fan-out a second way, in
+// `details.workflowChildren.children[]`, before (and while) any child result
+// exists. Everything below reads only those documented shapes — unknown fields
+// are ignored, so a newer extension version degrades to the generic tool view
+// instead of breaking the transcript.
 const SUBAGENT_TOOL = "subagent";
-/** children listed under the card head; the popup holds the rest */
+/** children listed under the card head; the inspector holds the rest */
 const SUBAGENT_INLINE_MAX = 6;
 const REDACTED_TASK = "[prompt redacted]";
+/** the four shapes the extension launches: one child, a parallel fan-out, a
+ *  sequential chain, or a workflow script that may do either. The label is
+ *  what the head shows, because "subagent" alone says nothing about whether
+ *  one reviewer or eight lanes are at work. */
+const SUBAGENT_MODES = {
+  single: { label: "single", hint: "one child agent" },
+  parallel: { label: "parallel", hint: "children run side by side" },
+  chain: { label: "chain", hint: "children run one after another" },
+  workflow: { label: "workflow", hint: "a workflow script orchestrates the children" },
+};
 
 /** Child task texts from the call arguments, in launch order. The results
  *  themselves redact `task`, so the request is the only place the prompt the
@@ -881,6 +893,7 @@ function subagentTasks(call) {
   const push = (agent, task) =>
     out.push({ agent: typeof agent === "string" && agent ? agent : null, task: typeof task === "string" ? task : "" });
   if (Array.isArray(a.tasks)) for (const t of a.tasks) push(t?.agent, t?.task);
+  if (a.args && Array.isArray(a.args.tasks)) for (const t of a.args.tasks) push(t?.agent, t?.task);
   if (Array.isArray(a.chain)) {
     for (const step of a.chain) {
       if (Array.isArray(step?.parallel)) for (const t of step.parallel) push(t?.agent, t?.task);
@@ -896,33 +909,87 @@ function liveSubagentDetails(exec) {
   const updates = exec?.updates || [];
   for (let i = updates.length - 1; i >= 0; i--) {
     const d = updates[i]?.details;
-    if (d && Array.isArray(d.results)) return d;
+    if (d && (Array.isArray(d.results) || d.workflowChildren)) return d;
   }
   return null;
 }
 
 function subagentStatus(progressStatus, exitCode, error) {
-  if (["pending", "running", "detached", "completed", "failed"].includes(progressStatus)) return progressStatus;
+  if (["pending", "running", "detached", "completed", "failed", "stopped", "paused", "rejected"].includes(progressStatus)) {
+    return progressStatus;
+  }
   if (exitCode != null) return exitCode === 0 ? "completed" : "failed";
   return error ? "failed" : "completed";
 }
 
 /** css tone for a child state: "running" | "ok" | "error" | "" */
 function subagentTone(status) {
-  if (status === "running" || status === "pending") return "running";
-  if (status === "failed") return "error";
+  if (status === "running" || status === "pending" || status === "detached") return "running";
+  if (status === "failed" || status === "rejected") return "error";
   if (status === "completed") return "ok";
   return "";
 }
 
 function subagentStatusText(status) {
-  return { pending: "queued", running: "running", completed: "done", failed: "error", detached: "detached" }[status] || status || "";
+  return (
+    {
+      pending: "queued",
+      running: "running",
+      completed: "done",
+      failed: "error",
+      detached: "detached",
+      stopped: "stopped",
+      paused: "paused",
+      rejected: "rejected",
+    }[status] ||
+    status ||
+    ""
+  );
 }
 
-/** Normalize one `subagent` call + its result into child rows both the card and
- *  the popup render from, so the two never disagree about state. */
+/** how one child's token usage adds up, from either a live progress snapshot
+ *  or a final usage block. Cache reads and writes are reported separately by
+ *  the extension, so the total has to include them or a cached run reads as
+ *  almost free. */
+function subagentUsage(usage) {
+  if (!usage) return null;
+  const input = Number(usage.input ?? usage.inputTokens ?? 0) || 0;
+  const output = Number(usage.output ?? usage.outputTokens ?? 0) || 0;
+  const cacheRead = Number(usage.cacheRead ?? 0) || 0;
+  const total = input + output + cacheRead;
+  if (!total) return null;
+  return { input, output, cacheRead, total };
+}
+
+/** one child's acceptance verdict, flattened to the two things a reader acts
+ *  on: did the child attest its result, and how many required criteria it
+ *  reported as satisfied. Null when the run carried no acceptance ledger. */
+function subagentAcceptance(acceptance) {
+  if (!acceptance || typeof acceptance !== "object") return null;
+  const status = typeof acceptance.status === "string" ? acceptance.status : null;
+  const evidence = typeof acceptance.evidenceStatus === "string" ? acceptance.evidenceStatus : null;
+  const criteria = Array.isArray(acceptance.criteria) ? acceptance.criteria : [];
+  const satisfied = Array.isArray(acceptance.childReport?.criteriaSatisfied)
+    ? acceptance.childReport.criteriaSatisfied.filter((c) => c && c.status === "satisfied").length
+    : null;
+  if (!status && !criteria.length) return null;
+  return {
+    status,
+    evidence,
+    required: criteria.filter((c) => c.severity !== "recommended").length || criteria.length,
+    satisfied,
+    ok: status === "verified" || status === "checked" || status === "attested",
+  };
+}
+
+/** Normalize one `subagent` call + its result into the view both the card and
+ *  the inspector render from, so the two never disagree about state. Reads the
+ *  three places the extension reports a fan-out, in order of authority:
+ *  `results[]` (a child that finished or is streaming), `workflowChildren`
+ *  (a workflow that has not produced results yet), and the call arguments
+ *  (children that were asked for but have not started). */
 function subagentView(call, exec, result) {
-  const finalDetails = result?.details && Array.isArray(result.details.results) ? result.details : null;
+  const finalDetails = result?.details && (Array.isArray(result.details.results) || result.details.workflowChildren) ? result.details : null;
   const live = liveSubagentDetails(exec);
   const details = finalDetails || live;
   const tasks = subagentTasks(call);
@@ -935,12 +1002,14 @@ function subagentView(call, exec, result) {
   const rows = (details?.results || []).map((raw, i) => {
     const index = Number.isInteger(raw.index) ? raw.index : i;
     const liveRow = Array.isArray(live?.results) ? live.results[i] : null;
-    const progress = raw.progress || liveRow?.progress || progressByIndex.get(index) || null;
-    const usage = raw.usage || {};
+    const progress = raw.progress || liveRow?.progress || progressByIndex.get(index) || raw.progressSummary || null;
+    const usage = subagentUsage(raw.usage) || subagentUsage(progress);
     const task = tasks[index];
     const taskText = [task?.task, progress?.task]
       .find((t) => typeof t === "string" && t.trim() && t !== REDACTED_TASK) || "";
-    const tokens = progress?.tokens || (usage.input || 0) + (usage.output || 0) || null;
+    const toolCalls = Array.isArray(raw.toolCalls)
+      ? raw.toolCalls.map((t) => (typeof t === "string" ? { text: t, expandedText: t } : { text: String(t?.text || ""), expandedText: String(t?.expandedText || t?.text || "") }))
+      : [];
     return {
       agent: raw.agent || progress?.agent || task?.agent || "subagent",
       name: raw.sessionName || progress?.sessionName || null,
@@ -948,34 +1017,144 @@ function subagentView(call, exec, result) {
       status: subagentStatus(progress?.status, raw.exitCode, raw.error),
       model: progress?.model || raw.model || raw.requestedModel || null,
       thinking: progress?.thinking || raw.thinking || null,
+      context: raw.context || null,
       currentTool: progress?.currentTool || null,
       currentToolArgs: progress?.currentToolArgs || null,
-      recentTools: Array.isArray(progress?.recentTools) ? progress.recentTools.slice(-3) : [],
+      currentToolStartedAt: progress?.currentToolStartedAt || null,
+      activityState: progress?.activityState || null,
+      progressText: progress?.progressText || null,
+      failedTool: progress?.failedTool || null,
+      recentTools: Array.isArray(progress?.recentTools) ? progress.recentTools.slice(-4) : [],
       recentOutput: Array.isArray(progress?.recentOutput) ? progress.recentOutput.slice(-8) : [],
-      tokens,
-      cost: usage.cost?.total || null,
+      toolCalls,
+      usage,
+      tokens: usage?.total || null,
+      cost: raw.usage?.cost?.total || raw.usage?.cost || null,
+      turns: raw.usage?.turns || progress?.turnCount || null,
       // 0 is "not measured yet" for a queued child, not an instant run
       durationMs: progress?.durationMs || raw.progressSummary?.durationMs || null,
-      toolCount: progress?.toolCount ?? raw.progressSummary?.toolCount ?? null,
+      toolCount: progress?.toolCount ?? raw.progressSummary?.toolCount ?? (toolCalls.length || null),
       error: raw.error || progress?.error || null,
       output: typeof raw.finalOutput === "string" ? raw.finalOutput : "",
+      outputPartial: !!raw.outputPartial,
+      outputState: raw.outputState || null,
       sessionFile: raw.sessionFile || null,
+      acceptance: subagentAcceptance(raw.acceptance),
+      structured: raw.structuredOutput !== undefined ? raw.structuredOutput : null,
     };
   });
 
+  // A workflow's children exist before their results do. Anything `results[]`
+  // already covers is skipped, so the two sources never double-list a child.
+  const seen = new Set(rows.map((r) => r.name).filter(Boolean));
+  const wf = details?.workflowChildren;
+  if (wf && Array.isArray(wf.children)) {
+    for (const child of wf.children) {
+      if (!child || (child.sessionName && seen.has(child.sessionName))) continue;
+      const activity = child.activity || null;
+      const status = subagentStatus(child.state, null, null);
+      rows.push({
+        agent: child.agent || child.childId || "subagent",
+        name: child.sessionName || null,
+        key: child.workflowKey || child.childId || null,
+        task: "",
+        status,
+        model: child.model || activity?.model || null,
+        thinking: child.thinking || null,
+        context: null,
+        currentTool: activity?.currentTool || null,
+        currentToolArgs: null,
+        currentToolStartedAt: activity?.currentToolStartedAt || null,
+        activityState: null,
+        progressText: null,
+        failedTool: null,
+        recentTools: [],
+        recentOutput: [],
+        toolCalls: [],
+        usage: null,
+        tokens: activity?.tokens || null,
+        cost: null,
+        turns: activity?.turnCount || null,
+        durationMs: activity?.durationMs || null,
+        toolCount: activity?.toolCount || null,
+        error: null,
+        output: "",
+        outputPartial: false,
+        outputState: null,
+        sessionFile: null,
+        acceptance: null,
+        structured: null,
+        planned: true,
+      });
+    }
+  }
+
+  // Nothing reported yet, but the call asked for children: show what was asked
+  // for instead of an empty card, so a queued run is legible before its first
+  // progress tick.
+  if (!rows.length && tasks.length) {
+    for (const t of tasks) {
+      rows.push({
+        agent: t.agent || "subagent",
+        name: null,
+        task: t.task,
+        status: "pending",
+        model: null,
+        thinking: null,
+        context: null,
+        currentTool: null,
+        currentToolArgs: null,
+        currentToolStartedAt: null,
+        activityState: null,
+        progressText: null,
+        failedTool: null,
+        recentTools: [],
+        recentOutput: [],
+        toolCalls: [],
+        usage: null,
+        tokens: null,
+        cost: null,
+        turns: null,
+        durationMs: null,
+        toolCount: null,
+        error: null,
+        output: "",
+        outputPartial: false,
+        outputState: null,
+        sessionFile: null,
+        acceptance: null,
+        structured: null,
+        planned: true,
+      });
+    }
+  }
+
+  const graph = details?.workflowGraph || null;
+  const mode = details?.mode || (graph ? "workflow" : null);
   return {
-    mode: details?.mode || null,
+    mode,
+    // "workflow" mode is the transport; the run inside it can still be a single
+    // child, so the head names the transport and the shape separately.
+    shape: details?.mode || null,
     runId: details?.runId || null,
     /** A background launch answers immediately with no child rows: the run is
      *  detached and its result arrives later as a completion message. */
     asyncId: details?.asyncId || null,
-    background: !!details?.background,
+    background: !!details?.background || !!details?.asyncId,
+    // The head has to tell "a workflow with no children yet" apart from "a
+    // background run whose children never reach this window".
+    inventoryComplete: wf ? wf.inventoryComplete !== false : null,
+    workflowState: wf?.workflowState || null,
+    graph,
+    workflowResource: details?.workflow?.resource || null,
+    preflight: details?.preflight || null,
     rows,
     running: rows.filter((r) => r.status === "running" || r.status === "pending" || r.status === "detached").length,
-    failed: rows.filter((r) => r.status === "failed").length,
+    failed: rows.filter((r) => r.status === "failed" || r.status === "rejected").length,
     tokens: rows.reduce((sum, r) => sum + (r.tokens || 0), 0) || null,
     cost: rows.reduce((sum, r) => sum + (r.cost || 0), 0) || null,
     durationMs: rows.reduce((max, r) => Math.max(max, r.durationMs || 0), 0) || null,
+    tools: rows.reduce((sum, r) => sum + (r.toolCount || 0), 0) || null,
   };
 }
 
@@ -984,15 +1163,25 @@ function subagentView(call, exec, result) {
  *  but are not runs, so they keep the generic tool view. */
 function isSubagentRun(call, exec, result) {
   if (call?.name !== SUBAGENT_TOOL) return false;
+  // `action` is management/control only (status, stop, guide, agent CRUD): those
+  // calls answer with a run's envelope but never start one, so they keep the
+  // generic tool view. The envelope's own `mode` cannot tell them apart — a
+  // status query reports the queried run's mode.
+  if (typeof call.arguments?.action === "string" && call.arguments.action) return false;
   const live = liveSubagentDetails(exec);
-  const details = result?.details && Array.isArray(result.details.results) ? result.details : live;
+  const details = result?.details && (Array.isArray(result.details.results) || result.details.workflowChildren)
+    ? result.details
+    : live;
   if (!details || details.mode === "management") return false;
-  return details.results.length > 0 || details.mode === "single" || !!details.asyncId || !!live;
+  if (details.workflowChildren) return true;
+  return (details.results?.length || 0) > 0 || details.mode === "single" || !!details.asyncId || !!live;
 }
 
+/** A workflow answer that only says how it was launched is quiet about what to
+ *  do next, so the background note leads with the one action that matters. */
 function subagentHeadline(view) {
   if (!view.rows.length) {
-    if (view.background || view.asyncId) return "background run · detached";
+    if (view.background || view.asyncId) return view.workflowState ? `background workflow · ${view.workflowState}` : "background run · detached";
     return view.mode ? `${view.mode} run` : "starting…";
   }
   const agents = view.rows.map((r) => r.agent);
@@ -1006,9 +1195,17 @@ function subagentHeadline(view) {
   return truncate(who, 90);
 }
 
+/** the run's shape as one word: parallel / chain / single / workflow */
+function subagentModeLabel(view) {
+  const mode = view.mode && SUBAGENT_MODES[view.mode] ? SUBAGENT_MODES[view.mode] : null;
+  if (mode) return mode.label;
+  return view.rows.length > 1 ? "parallel" : "single";
+}
+
 /** one line of live activity for a child row */
 function subagentActivity(row) {
   if (row.status === "failed" && row.error) return truncate(row.error, 160);
+  if (row.activityState === "needs_attention") return "waiting on you — check the inspector";
   if (row.currentTool) {
     const args = row.currentToolArgs ? ` ${truncate(String(row.currentToolArgs), 80)}` : "";
     return `${row.currentTool}${args}`;
@@ -1016,6 +1213,7 @@ function subagentActivity(row) {
   const lastOutput = row.recentOutput[row.recentOutput.length - 1];
   if (lastOutput) return truncate(lastOutput.trim(), 160);
   if (row.status === "pending") return "queued";
+  if (row.status === "detached") return "detached — result arrives later";
   if (row.status === "running") return "working…";
   // A finished row is identified by what it was asked to do, not by a tool count
   if (row.task) return truncate(row.task, 160);
@@ -1031,8 +1229,15 @@ function subagentMeta(row) {
   return parts.join(" · ");
 }
 
+/** a small worded badge. Every state carries its word, so a colorblind reader
+ *  and a grayscale screenshot both survive. */
+function saBadge(text, tone = "", title = "") {
+  return el("span", { class: `sa-badge ${tone}`, text, title: title || text });
+}
+
 /** inline card: the run on one head line, its children as compact rows. A
- *  subagent's children are the part worth seeing without opening a popup. */
+ *  subagent's children are the part worth seeing without opening the popup, so
+ *  they stay in the transcript; everything deeper is one click away. */
 function renderSubagentCard(call, block) {
   const { result, exec, statusText } = toolcallState(block);
   const view = subagentView(call, exec, result);
@@ -1042,6 +1247,7 @@ function renderSubagentCard(call, block) {
   // error accent; a partial failure gets the warning one.
   const allFailed = view.rows.length > 0 && view.failed === view.rows.length;
   const accent = statusText === "error" || allFailed ? "error" : view.failed ? "partial" : "";
+  const mode = subagentModeLabel(view);
   const card = el("div", {
     class: `toolcall subagent ${exec.status === "running" || view.running ? "running" : ""} ${accent}`,
     "data-call-id": call.id,
@@ -1052,7 +1258,7 @@ function renderSubagentCard(call, block) {
     class: "tc-head",
     role: "button",
     tabindex: "0",
-    title: "Open subagent run",
+    title: "Open the run inspector",
     "aria-haspopup": "dialog",
     onclick: open,
     onkeydown: onActivate(open),
@@ -1063,6 +1269,7 @@ function renderSubagentCard(call, block) {
       headOpts,
       el("span", { class: "tc-open-icon", text: "⧉" }),
       el("span", { class: "tc-name", text: "subagent" }),
+      saBadge(mode, `mode ${mode}`),
       el("span", { class: "tc-summary", text: subagentHeadline(view) }),
       view.running ? el("span", { class: "sa-count running", text: `${view.running} running` }) : null,
       view.failed ? el("span", { class: "sa-count error", text: `${view.failed} failed` }) : null,
@@ -1112,21 +1319,39 @@ function subagentChildRow(row, open) {
   );
 }
 
-/** Rich popup body for one subagent run: a summary strip plus one panel per
- *  child with its task, live activity, output and session file. */
+/** one value for the child list: the number a reader compares between rows.
+ *  Tokens and turn counts live in the panel head, where there is room to say
+ *  what they mean. */
+function subagentListMeta(row) {
+  if (row.durationMs) return fmtDuration(row.durationMs);
+  if (row.toolCount) return `${row.toolCount}·`;
+  return "";
+}
+
+/** Rich popup body for one subagent run: a summary strip, then a
+ *  master/detail inspector — one row per child on the left, the selected
+ *  child's task, live activity, tools, output and acceptance on the right.
+ *  A single child skips the list: there is nothing to choose between. */
 let subagentRequestOpen = false;
+/** which child the inspector is showing, by index; -1 means the run overview */
+let subagentSelected = -1;
 function buildSubagentBody(call, exec, result) {
   const view = subagentView(call, exec, result);
   const body = el("div", { class: "sa-body" });
 
   const strip = el("div", { class: "sa-strip" });
   const chip = (text, tone = "") => el("span", { class: `sa-chip ${tone}`, text });
-  if (view.mode) strip.append(chip(`mode: ${view.mode}${view.background ? " · background" : ""}`));
+  const mode = subagentModeLabel(view);
+  strip.append(chip(`${mode}${view.background ? " · background" : ""}`, "mode"));
+  if (view.mode && view.mode !== mode) strip.append(chip(`transport: ${view.mode}`));
+  if (view.workflowResource?.name) strip.append(chip(`workflow: ${view.workflowResource.name}`));
+  if (view.preflight?.lanes?.length) strip.append(chip(`${view.preflight.lanes.length} lanes`));
   strip.append(chip(`${view.rows.length} child${view.rows.length === 1 ? "" : "ren"}`));
   if (view.running) strip.append(chip(`${view.running} running`, "running"));
   if (view.failed) strip.append(chip(`${view.failed} failed`, "error"));
   if (view.durationMs != null) strip.append(chip(`wall ${fmtDuration(view.durationMs)}`));
   if (view.tokens != null) strip.append(chip(`${fmtTokens(view.tokens)} tok`));
+  if (view.tools) strip.append(chip(`${view.tools} tools`));
   if (view.cost) strip.append(chip(fmtCost(view.cost)));
   if (view.runId) {
     const run = chip(`run ${view.runId.slice(0, 8)}`);
@@ -1147,12 +1372,15 @@ function buildSubagentBody(call, exec, result) {
       : null;
     if (note) body.append(note);
     body.append(el("div", { class: "tc-text", text: capText(text || "(no child results reported yet)") }));
+  } else if (view.rows.length === 1) {
+    body.append(subagentPanel(view.rows[0], 0, view, false));
+  } else {
+    body.append(subagentInspector(view));
   }
 
-  for (const row of view.rows) {
-    body.append(subagentPanel(row));
-  }
-
+  // The workflow launch answered with "detached, return control now" — that is
+  // traffic control, not the run's content, so it stays out of the summary and
+  // behind the same disclosure the raw request uses.
   const request = el("details", { class: "sa-request" });
   // A running run repaints this body on every progress tick; remember whether
   // the reader expanded the request so the repaint does not collapse it.
@@ -1165,27 +1393,134 @@ function buildSubagentBody(call, exec, result) {
   return body;
 }
 
-function subagentPanel(row) {
-  const tone = subagentTone(row.status);
-  const panel = el("div", { class: `sa-panel ${tone}` });
+/** master/detail: a child list on the left, one selected child's panel on the
+ *  right. Selecting a row repaints only the detail pane, so the list keeps its
+ *  scroll position while a run is still ticking. */
+function subagentInspector(view) {
+  const list = el("div", { class: "sa-list", role: "listbox", "aria-label": "children" });
+  const detail = el("div", { class: "sa-detail" });
+  // Keep the selection on a child that still exists; a run that loses a row
+  // (a workflow re-inventory) must not point the pane at nothing.
+  let selected = subagentSelected >= 0 && subagentSelected < view.rows.length ? subagentSelected : 0;
 
+  const paintDetail = () => {
+    detail.replaceChildren(subagentPanel(view.rows[selected], selected, view, false));
+    for (const [i, node] of [...list.children].entries()) {
+      node.classList.toggle("selected", i === selected);
+      node.setAttribute("aria-selected", i === selected ? "true" : "false");
+    }
+  };
+
+  // A parallel fan-out routinely runs the same agent several times, so a bare
+  // "reviewer" three times is not a list a reader can navigate: the ordinal
+  // names the lane.
+  const agentCount = new Map();
+  for (const row of view.rows) agentCount.set(row.agent, (agentCount.get(row.agent) || 0) + 1);
+
+  view.rows.forEach((row, i) => {
+    const tone = subagentTone(row.status);
+    const repeated = (agentCount.get(row.agent) || 0) > 1;
+    const item = el(
+      "div",
+      {
+        class: `sa-list-row ${tone}`,
+        role: "option",
+        tabindex: "0",
+        title: row.task || row.name || row.agent,
+        onclick: () => {
+          selected = i;
+          subagentSelected = i;
+          paintDetail();
+        },
+        onkeydown: onActivate(() => {
+          selected = i;
+          subagentSelected = i;
+          paintDetail();
+        }),
+      },
+      el("span", { class: `sa-dot ${tone}` }),
+      el("span", { class: "sa-list-main" },
+        el("span", { class: "sa-list-agent", text: repeated ? `${row.agent} ${i + 1}` : row.agent, title: row.name || row.agent }),
+        el("span", { class: "sa-list-what", text: subagentActivity(row) })
+      ),
+      el("span", { class: "sa-list-meta", text: subagentListMeta(row) })
+    );
+    list.append(item);
+  });
+
+  paintDetail();
+  return el("div", { class: "sa-inspector" }, list, detail);
+}
+
+/** open one child's full panel in its own popup, so a long output can use the
+ *  whole dialog instead of a scrolling column */
+function openChildPopup(row, index, view) {
+  const title = row.name ? `child: ${row.agent}` : `child ${index + 1}: ${row.agent}`;
+  openPopup(title, {
+    paint: () => el("div", { class: "sa-body" }, subagentPanel(row, index, view, true)),
+    payload: () => ({ child: row, runId: view.runId, mode: view.mode }),
+  });
+}
+
+/** one child's panel: state, task, live activity, tools, output, acceptance and
+ *  the session file it left behind. `standalone` drops the height caps that
+ *  exist only to keep the master/detail pane from taking over the dialog. */
+function subagentPanel(row, index, view, standalone) {
+  const tone = subagentTone(row.status);
+  const panel = el("div", { class: `sa-panel ${tone}${standalone ? " standalone" : ""}` });
+
+  // Two head lines, because one cannot hold a model name and four counts in a
+  // 530px column without truncating all of them: state and the compact counts
+  // stay on the first line, everything descriptive on the second.
   const head = el(
     "div",
     { class: "sa-panel-head" },
     el("span", { class: `sa-dot ${tone}` }),
     el("span", { class: "sa-agent", text: row.agent }),
     el("span", { class: `sa-state ${tone}`, text: subagentStatusText(row.status) }),
-    row.model ? el("span", { class: "sa-chip", text: row.model }) : null,
-    row.thinking ? el("span", { class: "sa-chip", text: `think: ${row.thinking}` }) : null,
-    el("span", { class: "spacer" }),
-    row.toolCount ? el("span", { class: "sa-dim", text: `${row.toolCount} tools` }) : null,
-    row.tokens ? el("span", { class: "sa-dim", text: `${fmtTokens(row.tokens)} tok` }) : null,
-    row.durationMs ? el("span", { class: "sa-dim", text: fmtDuration(row.durationMs) }) : null
+    row.outputPartial ? saBadge("partial output", "warn", "The child stopped early; this text is what it had produced") : null,
+    el("span", { class: "sa-panel-fill" }),
+    el(
+      "span",
+      { class: "sa-readouts" },
+      row.toolCount ? el("span", { class: "sa-dim", text: `${row.toolCount} tool${row.toolCount === 1 ? "" : "s"}` }) : null,
+      row.turns ? el("span", { class: "sa-dim", text: `${row.turns} turn${row.turns === 1 ? "" : "s"}` }) : null,
+      row.tokens ? el("span", { class: "sa-dim", text: `${fmtTokens(row.tokens)} tok` }) : null,
+      row.durationMs ? el("span", { class: "sa-dim", text: fmtDuration(row.durationMs) }) : null
+    )
   );
+  const facts = [
+    // the child's session name is an identifier; the model and thinking level
+    // are values, so only the name is set in the mono face
+    row.name && row.name !== row.agent ? { text: row.name, mono: true } : null,
+    row.model ? { text: row.model } : null,
+    row.thinking ? { text: `think: ${row.thinking}` } : null,
+    row.context ? { text: `${row.context} context` } : null,
+  ].filter(Boolean);
+  if (facts.length || row.acceptance) {
+    head.append(
+      el(
+        "div",
+        { class: "sa-panel-sub" },
+        ...facts.map((f) => el("span", { class: f.mono ? "sa-fact-mono" : null, text: f.text })),
+        row.acceptance
+          ? saBadge(
+              `acceptance: ${row.acceptance.status}`,
+              row.acceptance.ok ? "ok" : "warn",
+              `${row.acceptance.satisfied ?? "?"}/${row.acceptance.required ?? "?"} criteria satisfied · evidence: ${row.acceptance.evidence || "unknown"}`
+            )
+          : null
+      )
+    );
+  }
   panel.append(head);
 
   const content = el("div", { class: "sa-panel-body" });
   if (row.task) content.append(el("div", { class: "sa-task", text: row.task }));
+
+  if (row.progressText) {
+    content.append(el("div", { class: "tc-label", text: "report" }), el("div", { class: "sa-report", text: row.progressText }));
+  }
 
   if (row.currentTool) {
     const tool = el("div", { class: "sa-tool current" });
@@ -1193,7 +1528,14 @@ function subagentPanel(row) {
       el("span", { class: "sa-tool-name", text: row.currentTool }),
       el("span", { class: "sa-tool-args", text: truncate(String(row.currentToolArgs || "running…"), 200) })
     );
+    if (row.currentToolStartedAt) {
+      const secs = Math.max(0, Math.round((Date.now() - Number(row.currentToolStartedAt)) / 1000));
+      if (secs > 0) tool.append(el("span", { class: "sa-tool-elapsed", text: `${secs}s` }));
+    }
     content.append(el("div", { class: "tc-label", text: "now" }), tool);
+  }
+  if (row.failedTool) {
+    content.append(el("div", { class: "sa-failed-tool", text: `last failure: ${row.failedTool}` }));
   }
 
   if (row.recentTools.length) {
@@ -1216,6 +1558,17 @@ function subagentPanel(row) {
     );
   }
 
+  if (row.toolCalls.length) {
+    const list = el("div", { class: "sa-tools sa-toolcalls" });
+    for (const t of row.toolCalls.slice(standalone ? -60 : -12)) {
+      list.append(el("div", { class: "sa-tool", title: t.expandedText || t.text }, el("span", { class: "sa-tool-args", text: truncate(t.text || "", 240) })));
+    }
+    content.append(
+      el("div", { class: "tc-label", text: `tool calls (${row.toolCalls.length})` }),
+      list
+    );
+  }
+
   if (row.error) {
     content.append(el("div", { class: "tc-label", text: "error" }), el("div", { class: "tc-text sa-error", text: row.error }));
   }
@@ -1223,19 +1576,42 @@ function subagentPanel(row) {
   if (row.output.trim()) {
     const out = el("div", { class: "sa-output assistant-text" });
     out.replaceChildren(...htmlFragment(renderMarkdown(row.output)));
-    content.append(el("div", { class: "tc-label", text: "output" }), out);
+    const label = el("div", { class: "tc-label sa-output-label" },
+      el("span", { text: row.outputPartial ? "output (partial)" : "output" }),
+      el("button", {
+        class: "ghost sa-copy",
+        text: "copy",
+        title: "Copy this child's output",
+        onclick: () =>
+          navigator.clipboard.writeText(row.output).then(() => toast("output copied"), () => toast("copy failed", "error")),
+      })
+    );
+    content.append(label, out);
+  }
+
+  if (row.structured != null) {
+    content.append(el("div", { class: "tc-label", text: "structured output" }), jsonBlock(row.structured));
   }
 
   if (row.sessionFile) {
     const foot = el("div", { class: "sa-session" });
-    const copy = el("button", {
+    const open = el("button", {
       class: "ghost sa-open",
       text: "open transcript",
-      title: row.sessionFile,
+      title: `${row.sessionFile}\nSwitches this tab to the child's own session`,
       onclick: () => openChildSession(row.sessionFile),
     });
-    foot.append(copy, el("span", { class: "sa-session-path", text: row.sessionFile, title: row.sessionFile }));
+    foot.append(open, el("span", { class: "sa-session-path", text: row.sessionFile, title: row.sessionFile }));
     content.append(foot);
+  }
+
+  if (view.rows.length > 1 && !standalone) {
+    const expand = el("button", {
+      class: "ghost sa-expand",
+      text: "open in full",
+      onclick: () => openChildPopup(row, index, view),
+    });
+    content.append(el("div", { class: "sa-panel-foot" }, expand));
   }
 
   panel.append(content);
@@ -1255,8 +1631,9 @@ function openSubagent(call, block) {
   const { exec, result } = toolcallState(block);
   const view = subagentView(call, exec, result);
   subagentRequestOpen = false;
+  subagentSelected = -1;
   const label = view.rows.length === 1 ? `: ${view.rows[0].agent}` : view.rows.length > 1 ? `: ${view.rows.length} children` : "";
-  openPopup(`subagent${label}`, {
+  openPopup(`subagent · ${subagentModeLabel(view)}${label}`, {
     paint: () => {
       const st = toolcallState(block);
       return buildSubagentBody(st.call, st.exec, st.result);
